@@ -3,8 +3,11 @@
 Wires together:
   - Claude Sonnet via Bedrock (strands.models.BedrockModel)
   - Tools from the AgentCore Gateway (Web Search + weather + places), over
-    MCP. Inside AgentCore Runtime, IAM auth to the Gateway is automatic via
-    the Runtime's execution role — no bearer token is needed.
+    MCP with AWS SigV4 (IAM) request signing. The Runtime's execution role
+    has bedrock-agentcore:InvokeGateway, but that permission only takes
+    effect if the outbound request is actually SigV4-signed — the Gateway
+    otherwise responds 401 Unauthorized (confirmed against a real deployment;
+    the Runtime does not sign Gateway calls automatically).
   - AgentCore Memory (short-term conversation history + long-term traveler
     preferences and session summaries) via the Strands session_manager
     integration, so the agent recalls context within a session and across
@@ -33,7 +36,7 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
     AgentCoreMemorySessionManager,
 )
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from mcp.client.streamable_http import streamablehttp_client
+from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp.mcp_client import MCPClient
@@ -115,14 +118,24 @@ def build_mcp_client() -> Optional[MCPClient]:
 
     Returns None if GATEWAY_URL isn't configured, so the agent can still run
     (without tools) rather than failing outright.
+
+    Requests are SigV4-signed (aws_iam_streamablehttp_client) using the
+    Runtime's execution role credentials, which is what actually authorizes
+    against a Gateway configured with GatewayAuthorizer.using_aws_iam() —
+    the Runtime's execution role IAM policy alone is not sufficient; the
+    request itself must be signed, or the Gateway returns 401 Unauthorized.
     """
     if not GATEWAY_URL:
         logger.warning("GATEWAY_URL not set; running without Gateway tools")
         return None
 
-    # No Authorization header: inside AgentCore Runtime, IAM auth to the
-    # Gateway is provided automatically via the Runtime's execution role.
-    return MCPClient(lambda: streamablehttp_client(GATEWAY_URL))
+    return MCPClient(
+        lambda: aws_iam_streamablehttp_client(
+            endpoint=GATEWAY_URL,
+            aws_service="bedrock-agentcore",
+            aws_region=AWS_REGION,
+        )
+    )
 
 
 @app.entrypoint

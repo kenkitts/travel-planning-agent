@@ -45,7 +45,7 @@ class RuntimeStack(Stack):
         agent_runtime_artifact = agentcore.AgentRuntimeArtifact.from_code_asset(
             path=str(AGENT_DIR),
             runtime=agentcore.AgentCoreRuntime.PYTHON_3_12,
-            entrypoint=["python3", "agent.py"],
+            entrypoint=["agent.py"],
             bundling=BundlingOptions(
                 image=lambda_.Runtime.PYTHON_3_12.bundling_image,
                 command=[
@@ -76,16 +76,23 @@ class RuntimeStack(Stack):
             },
         )
 
-        # Claude Sonnet invocation for the agent's own reasoning.
+        # Claude Sonnet invocation for the agent's own reasoning. The "us."
+        # cross-region inference profile for Claude Sonnet 4.5 routes actual
+        # model invocations to us-east-1, us-east-2, and us-west-2 (confirmed
+        # via bedrock:GetInferenceProfile) — granting foundation-model
+        # access only in self.region is insufficient and causes
+        # AccessDeniedException on requests routed to the other regions.
+        CROSS_REGION_MODEL_REGIONS = ["us-east-1", "us-east-2", "us-west-2"]
         self.runtime.add_to_role_policy(
             iam.PolicyStatement(
                 sid="AllowBedrockModelInvocation",
                 effect=iam.Effect.ALLOW,
                 actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
                 resources=[
-                    f"arn:aws:bedrock:{self.region}::foundation-model/*",
-                    f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/*",
-                ],
+                    f"arn:aws:bedrock:{region}::foundation-model/*"
+                    for region in CROSS_REGION_MODEL_REGIONS
+                ]
+                + [f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/*"],
             )
         )
 

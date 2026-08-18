@@ -81,10 +81,11 @@ travel-planning-agent/
       agent container/code to AgentCore Runtime, IAM auth only (decision #15)
 
 ## Phase 4 — Client Tooling
-- [ ] `cli/chat.py` — simple REPL: reads user input, calls
+- [x] `cli/chat.py` — simple REPL: reads user input, calls
       `bedrock-agentcore` `invoke_agent_runtime` (boto3), streams/prints
       response, maintains session ID across turns
-- [ ] Manual smoke test via AgentCore console test chat
+- [ ] Manual smoke test via AgentCore console test chat (deferred — requires
+      a deployed stack; see Phase 5)
 
 ## Phase 5 — End-to-End Validation (manual, per decision #18)
 - [ ] Full conversation: vague request → clarifying Q&A → itinerary generated

@@ -1,81 +1,83 @@
-{
-  "name": "get_weather_forecast",
-  "description": "Get a daily weather forecast (temperature, precipitation, conditions) for a destination and date range, to help plan weather-appropriate travel itineraries. Supports forecasts up to 16 days out; for dates further in the future, rely on general seasonal knowledge instead.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "location": {
-        "type": "string",
-        "description": "Place name to get weather for, e.g. 'Kyoto, Japan'. Required unless latitude and longitude are both provided."
-      },
-      "latitude": {
-        "type": "number",
-        "description": "Latitude in decimal degrees. Provide together with longitude to skip geocoding."
-      },
-      "longitude": {
-        "type": "number",
-        "description": "Longitude in decimal degrees. Provide together with latitude to skip geocoding."
-      },
-      "start_date": {
-        "type": "string",
-        "description": "First day of the forecast range, in YYYY-MM-DD format."
-      },
-      "end_date": {
-        "type": "string",
-        "description": "Last day of the forecast range, in YYYY-MM-DD format."
-      }
-    },
-    "required": ["start_date", "end_date"]
-  },
-  "outputSchema": {
-    "type": "object",
-    "properties": {
-      "location": {
-        "type": "string",
-        "description": "Resolved location name."
-      },
-      "latitude": {
-        "type": "number"
-      },
-      "longitude": {
-        "type": "number"
-      },
-      "timezone": {
-        "type": "string",
-        "description": "IANA timezone identifier for the location, e.g. 'Asia/Tokyo'."
-      },
-      "daily": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "date": {
-              "type": "string",
-              "description": "Date in YYYY-MM-DD format."
-            },
-            "temperature_max_c": {
-              "type": "number"
-            },
-            "temperature_min_c": {
-              "type": "number"
-            },
-            "precipitation_probability_max_pct": {
-              "type": "number"
-            },
-            "precipitation_sum_mm": {
-              "type": "number"
-            },
-            "condition": {
-              "type": "string",
-              "description": "Human-readable weather condition, e.g. 'Partly cloudy'."
-            }
-          }
+[
+  {
+    "name": "get_weather_forecast",
+    "description": "Get a daily weather forecast (temperature, precipitation, conditions) for a destination and date range, to help plan weather-appropriate travel itineraries. Supports forecasts up to 16 days out; for dates further in the future, rely on general seasonal knowledge instead.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "type": "string",
+          "description": "Place name to get weather for, e.g. 'Kyoto, Japan'. Required unless latitude and longitude are both provided."
+        },
+        "latitude": {
+          "type": "number",
+          "description": "Latitude in decimal degrees. Provide together with longitude to skip geocoding."
+        },
+        "longitude": {
+          "type": "number",
+          "description": "Longitude in decimal degrees. Provide together with latitude to skip geocoding."
+        },
+        "start_date": {
+          "type": "string",
+          "description": "First day of the forecast range, in YYYY-MM-DD format."
+        },
+        "end_date": {
+          "type": "string",
+          "description": "Last day of the forecast range, in YYYY-MM-DD format."
         }
       },
-      "error": {
-        "type": "string",
-        "description": "Present only if the request failed, e.g. location not found."
+      "required": ["start_date", "end_date"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "type": "string",
+          "description": "Resolved location name."
+        },
+        "latitude": {
+          "type": "number"
+        },
+        "longitude": {
+          "type": "number"
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone identifier for the location, e.g. 'Asia/Tokyo'."
+        },
+        "daily": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "date": {
+                "type": "string",
+                "description": "Date in YYYY-MM-DD format."
+              },
+              "temperature_max_c": {
+                "type": "number"
+              },
+              "temperature_min_c": {
+                "type": "number"
+              },
+              "precipitation_probability_max_pct": {
+                "type": "number"
+              },
+              "precipitation_sum_mm": {
+                "type": "number"
+              },
+              "condition": {
+                "type": "string",
+                "description": "Human-readable weather condition, e.g. 'Partly cloudy'."
+              }
+            }
+          }
+        },
+        "error": {
+          "type": "string",
+          "description": "Present only if the request failed, e.g. location not found."
+        }
       }
     }
   }
-}
+]

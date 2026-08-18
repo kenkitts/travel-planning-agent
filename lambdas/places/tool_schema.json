@@ -1,80 +1,82 @@
-{
-  "name": "search_and_sequence_places",
-  "description": "Search for places (attractions, restaurants, points of interest) near a destination, and sequence a list of chosen places into a geographically sensible visiting order to minimize backtracking within a day's itinerary.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "action": {
-        "type": "string",
-        "enum": ["search", "sequence"],
-        "description": "'search' to find candidate places by free-text query; 'sequence' to reorder a chosen list of places geographically."
-      },
-      "query": {
-        "type": "string",
-        "description": "Free-text search query, e.g. 'temples in Kyoto'. Required for action 'search'."
-      },
-      "bias_latitude": {
-        "type": "number",
-        "description": "Latitude to bias search results toward (e.g. the destination's center). Optional for action 'search'."
-      },
-      "bias_longitude": {
-        "type": "number",
-        "description": "Longitude to bias search results toward. Optional for action 'search'."
-      },
-      "max_results": {
-        "type": "integer",
-        "description": "Maximum number of search results to return. Defaults to 5. Only used for action 'search'.",
-        "default": 5
-      },
-      "places": {
-        "type": "array",
-        "description": "List of places to sequence geographically. Required for action 'sequence'.",
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string" },
-            "latitude": { "type": "number" },
-            "longitude": { "type": "number" }
-          },
-          "required": ["latitude", "longitude"]
+[
+  {
+    "name": "search_and_sequence_places",
+    "description": "Search for places (attractions, restaurants, points of interest) near a destination, and sequence a list of chosen places into a geographically sensible visiting order to minimize backtracking within a day's itinerary.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["search", "sequence"],
+          "description": "'search' to find candidate places by free-text query; 'sequence' to reorder a chosen list of places geographically."
+        },
+        "query": {
+          "type": "string",
+          "description": "Free-text search query, e.g. 'temples in Kyoto'. Required for action 'search'."
+        },
+        "bias_latitude": {
+          "type": "number",
+          "description": "Latitude to bias search results toward (e.g. the destination's center). Optional for action 'search'."
+        },
+        "bias_longitude": {
+          "type": "number",
+          "description": "Longitude to bias search results toward. Optional for action 'search'."
+        },
+        "max_results": {
+          "type": "integer",
+          "description": "Maximum number of search results to return. Defaults to 5. Only used for action 'search'.",
+          "default": 5
+        },
+        "places": {
+          "type": "array",
+          "description": "List of places to sequence geographically. Required for action 'sequence'.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "latitude": { "type": "number" },
+              "longitude": { "type": "number" }
+            },
+            "required": ["latitude", "longitude"]
+          }
         }
-      }
+      },
+      "required": ["action"]
     },
-    "required": ["action"]
-  },
-  "outputSchema": {
-    "type": "object",
-    "properties": {
-      "results": {
-        "type": "array",
-        "description": "Present for action 'search'.",
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string" },
-            "address": { "type": "string" },
-            "category": { "type": "string" },
-            "latitude": { "type": "number" },
-            "longitude": { "type": "number" }
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "results": {
+          "type": "array",
+          "description": "Present for action 'search'.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "address": { "type": "string" },
+              "category": { "type": "string" },
+              "latitude": { "type": "number" },
+              "longitude": { "type": "number" }
+            }
           }
-        }
-      },
-      "ordered_places": {
-        "type": "array",
-        "description": "Present for action 'sequence'. Same shape as the input 'places', reordered.",
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string" },
-            "latitude": { "type": "number" },
-            "longitude": { "type": "number" }
+        },
+        "ordered_places": {
+          "type": "array",
+          "description": "Present for action 'sequence'. Same shape as the input 'places', reordered.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "latitude": { "type": "number" },
+              "longitude": { "type": "number" }
+            }
           }
+        },
+        "error": {
+          "type": "string",
+          "description": "Present only if the request failed."
         }
-      },
-      "error": {
-        "type": "string",
-        "description": "Present only if the request failed."
       }
     }
   }
-}
+]

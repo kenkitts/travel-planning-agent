@@ -54,16 +54,18 @@ travel-planning-agent/
       Gateway Lambda target)
 
 ## Phase 2 — Infra: Gateway, Memory, Lambdas (CDK)
-- [ ] `tools_stack.py` — deploy the two Lambda functions + IAM roles
-- [ ] `gateway_stack.py` — create AgentCore Gateway; add:
+- [x] `tools_stack.py` — deploy the two Lambda functions + IAM roles
+- [x] `gateway_stack.py` — create AgentCore Gateway; add:
       - Web Search managed connector target
       - Lambda target → weather handler
       - Lambda target → places handler
       - IAM role for Gateway (`GATEWAY_IAM_ROLE` credential provider)
-- [ ] `memory_stack.py` — create AgentCore `Memory` resource with a long-term
+- [x] `memory_stack.py` — create AgentCore `Memory` resource with a long-term
       strategy enabled (built-in preference-extraction strategy) plus
       short-term event storage
 - [ ] `cdk deploy` all stacks; capture Gateway URL/ARN + Memory ID as outputs
+      (deferred — requires a target AWS account; `cdk synth` validated the
+      templates render correctly, see DESIGN.md decision log)
 
 ## Phase 3 — Agent Application
 - [ ] `agent/prompts.py` — system prompt: itinerary-builder persona,

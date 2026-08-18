@@ -68,16 +68,16 @@ travel-planning-agent/
       templates render correctly, see DESIGN.md decision log)
 
 ## Phase 3 — Agent Application
-- [ ] `agent/prompts.py` — system prompt: itinerary-builder persona,
+- [x] `agent/prompts.py` — system prompt: itinerary-builder persona,
       instructions to ask clarifying questions before generating, to call
       tools for grounding, and to output plain markdown itineraries
-- [ ] `agent/agent.py` — Strands `Agent` wired to:
+- [x] `agent/agent.py` — Strands `Agent` wired to:
       - `BedrockModel` (Claude Sonnet)
       - MCP client pointed at the Gateway URL (discovers Web Search/weather/places tools)
       - AgentCore Memory client (short-term: `create_event`/`get_last_k_turns`;
         long-term: `retrieve_memories` at session start, injected into context)
       - Wrapped in `BedrockAgentCoreApp` entrypoint for Runtime hosting
-- [ ] `runtime_stack.py` — CDK `CfnRuntime` (or L2 equivalent) deploying the
+- [x] `runtime_stack.py` — CDK `CfnRuntime` (or L2 equivalent) deploying the
       agent container/code to AgentCore Runtime, IAM auth only (decision #15)
 
 ## Phase 4 — Client Tooling

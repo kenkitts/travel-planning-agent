@@ -16,6 +16,7 @@ import aws_cdk as cdk
 
 from stacks.gateway_stack import GatewayStack
 from stacks.memory_stack import MemoryStack
+from stacks.runtime_stack import RuntimeStack
 from stacks.tools_stack import ToolsStack
 
 app = cdk.App()
@@ -34,5 +35,15 @@ gateway_stack = GatewayStack(
 gateway_stack.add_dependency(tools_stack)
 
 memory_stack = MemoryStack(app, "TravelAgentMemoryStack", env=env)
+
+runtime_stack = RuntimeStack(
+    app,
+    "TravelAgentRuntimeStack",
+    env=env,
+    gateway=gateway_stack.gateway,
+    memory=memory_stack.memory,
+)
+runtime_stack.add_dependency(gateway_stack)
+runtime_stack.add_dependency(memory_stack)
 
 app.synth()

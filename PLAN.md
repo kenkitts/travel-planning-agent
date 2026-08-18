@@ -149,8 +149,20 @@ travel-planning-agent/
    all three regions in `runtime_stack.py`.
 
 ## Phase 6 — Wrap-up
-- [ ] `README.md` — setup, deploy, and usage instructions
-- [ ] Review AWS costs incurred (Bedrock invocations, Lambda, Location Service calls)
+- [x] `README.md` — setup, deploy, and usage instructions
+- [x] Review AWS costs incurred (Bedrock invocations, Lambda, Location Service calls)
+      — checked Cost Explorer for account 800206160271: no dedicated
+      Bedrock / Bedrock AgentCore / Location Service line items had posted
+      yet as of this check (Cost Explorer has a ~24h+ reporting lag, and
+      this session's usage happened same-day). Lambda cost so far is
+      negligible (~$0.00004, a handful of test invocations). Actual
+      Bedrock/AgentCore spend from this session's ~10 test conversations
+      is expected to be a few cents at most (Claude Sonnet invocations on
+      short prompts, no provisioned throughput). No cost-control action
+      needed for a personal dev account at this usage level, but revisit
+      Cost Explorer in 24-48h to confirm, and remember to `cdk destroy --all`
+      when done experimenting to stop the AgentCore Gateway/Memory/Runtime
+      resources (and their Lambda targets) from continuing to run.
 - [x] Confirm all unit tests pass (`pytest`) — 33/33 passing after the Phase 5 fixes
 
 ## Explicit Non-Goals (tracked, not built now)

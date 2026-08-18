@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_DIR = REPO_ROOT / "agent"
 
 # Matches the model ID used as the default in agent/agent.py.
-DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-5"
 
 
 class RuntimeStack(Stack):
@@ -77,7 +77,7 @@ class RuntimeStack(Stack):
         )
 
         # Claude Sonnet invocation for the agent's own reasoning. The "us."
-        # cross-region inference profile for Claude Sonnet 4.5 routes actual
+        # cross-region inference profile for Claude Sonnet 5 routes actual
         # model invocations to us-east-1, us-east-2, and us-west-2 (confirmed
         # via bedrock:GetInferenceProfile) — granting foundation-model
         # access only in self.region is insufficient and causes

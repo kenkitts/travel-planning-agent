@@ -51,7 +51,7 @@ MEMORY_ID = os.environ.get("MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Sonnet is the design's chosen model (see DESIGN.md decision #7) for its
 # multi-step reasoning and tool-use reliability across the three Gateway tools.
-MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
 
 # Namespace patterns must match those configured on the Memory resource in
 # cdk/stacks/memory_stack.py.

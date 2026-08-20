@@ -46,4 +46,8 @@ runtime_stack = RuntimeStack(
 runtime_stack.add_dependency(gateway_stack)
 runtime_stack.add_dependency(memory_stack)
 
+# Applied to every taggable resource across all four stacks.
+cdk.Tags.of(app).add("auto-delete", "no")
+cdk.Tags.of(app).add("project", "travel-planning-agent")
+
 app.synth()

@@ -7,24 +7,37 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header class="app-header">
-    <h1>Travel Planning Agent</h1>
-    <button id="new-conversation-btn" title="Start a new conversation">New conversation</button>
-  </header>
+  <div class="app-layout">
+    <nav id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <span>Conversations</span>
+        <button id="sidebar-close-btn" class="icon-btn" title="Close sidebar" aria-label="Close sidebar">✕</button>
+      </div>
+      <ul id="conversation-list" class="conversation-list" aria-live="polite"></ul>
+    </nav>
 
-  <main id="messages" class="messages" aria-live="polite"></main>
+    <div class="app-main">
+      <header class="app-header">
+        <button id="sidebar-toggle-btn" class="icon-btn" title="Show conversations" aria-label="Show conversations">☰</button>
+        <h1>Travel Planning Agent</h1>
+        <button id="new-conversation-btn" title="Start a new conversation">New conversation</button>
+      </header>
 
-  <form id="chat-form" class="chat-form">
-    <label for="chat-input" class="sr-only">Message</label>
-    <textarea
-      id="chat-input"
-      class="chat-input"
-      placeholder="Ask about a trip… (Shift+Enter for a new line)"
-      rows="2"
-      autofocus
-    ></textarea>
-    <button id="send-btn" type="submit">Send</button>
-  </form>
+      <main id="messages" class="messages" aria-live="polite"></main>
+
+      <form id="chat-form" class="chat-form">
+        <label for="chat-input" class="sr-only">Message</label>
+        <textarea
+          id="chat-input"
+          class="chat-input"
+          placeholder="Ask about a trip… (Shift+Enter for a new line)"
+          rows="2"
+          autofocus
+        ></textarea>
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

@@ -17,9 +17,8 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: #111;
-  display: flex;
-  flex-direction: column;
   height: 100vh;
+  overflow: hidden;
 }
 
 .sr-only {
@@ -28,6 +27,122 @@ body {
   height: 1px;
   overflow: hidden;
   clip: rect(0 0 0 0);
+}
+
+.app-layout {
+  display: flex;
+  height: 100vh;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* --- Sidebar ------------------------------------------------------------ */
+
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  background: #fff;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  font-size: 1.1rem;
+  cursor: pointer;
+  color: #333;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+}
+
+.icon-btn:hover {
+  background: #f0f0f2;
+}
+
+#sidebar-close-btn {
+  display: none;
+}
+
+.conversation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.conversation-item {
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  cursor: pointer;
+  margin-bottom: 0.2rem;
+}
+
+.conversation-item:hover {
+  background: #f0f0f2;
+}
+
+.conversation-item.active {
+  background: #e8edfc;
+}
+
+.conversation-preview {
+  font-size: 0.85rem;
+  color: #222;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-date {
+  font-size: 0.72rem;
+  color: #888;
+  margin-top: 0.15rem;
+}
+
+/* Narrow viewports: sidebar becomes an overlay, hidden by default. */
+@media (max-width: 720px) {
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 10;
+    transform: translateX(-100%);
+    transition: transform 0.15s ease-out;
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.15);
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  #sidebar-close-btn {
+    display: inline-block;
+  }
+}
+
+@media (min-width: 721px) {
+  #sidebar-toggle-btn {
+    display: none;
+  }
 }
 
 .app-header {

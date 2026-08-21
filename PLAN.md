@@ -288,6 +288,52 @@ itinerary) through the running local web server — returned a complete
 4504-character itinerary with a natural ending, HTTP 200, and CloudWatch
 confirmed `"Invocation completed successfully (56.617s)"` with no exception.
 
+### Post-Phase-7 feature: conversation history sidebar
+Requested by the user: a way to revisit and continue past conversations
+from the web UI, rather than only ever seeing the current session (the
+existing `localStorage`-cached message list was lost on a different device
+or browser, and there was no way to browse other sessions at all).
+
+Implemented with **no new storage** — AgentCore Memory is already the
+system of record for every session's raw turn history (short-term events,
+90-day retention per `memory_stack.py`), so the feature is purely two new
+read-only endpoints on top of the existing `ListSessions`/`ListEvents` data
+plane APIs:
+- `GET /api/conversations` — lists the current `--actor-id`'s sessions
+  (via `ListSessions`), with a preview built from each session's first user
+  message (via one `ListEvents` call per session), sorted newest-first.
+  Sessions with zero events (a `sessionId` AgentCore assigned but never
+  used) are skipped.
+- `GET /api/conversations/{session_id}` — the full chronological transcript
+  for one session (via `ListEvents`, reversed since the API returns
+  newest-first).
+
+Both are gated on a new `--memory-id` server CLI arg; omitting it disables
+the sidebar entirely (`/api/config` reports `history_enabled: false`) so
+the feature degrades cleanly for anyone who doesn't pass it. This is a
+**new IAM permission requirement** for local callers: `InvokeAgentRuntime`
+(already required for chat) does not cover `ListSessions`/`ListEvents` —
+those are separate actions on the Memory resource, granted server-side to
+the Runtime's execution role by `memory.grant_full_access()` in
+`runtime_stack.py`, but not automatically to whoever runs `web/server.py`
+locally with their own credentials.
+
+Frontend: `static/index.html`/`app.js`/`style.css` gained a sidebar
+(`#sidebar`) listing conversations, click-to-switch (fetches that session's
+transcript and swaps the active `runtimeSessionId`), an active-conversation
+highlight, and an overlay/toggle behavior under 720px width for mobile. The
+old `localStorage`-cached message-list hack (`HISTORY_STORAGE_KEY`) was
+removed entirely — AgentCore Memory is now the single source of truth for
+transcripts, so a page reload re-fetches the current session's transcript
+from the server instead of replaying a local cache that could drift out of
+sync with what the agent actually has in Memory.
+
+Added `ConversationHistoryEndpointTests` (9 tests) to
+`web/tests/test_server.py`, covering the list/get endpoints, preview
+truncation, newest-first-to-chronological ordering, empty-session
+filtering, the disabled-sidebar 404 path, and upstream-error handling. Full
+suite: 60/60 passing.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

@@ -131,13 +131,24 @@ existing local AWS credentials to call the same deployed Runtime.
 
 ```bash
 pip install -r web/requirements.txt
-python web/server.py --agent-runtime-arn <runtime-arn> --actor-id <your-name>
+python web/server.py --agent-runtime-arn <runtime-arn> --actor-id <your-name> \
+    --memory-id <memory-id>
 ```
 
 Then open `http://localhost:8420` in a browser. Your conversation's runtime
 session ID is stored in the browser's `localStorage`, so reloading the page
 continues the same conversation; use the **New conversation** button to
 start over. Long-term memory is scoped by `--actor-id`, same as the CLI.
+
+`--memory-id` (the `TravelAgentMemoryStack` Memory resource ID) enables the
+**conversation history sidebar**: a list of your past conversations with a
+preview of each, read live from AgentCore Memory (`ListSessions`/
+`ListEvents`) rather than any local storage — click one to load its full
+transcript and continue it. Omit `--memory-id` to run without the sidebar.
+This requires your local AWS credentials to additionally have
+`bedrock-agentcore:ListSessions` and `bedrock-agentcore:ListEvents`
+permission on the Memory resource (`InvokeAgentRuntime` alone, as used for
+chat, is not sufficient).
 
 Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
 - No login/auth — it's a local dev tool for one person, not multi-user or
@@ -147,12 +158,16 @@ Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
 - No token-by-token streaming — full responses only, matching the CLI.
 - No structured itinerary rendering — agent responses are rendered as
   plain markdown (headings, bold/italic, lists) in the chat bubble.
+- Conversation history is read-only and scoped to the current `--actor-id`
+  — there's no delete/rename/search, and no history across different
+  actors.
 
 ## Testing
 
 Unit tests cover the two Lambda tool handlers (mocked, no live network or
 AWS calls), the agent's response-extraction/session-parsing helpers, and
-the web UI's `/api/chat` endpoint (mocked agent invocation):
+the web UI's `/api/chat` and `/api/conversations` endpoints (mocked agent
+invocation and mocked AgentCore Memory client):
 
 ```bash
 python -m pytest tests/ web/tests/

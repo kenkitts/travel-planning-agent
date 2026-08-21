@@ -66,6 +66,21 @@ DEFAULT_ACTOR_ID = "anonymous-traveler"
 app = BedrockAgentCoreApp()
 
 
+def extract_response_text(message: dict) -> str:
+    """Extract the assistant's plain-text reply from a Strands result message.
+
+    `result.message` is a dict like {"role": "assistant", "content": [...]}
+    where `content` is a list of blocks — typically a `reasoningContent`
+    block (Claude's extended thinking, not meant for the end user) followed
+    by one or more `text` blocks. Concatenates only the `text` blocks, so
+    callers (CLI, web UI) get the clean markdown reply the docstrings
+    promise, not a stringified dict repr of the whole message.
+    """
+    content = message.get("content") or []
+    text_parts = [block["text"] for block in content if isinstance(block, dict) and "text" in block]
+    return "\n".join(text_parts).strip()
+
+
 def parse_runtime_session_id(runtime_session_id: Optional[str]) -> tuple[str, str]:
     """Split a Runtime session ID into (actor_id, session_id).
 
@@ -180,7 +195,7 @@ def invoke(payload: dict, context: Any = None) -> dict:
             session_manager=session_manager,
         )
         result = agent(user_message)
-        return {"response": str(result.message)}
+        return {"response": extract_response_text(result.message)}
 
     with mcp_client:
         tools = mcp_client.list_tools_sync()
@@ -193,7 +208,7 @@ def invoke(payload: dict, context: Any = None) -> dict:
             session_manager=session_manager,
         )
         result = agent(user_message)
-        return {"response": str(result.message)}
+        return {"response": extract_response_text(result.message)}
 
 
 if __name__ == "__main__":

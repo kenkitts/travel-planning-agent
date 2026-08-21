@@ -1,0 +1,178 @@
+:root {
+  --bg: #f7f7f8;
+  --bubble-user: #2563eb;
+  --bubble-user-text: #ffffff;
+  --bubble-agent: #ffffff;
+  --bubble-agent-text: #1a1a1a;
+  --border: #e2e2e6;
+  --error: #b91c1c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: #111;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+}
+
+.app-header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+#new-conversation-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  color: #333;
+}
+
+#new-conversation-btn:hover {
+  background: #f0f0f2;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.message {
+  max-width: 70ch;
+  padding: 0.65rem 0.9rem;
+  border-radius: 12px;
+  line-height: 1.45;
+  white-space: normal;
+  word-wrap: break-word;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: var(--bubble-user);
+  color: var(--bubble-user-text);
+}
+
+.message.agent {
+  align-self: flex-start;
+  background: var(--bubble-agent);
+  color: var(--bubble-agent-text);
+  border: 1px solid var(--border);
+}
+
+.message.error {
+  align-self: flex-start;
+  background: #fef2f2;
+  color: var(--error);
+  border: 1px solid #fecaca;
+}
+
+.message.pending {
+  align-self: flex-start;
+  color: #888;
+  font-style: italic;
+  background: transparent;
+  border: none;
+  padding: 0.2rem 0.9rem;
+}
+
+.message p {
+  margin: 0 0 0.6rem 0;
+}
+
+.message p:last-child {
+  margin-bottom: 0;
+}
+
+.message h1,
+.message h2,
+.message h3 {
+  margin: 0.8rem 0 0.4rem 0;
+}
+
+.message h1:first-child,
+.message h2:first-child,
+.message h3:first-child {
+  margin-top: 0;
+}
+
+.message ul,
+.message ol {
+  margin: 0.3rem 0 0.6rem 1.25rem;
+  padding: 0;
+}
+
+.message li {
+  margin-bottom: 0.2rem;
+}
+
+.chat-form {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.9rem 1.25rem;
+  border-top: 1px solid var(--border);
+  background: #fff;
+}
+
+.chat-input {
+  flex: 1;
+  resize: none;
+  font-family: inherit;
+  font-size: 0.95rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.chat-input:focus {
+  outline: 2px solid var(--bubble-user);
+  outline-offset: -1px;
+}
+
+#send-btn {
+  background: var(--bubble-user);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0 1.1rem;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+#send-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+#send-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+}

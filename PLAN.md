@@ -32,9 +32,17 @@ travel-planning-agent/
 │       └── tool_schema.json
 ├── tests/
 │   ├── test_weather_handler.py
-│   └── test_places_handler.py
-└── cli/
-    └── chat.py                   # local REPL client, calls invoke_agent_runtime
+│   ├── test_places_handler.py
+│   └── test_agent.py              # agent.py helper functions (no AWS calls)
+├── cli/
+│   ├── agent_client.py            # shared: session ID + InvokeAgentRuntime call
+│   └── chat.py                    # local REPL client
+└── web/
+    ├── server.py                  # local FastAPI backend, reuses agent_client
+    ├── requirements.txt
+    ├── static/                    # index.html, app.js, style.css
+    └── tests/
+        └── test_server.py
 ```
 
 ## Phase 0 — Project Scaffolding
@@ -164,6 +172,85 @@ travel-planning-agent/
       when done experimenting to stop the AgentCore Gateway/Memory/Runtime
       resources (and their Lambda targets) from continuing to run.
 - [x] Confirm all unit tests pass (`pytest`) — 33/33 passing after the Phase 5 fixes
+
+### Post-Phase-6 fixes (undocumented at the time, recorded here retroactively)
+1. **Gateway service role missing Web Search invoke permission**: the
+   Gateway's service role had `lambda:InvokeFunction` for the weather/places
+   Lambda targets (auto-granted by `add_lambda_target()`) but no permission
+   at all to invoke the Web Search managed connector, so any web-search tool
+   call failed. Fixed by granting `bedrock-agentcore:InvokeGateway` and
+   `bedrock-agentcore:InvokeWebSearch` (on the literal `arn:...:tool/web-search.v1`
+   resource, owned by the service under account `aws`) on the Gateway's
+   service role — see `_grant_web_search_invoke()` in `gateway_stack.py`.
+2. **All infra tagged** `{"auto-delete":"no"}` and `{"project":"travel-planning-agent"}`
+   via `cdk.Tags.of(app).add(...)` in `cdk/app.py`, cascading to all 4 stacks.
+3. **Long-term memory retrieval silently dropped by a relevance-score filter
+   bug**: `bedrock-agentcore`'s `AgentCoreMemorySessionManager` filters
+   retrieved memory records with `m.get("score", 0.0) >= relevance_score`,
+   but real `retrieve_memory_records` results carry no `score` field at all
+   — so any positive `relevance_score` (including the library's own default
+   of 0.2) discarded every retrieved memory before it could be injected into
+   the model's context, even though CloudWatch logs showed retrieval
+   "succeeding" (that log line fires earlier and unconditionally, before the
+   filter runs). Fixed by setting `relevance_score=0.0` explicitly for both
+   retrieval namespaces in `agent/agent.py`'s `build_session_manager()`.
+   Verified via Bedrock model invocation logging showing the actual
+   `<user_context>` block present in the outbound request after the fix.
+
+## Phase 7 — Web UI (local, single-user)
+- [x] `cli/agent_client.py` — extracted `build_runtime_session_id()` and
+      `invoke_agent()` out of `cli/chat.py` into a shared module, so
+      `cli/chat.py` and `web/server.py` use one implementation of the
+      `InvokeAgentRuntime` call instead of duplicating it.
+- [x] `web/server.py` — FastAPI backend, local-only (binds `127.0.0.1` by
+      default): `GET /` serves the chat UI, `GET /api/config` exposes the
+      configured `--actor-id` to the frontend, `POST /api/chat` invokes the
+      agent via `agent_client.invoke_agent()` and returns the plain-text
+      response. No new AWS infrastructure — uses the caller's existing local
+      AWS credentials, same as the CLI.
+- [x] `web/static/{index.html,app.js,style.css}` — chat UI: message list,
+      input box, "New conversation" button. Session ID (and message history,
+      for redisplay on reload) persisted in the browser's `localStorage` so
+      a page reload continues the same conversation, unlike the CLI which
+      always starts a fresh session. A small hand-rolled markdown-to-HTML
+      renderer (headings, bold/italic, lists, paragraphs) is used instead of
+      a vendored library, since the agent's output shape is simple and known
+      (see `agent/prompts.py`'s "Writing the itinerary" section) — output is
+      HTML-escaped before any markdown transformation is applied, so agent
+      text can never inject raw HTML/script into the page.
+- [x] `web/requirements.txt` — `fastapi`, `uvicorn`, `pydantic`, `boto3`,
+      pinned to versions already resolved in this project's venv.
+- [x] `web/tests/test_server.py` — 7 tests against `/api/chat`, `/api/config`,
+      and `/` using FastAPI's `TestClient`, mocking `invoke_agent()` (no real
+      AWS calls).
+- [x] **Real bug found and fixed during end-to-end verification**: the
+      Runtime's `invoke()` entrypoint returned `str(result.message)` — the
+      Python `repr()` of the full Strands result message dict, including a
+      `reasoningContent` block (Claude's extended-thinking signature blob),
+      not the plain assistant reply text. This was live in the deployed
+      agent already (the CLI printed the same raw dict, it just blended in
+      less obviously in a terminal than in a rendered chat bubble would
+      have). Fixed by adding `extract_response_text()` to `agent/agent.py`,
+      which concatenates only the `text` content blocks, and using it at
+      both `invoke()` return sites. Added `tests/test_agent.py` (8 tests) for
+      this and `parse_runtime_session_id()`. Verified live: before the fix,
+      `/api/chat` returned the raw dict repr string; after redeploying
+      `TravelAgentRuntimeStack`, the same request/session returned clean
+      plain text, confirmed via curl against the running local server, and a
+      full itinerary-generation turn (weather + web search + places tools)
+      was independently re-verified to render correctly through the
+      frontend's markdown renderer (checked with a standalone Node.js
+      harness against the real API response).
+- [x] End-to-end verified against the live deployed Runtime ARN: `/api/config`,
+      `GET /`, a no-memory "What do you know about me?" turn, a multi-turn
+      clarifying-question exchange, and a full tool-grounded itinerary
+      generation (Portland, OR) — all returned clean, correctly-rendered
+      responses.
+- [x] `README.md` updated with a "Web UI" section (setup, run, scope/non-goals)
+      and the stale Phase-5 "Known limitations" note (about memory not
+      surfacing) removed, since that was fixed by the Phase-6-adjacent fix
+      above.
+- [x] Full repo test suite passing: 48/48 (`tests/` + `web/tests/`).
 
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations

@@ -9,8 +9,10 @@ design decisions and rationale, and `PLAN.md` for the phased build plan.
 ## Architecture
 
 ```
-CLI (cli/chat.py)
-   │  boto3 bedrock-agentcore InvokeAgentRuntime (IAM/SigV4)
+CLI (cli/chat.py)  ──┐
+                      │  boto3 bedrock-agentcore InvokeAgentRuntime (IAM/SigV4)
+Web UI (web/server.py)┘  (via cli/agent_client.py, shared by both clients)
+   │
    ▼
 AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
    │                                   │
@@ -30,6 +32,10 @@ Four CDK stacks (deployed in this order):
 - `TravelAgentMemoryStack` — the AgentCore Memory resource
 - `TravelAgentRuntimeStack` — the AgentCore Runtime hosting the agent
 
+The web UI (`web/`) is **not** a fifth AWS stack — it's a local-only backend
+that runs on your machine and calls the deployed Runtime the same way the
+CLI does. See "Web UI" below.
+
 ## Repo layout
 
 ```
@@ -39,8 +45,9 @@ travel-planning-agent/
 ├── agent/                 # Strands agent + BedrockAgentCoreApp entrypoint
 ├── cdk/                   # CDK app (Python) — 4 stacks, see cdk/stacks/
 ├── lambdas/                # weather + places tool Lambdas, with tests
-├── tests/                  # unit tests for the Lambda handlers
-└── cli/                    # local REPL client (chat.py)
+├── tests/                  # unit tests for the Lambda handlers + agent helpers
+├── cli/                    # local REPL client (chat.py) + shared agent_client.py
+└── web/                    # local web UI (server.py + static/), see below
 ```
 
 ## Prerequisites
@@ -116,13 +123,39 @@ always prefer walking tours") persist across separate CLI runs for the same
 You can also test directly from the **AgentCore console's test chat** for
 the deployed Runtime.
 
+## Web UI
+
+A local, single-user web chat UI is available as an alternative to the CLI.
+It runs entirely on your machine — no new AWS infrastructure — and uses your
+existing local AWS credentials to call the same deployed Runtime.
+
+```bash
+pip install -r web/requirements.txt
+python web/server.py --agent-runtime-arn <runtime-arn> --actor-id <your-name>
+```
+
+Then open `http://localhost:8420` in a browser. Your conversation's runtime
+session ID is stored in the browser's `localStorage`, so reloading the page
+continues the same conversation; use the **New conversation** button to
+start over. Long-term memory is scoped by `--actor-id`, same as the CLI.
+
+Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
+- No login/auth — it's a local dev tool for one person, not multi-user or
+  public-facing. Do not bind it to anything other than `127.0.0.1` (the
+  default) or expose it beyond your machine — it holds your real AWS
+  credentials.
+- No token-by-token streaming — full responses only, matching the CLI.
+- No structured itinerary rendering — agent responses are rendered as
+  plain markdown (headings, bold/italic, lists) in the chat bubble.
+
 ## Testing
 
 Unit tests cover the two Lambda tool handlers (mocked, no live network or
-AWS calls):
+AWS calls), the agent's response-extraction/session-parsing helpers, and
+the web UI's `/api/chat` endpoint (mocked agent invocation):
 
 ```bash
-python -m pytest tests/
+python -m pytest tests/ web/tests/
 ```
 
 Agent behavior itself is validated manually (see `PLAN.md` Phase 5) rather
@@ -147,10 +180,7 @@ with the corresponding constants in `cdk/stacks/runtime_stack.py` and
 
 ## Known limitations
 
-- Retrieved long-term memory records don't always surface into the model's
-  answer when a traveler asks directly "do you remember my preferences?",
-  even though the underlying storage/extraction/retrieval pipeline is
-  confirmed working (see `PLAN.md` Phase 5 notes). Implicit personalization
-  (skipping already-answered questions) works as expected.
 - No booking integrations, structured/JSON output, or automated integration
   tests — see `DESIGN.md`'s "Out of scope" section.
+- The web UI (see above) is local-only and single-user by design, not a
+  general-purpose hosted frontend.

@@ -334,6 +334,58 @@ truncation, newest-first-to-chronological ordering, empty-session
 filtering, the disabled-sidebar 404 path, and upstream-error handling. Full
 suite: 60/60 passing.
 
+### Post-Phase-7 feature: custom conversation titles/rename
+Requested by the user: a way to tell conversations in the sidebar apart
+beyond the auto-generated first-message preview (e.g. two separate
+sessions both starting "Hi" are indistinguishable).
+
+AgentCore Memory has no native session-title field — `ListSessions` only
+ever returns `{sessionId, actorId, createdAt}`, confirmed against the real
+API. The chosen approach: a title is a small marker `CreateEvent` whose
+**event-level `metadata`** field (a real, separate feature from the
+conversational payload — up to 15 key-value pairs) carries
+`{"conversationTitle": {"stringValue": "..."}}`, with `extractionMode:
+"SKIP"` so it's never fed into long-term memory extraction (it's a UI
+label, not something the traveler said). `list_conversations` scans a
+session's events newest-first and prefers the latest marker's title over
+the auto-generated preview; `_event_turns` excludes marker events from
+transcripts entirely, so a rename can never appear as a fake chat turn.
+
+New endpoint: `PUT /api/conversations/{session_id}/title` — normalizes
+whitespace, truncates to 80 chars with an ellipsis, writes the marker
+event, and returns the (possibly-truncated) title actually stored.
+
+Frontend: each sidebar item gained a pencil icon (visible on hover, or
+always visible under the 720px mobile breakpoint) that swaps the label
+into an inline text input; Enter/blur commits via the new endpoint,
+Escape cancels.
+
+**Two real bugs found and fixed via live testing** against a real
+deployed Runtime + Memory resource (the initial mocked unit tests, using
+`MagicMock()` for the boto3 client, did not catch either):
+1. The raw boto3 `bedrock-agentcore` `CreateEvent` call requires
+   `eventTimestamp` explicitly — omitting it isn't defaulted the way
+   `bedrock_agentcore.memory.client.MemoryClient.create_event()` defaults
+   it internally (this server calls the plain boto3 client directly, not
+   that wrapper), and raised `botocore.exceptions.ParamValidationError`.
+2. `ParamValidationError` is a `BotoCoreError` subclass, not a
+   `ClientError` — the endpoint's original `except ClientError` block
+   didn't catch it, so the failure surfaced as a raw, unhandled 500
+   instead of a clean `502`. Fixed by also catching `BotoCoreError`.
+
+Verified live end-to-end: created a real conversation against the
+deployed Runtime, set a title, confirmed it appeared in
+`GET /api/conversations` in place of the preview and was correctly
+excluded from `GET /api/conversations/{id}`'s transcript, then renamed it
+a second time and confirmed the newer title won.
+
+Added 10 more tests to `web/tests/test_server.py` (title preferred over
+preview, title `None` when never renamed, latest-of-two-renames wins,
+marker excluded from transcript, successful `PUT` with correct
+metadata/`extractionMode`/bare session ID, whitespace normalization,
+empty-title rejection, long-title truncation, 404 when `--memory-id`
+unset, 502 on `ClientError`). Full suite: 74/74 passing.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

@@ -214,20 +214,97 @@ function renderConversationList(conversations) {
     }
     li.dataset.sessionId = conv.session_id;
 
-    const preview = document.createElement("div");
-    preview.className = "conversation-preview";
-    preview.textContent = conv.preview;
-    li.appendChild(preview);
+    const textWrap = document.createElement("div");
+    textWrap.className = "conversation-text";
+
+    const label = document.createElement("div");
+    label.className = "conversation-preview";
+    // A user-set title takes priority; otherwise fall back to the
+    // auto-generated preview from the first message.
+    label.textContent = conv.title || conv.preview;
+    textWrap.appendChild(label);
 
     if (conv.created_at) {
       const date = document.createElement("div");
       date.className = "conversation-date";
       date.textContent = new Date(conv.created_at).toLocaleString();
-      li.appendChild(date);
+      textWrap.appendChild(date);
     }
 
-    li.addEventListener("click", () => switchConversation(conv.session_id));
+    textWrap.addEventListener("click", () => switchConversation(conv.session_id));
+    li.appendChild(textWrap);
+
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "icon-btn conversation-rename-btn";
+    renameBtn.title = "Rename conversation";
+    renameBtn.setAttribute("aria-label", "Rename conversation");
+    renameBtn.textContent = "✎";
+    renameBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      startRenaming(li, conv);
+    });
+    li.appendChild(renameBtn);
+
     conversationListEl.appendChild(li);
+  }
+}
+
+function startRenaming(li, conv) {
+  const textWrap = li.querySelector(".conversation-text");
+  const currentValue = conv.title || "";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "conversation-rename-input";
+  input.value = currentValue;
+  input.maxLength = 80;
+
+  textWrap.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = async (commit) => {
+    if (settled) return;
+    settled = true;
+    const newTitle = input.value.trim();
+    if (commit && newTitle && newTitle !== currentValue) {
+      await renameConversation(conv.session_id, newTitle);
+    } else {
+      refreshConversationList();
+    }
+  };
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      finish(true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function renameConversation(targetSessionId, title) {
+  try {
+    const res = await fetch(
+      `/api/conversations/${encodeURIComponent(targetSessionId)}/title`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      }
+    );
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      appendMessage("error", data.detail || "Could not rename that conversation.");
+    }
+  } catch (err) {
+    appendMessage("error", `Could not rename that conversation: ${err.message}`);
+  } finally {
+    refreshConversationList();
   }
 }
 

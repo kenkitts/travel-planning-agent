@@ -91,7 +91,10 @@ body {
 }
 
 .conversation-item {
-  padding: 0.55rem 0.65rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.3rem;
+  padding: 0.55rem 0.4rem 0.55rem 0.65rem;
   border-radius: 8px;
   cursor: pointer;
   margin-bottom: 0.2rem;
@@ -103,6 +106,33 @@ body {
 
 .conversation-item.active {
   background: #e8edfc;
+}
+
+.conversation-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.conversation-rename-btn {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+  opacity: 0;
+  padding: 0.15rem 0.35rem;
+}
+
+.conversation-item:hover .conversation-rename-btn,
+.conversation-item:focus-within .conversation-rename-btn {
+  opacity: 1;
+}
+
+.conversation-rename-input {
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.1rem 0.3rem;
+  border: 1px solid var(--bubble-user);
+  border-radius: 4px;
+  box-sizing: border-box;
 }
 
 .conversation-preview {
@@ -136,6 +166,11 @@ body {
 
   #sidebar-close-btn {
     display: inline-block;
+  }
+
+  /* No hover on touch — keep the rename button reachable. */
+  .conversation-rename-btn {
+    opacity: 1;
   }
 }
 

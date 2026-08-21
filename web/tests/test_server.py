@@ -152,6 +152,21 @@ def _conversational_event(role: str, text: str, timestamp=None) -> dict:
     return event
 
 
+def _title_marker_event(title: str) -> dict:
+    """Build a fake title-marker event, as written by set_conversation_title."""
+    return {
+        "payload": [
+            {
+                "conversational": {
+                    "role": "USER",
+                    "content": {"text": f"Conversation renamed to “{title}”"},
+                }
+            }
+        ],
+        "metadata": {"conversationTitle": {"stringValue": title}},
+    }
+
+
 class ConversationHistoryEndpointTests(unittest.TestCase):
     """Tests for GET /api/conversations and GET /api/conversations/{session_id}."""
 
@@ -373,6 +388,160 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertIn("boom", response.json()["detail"])
+
+    def test_list_conversations_prefers_title_over_preview(self):
+        self.mock_client.list_sessions.return_value = {
+            "sessionSummaries": [{"sessionId": BARE_SESSION_ID, "createdAt": None}]
+        }
+        self.mock_client.list_events.return_value = {
+            "events": [
+                # Newest-first: the marker (latest) comes before the turns.
+                _title_marker_event("Seattle Coffee Trip"),
+                _conversational_event("USER", "Plan a trip to Seattle"),
+            ]
+        }
+
+        response = self.client.get("/api/conversations")
+
+        conversations = response.json()
+        self.assertEqual(conversations[0]["title"], "Seattle Coffee Trip")
+        self.assertEqual(conversations[0]["preview"], "Plan a trip to Seattle")
+
+    def test_list_conversations_title_is_none_when_never_renamed(self):
+        self.mock_client.list_sessions.return_value = {
+            "sessionSummaries": [{"sessionId": BARE_SESSION_ID, "createdAt": None}]
+        }
+        self.mock_client.list_events.return_value = {
+            "events": [_conversational_event("USER", "Plan a trip to Seattle")]
+        }
+
+        response = self.client.get("/api/conversations")
+
+        self.assertIsNone(response.json()[0]["title"])
+
+    def test_list_conversations_uses_latest_title_when_renamed_twice(self):
+        self.mock_client.list_sessions.return_value = {
+            "sessionSummaries": [{"sessionId": BARE_SESSION_ID, "createdAt": None}]
+        }
+        self.mock_client.list_events.return_value = {
+            # Newest-first: the most recent rename must win.
+            "events": [
+                _title_marker_event("Seattle Trip v2"),
+                _title_marker_event("Seattle Trip v1"),
+                _conversational_event("USER", "Plan a trip to Seattle"),
+            ]
+        }
+
+        response = self.client.get("/api/conversations")
+
+        self.assertEqual(response.json()[0]["title"], "Seattle Trip v2")
+
+    def test_get_conversation_excludes_title_marker_from_transcript(self):
+        self.mock_client.list_events.return_value = {
+            "events": [
+                _title_marker_event("Seattle Coffee Trip"),
+                _conversational_event("ASSISTANT", "Here's your itinerary."),
+                _conversational_event("USER", "Plan a trip to Seattle"),
+            ]
+        }
+
+        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(
+            response.json()["turns"],
+            [
+                {"role": "user", "text": "Plan a trip to Seattle"},
+                {"role": "assistant", "text": "Here's your itinerary."},
+            ],
+        )
+
+    def test_set_title_writes_marker_event_with_metadata(self):
+        self.mock_client.create_event.return_value = {"event": {"eventId": "e1"}}
+
+        response = self.client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": "Seattle Coffee Trip"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(), {"session_id": VALID_SESSION_ID, "title": "Seattle Coffee Trip"}
+        )
+
+        self.mock_client.create_event.assert_called_once()
+        call_kwargs = self.mock_client.create_event.call_args.kwargs
+        self.assertEqual(call_kwargs["memoryId"], "mem-123")
+        self.assertEqual(call_kwargs["actorId"], "web-user")
+        # The full runtimeSessionId in the URL must be stripped to the bare
+        # component before calling CreateEvent, same as the other endpoints.
+        self.assertEqual(call_kwargs["sessionId"], BARE_SESSION_ID)
+        self.assertEqual(
+            call_kwargs["metadata"],
+            {"conversationTitle": {"stringValue": "Seattle Coffee Trip"}},
+        )
+        self.assertEqual(call_kwargs["extractionMode"], "SKIP")
+
+    def test_set_title_normalizes_whitespace(self):
+        self.mock_client.create_event.return_value = {"event": {"eventId": "e1"}}
+
+        response = self.client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": "  Seattle   Coffee\nTrip  "},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "Seattle Coffee Trip")
+
+    def test_set_title_rejects_empty_title(self):
+        response = self.client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": "   "},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.mock_client.create_event.assert_not_called()
+
+    def test_set_title_truncates_long_title(self):
+        self.mock_client.create_event.return_value = {"event": {"eventId": "e1"}}
+        long_title = "A" * 200
+
+        response = self.client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": long_title},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        returned_title = response.json()["title"]
+        self.assertLessEqual(len(returned_title), 80)
+        self.assertTrue(returned_title.endswith("…"))
+
+    def test_set_title_returns_404_when_memory_id_not_configured(self):
+        app = web_server.create_app(
+            agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
+            region="us-east-1",
+            actor_id="web-user",
+        )
+        client = TestClient(app)
+
+        response = client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": "New Title"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_set_title_returns_502_on_client_error(self):
+        self.mock_client.create_event.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+            "CreateEvent",
+        )
+
+        response = self.client.put(
+            f"/api/conversations/{VALID_SESSION_ID}/title",
+            json={"title": "New Title"},
+        )
+
+        self.assertEqual(response.status_code, 502)
 
 
 if __name__ == "__main__":

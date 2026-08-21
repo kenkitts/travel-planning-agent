@@ -29,12 +29,13 @@ exposed beyond localhost.
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import boto3
 import uvicorn
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +60,19 @@ PREVIEW_MAX_CHARS = 80
 # frontend, since that's what /api/chat (and InvokeAgentRuntime) require.
 RUNTIME_SESSION_ID_SEPARATOR = "___"
 
+# AgentCore Memory has no native "session title" field — ListSessions only
+# ever returns {sessionId, actorId, createdAt} (confirmed against the real
+# API; there's no metadata/label slot on a session itself). A user-set
+# title is instead stored as `metadata` on a dedicated marker event, using
+# CreateEvent's per-event metadata param (a real, separate feature from
+# the conversational payload — up to 15 key-value pairs, confirmed in
+# bedrock_agentcore.memory.client.MemoryClient.create_event's docstring).
+# `list_conversations` reads the *latest* marker event's title and prefers
+# it over the first-user-message preview; `_event_turns` skips marker
+# events entirely so a rename never shows up as a fake chat turn.
+TITLE_METADATA_KEY = "conversationTitle"
+MAX_TITLE_CHARS = 80
+
 
 class ChatRequest(BaseModel):
     """Request body for POST /api/chat."""
@@ -79,6 +93,7 @@ class ConversationSummary(BaseModel):
     session_id: str
     created_at: Optional[str] = None
     preview: str
+    title: Optional[str] = None
 
 
 class ConversationTurn(BaseModel):
@@ -95,13 +110,40 @@ class ConversationDetail(BaseModel):
     turns: list[ConversationTurn]
 
 
+class SetTitleRequest(BaseModel):
+    """Request body for PUT /api/conversations/{session_id}/title."""
+
+    title: str
+
+
+def _is_title_marker_event(event: dict) -> bool:
+    """True if this event is a title-rename marker, not a real chat turn.
+
+    Marker events carry `TITLE_METADATA_KEY` in their event-level
+    `metadata` (set via CreateEvent's `metadata` param, not part of the
+    conversational payload) — this is enough to identify and skip them
+    without needing a special payload shape.
+    """
+    return TITLE_METADATA_KEY in (event.get("metadata") or {})
+
+
+def _event_title(event: dict) -> Optional[str]:
+    """Extract the title string from a title-marker event's metadata, if any."""
+    value = (event.get("metadata") or {}).get(TITLE_METADATA_KEY)
+    if isinstance(value, dict):
+        return value.get("stringValue")
+    return None
+
+
 def _event_turns(event: dict) -> list[ConversationTurn]:
     """Extract (role, text) turns from one AgentCore Memory event's payload.
 
     Each event's `payload` is a list of items. Only `conversational` items
     are turns — `blob` items (e.g. the agent's session/conversation-manager
     state snapshot, written by Strands' session persistence, not by
-    `AgentCoreMemorySessionManager`'s conversation history) are skipped.
+    `AgentCoreMemorySessionManager`'s conversation history) are skipped,
+    and so are title-marker events (see `_is_title_marker_event`) — a
+    rename must never appear as a fake chat turn in the transcript.
 
     A conversational item's `content.text` is not the plain reply string —
     confirmed against a real event via a live ListEvents call — it's a
@@ -115,6 +157,9 @@ def _event_turns(event: dict) -> list[ConversationTurn]:
     it isn't the expected JSON shape, so an unexpected/older event format
     degrades to showing something rather than nothing.
     """
+    if _is_title_marker_event(event):
+        return []
+
     turns = []
     for item in event.get("payload") or []:
         conv = item.get("conversational")
@@ -140,6 +185,21 @@ def _event_turns(event: dict) -> list[ConversationTurn]:
         if text:
             turns.append(ConversationTurn(role=role.lower(), text=text))
     return turns
+
+
+def _latest_title(events: list[dict]) -> Optional[str]:
+    """Return the most recent user-set title for a session, if any.
+
+    `events` is newest-first (as ListEvents returns it), so the first
+    marker event encountered is the latest rename — no need to compare
+    timestamps.
+    """
+    for event in events:
+        if _is_title_marker_event(event):
+            title = _event_title(event)
+            if title:
+                return title
+    return None
 
 
 def _first_user_preview(events: list[dict]) -> str:
@@ -261,6 +321,7 @@ def create_app(
                     session_id=f"{actor_id}{RUNTIME_SESSION_ID_SEPARATOR}{bare_session_id}",
                     created_at=created_at.isoformat() if created_at else None,
                     preview=_first_user_preview(events),
+                    title=_latest_title(events),
                 )
             )
 
@@ -316,6 +377,62 @@ def create_app(
             turns.extend(_event_turns(event))
 
         return ConversationDetail(session_id=session_id, turns=turns)
+
+    @app.put("/api/conversations/{session_id}/title")
+    def set_conversation_title(session_id: str, request: SetTitleRequest) -> dict:
+        if memory_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation history is unavailable: server was started "
+                "without --memory-id",
+            )
+
+        title = " ".join(request.title.split())
+        if not title:
+            raise HTTPException(status_code=400, detail="title must not be empty")
+        if len(title) > MAX_TITLE_CHARS:
+            title = title[: MAX_TITLE_CHARS - 1].rstrip() + "…"
+
+        bare_session_id = session_id.split(RUNTIME_SESSION_ID_SEPARATOR, 1)[-1]
+
+        try:
+            # A marker event, not a real chat turn: extractionMode=SKIP
+            # keeps it out of long-term memory extraction (it's a UI label,
+            # not something the traveler said), and _is_title_marker_event
+            # keeps it out of transcripts and previews. The title itself
+            # lives in event-level `metadata` (CreateEvent's dedicated
+            # key-value field), not the conversational payload — so a
+            # rename can never be mistaken for something the user typed in
+            # chat. A minimal placeholder payload is still required: the
+            # API's `payload` field for a conversational event can't be
+            # empty. eventTimestamp is also required by the raw API
+            # (bedrock_agentcore.memory.client.MemoryClient.create_event
+            # defaults it internally, but this server calls the plain
+            # boto3 client directly, which does not — confirmed live: an
+            # omitted eventTimestamp raises ParamValidationError, a
+            # botocore.exceptions.BotoCoreError subclass, not a ClientError).
+            client.create_event(
+                memoryId=memory_id,
+                actorId=actor_id,
+                sessionId=bare_session_id,
+                eventTimestamp=datetime.now(timezone.utc),
+                payload=[
+                    {
+                        "conversational": {
+                            "content": {"text": f"Conversation renamed to “{title}”"},
+                            "role": "USER",
+                        }
+                    }
+                ],
+                metadata={TITLE_METADATA_KEY: {"stringValue": title}},
+                extractionMode="SKIP",
+            )
+        except (ClientError, BotoCoreError) as e:
+            raise HTTPException(
+                status_code=502, detail=f"Failed to set title: {e}"
+            ) from e
+
+        return {"session_id": session_id, "title": title}
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app

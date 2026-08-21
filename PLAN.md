@@ -252,6 +252,42 @@ travel-planning-agent/
       above.
 - [x] Full repo test suite passing: 48/48 (`tests/` + `web/tests/`).
 
+### Post-Phase-7 fix: MaxTokensReachedException surfaced as an opaque 500
+Reported by the user via the web UI: `InvokeAgentRuntime` returned
+`RuntimeClientError` / HTTP 500 ("Received error (500) from runtime.").
+CloudWatch runtime logs showed the real cause:
+`strands.types.exceptions.MaxTokensReachedException: Model stopped
+generating due to maximum token limit` — a real request (3-day luxury
+Diablo Lake / North Cascades itinerary, dog-friendly, 13 tool calls before
+the final answer) ran the model out of its Bedrock Converse `maxTokens`
+budget mid-response. `BedrockModel` only sets `maxTokens` on the request if
+`max_tokens` is explicitly configured — `agent/agent.py` never set it, so
+Bedrock fell back to its own default limit, which wasn't enough for a long,
+richly-detailed, tool-grounded itinerary. The exception propagated
+uncaught out of `invoke()`, which AgentCore Runtime reports to callers as a
+generic 500.
+
+Two fixes in `agent/agent.py`:
+1. `BedrockModel(..., max_tokens=MAX_OUTPUT_TOKENS)` with
+   `MAX_OUTPUT_TOKENS = 8192` (overridable via `MAX_OUTPUT_TOKENS` env var),
+   giving long itineraries realistic headroom.
+2. Added `run_agent_turn()`, wrapping `agent(user_message)`: if
+   `MaxTokensReachedException` is still raised (a response longer than even
+   8192 tokens), Strands has already appended the partial assistant message
+   to `agent.messages` — confirmed by reading `strands.event_loop.event_loop`
+   and `_recover_message_on_max_tokens_reached` source directly rather than
+   assuming — so the partial text is extracted and returned with a
+   "cut off, ask me to continue" note instead of failing the whole request.
+
+Added 3 new tests to `tests/test_agent.py` (`RunAgentTurnTests`, using a
+`MagicMock` fake agent to deterministically exercise the success and
+max-tokens paths without needing a real model call). Full suite: 51/51
+passing. Verified live: redeployed `TravelAgentRuntimeStack`, then
+re-sent the exact same reproduction prompt (3-day Diablo Lake/Bella
+itinerary) through the running local web server — returned a complete
+4504-character itinerary with a natural ending, HTTP 200, and CloudWatch
+confirmed `"Invocation completed successfully (56.617s)"` with no exception.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

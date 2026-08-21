@@ -1,14 +1,16 @@
 """Unit tests for agent/agent.py's pure-function helpers.
 
-Only exercises extract_response_text() and parse_runtime_session_id(),
-which have no AWS/network dependencies. Does not invoke the Agent itself
-or anything requiring live AgentCore Memory/Gateway/model access.
+Covers extract_response_text(), run_agent_turn(), and
+parse_runtime_session_id(). run_agent_turn() is tested with a fake Agent
+double (no real Strands Agent, no AWS/network dependencies) so the
+MaxTokensReachedException handling path can be exercised deterministically.
 """
 import importlib.util
 import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 _AGENT_DIR = Path(__file__).resolve().parents[1] / "agent"
 _AGENT_PATH = _AGENT_DIR / "agent.py"
@@ -80,6 +82,44 @@ class ParseRuntimeSessionIdTests(unittest.TestCase):
 
         self.assertEqual(actor_id, travel_agent.DEFAULT_ACTOR_ID)
         self.assertEqual(session_id, "default-session")
+
+
+class RunAgentTurnTests(unittest.TestCase):
+    def test_returns_text_on_success(self):
+        fake_agent = MagicMock()
+        fake_agent.return_value.message = {
+            "role": "assistant",
+            "content": [{"text": "Here's your itinerary."}],
+        }
+
+        result = travel_agent.run_agent_turn(fake_agent, "Plan a trip")
+
+        self.assertEqual(result, "Here's your itinerary.")
+        fake_agent.assert_called_once_with("Plan a trip")
+
+    def test_returns_partial_text_with_note_on_max_tokens(self):
+        fake_agent = MagicMock()
+        fake_agent.side_effect = travel_agent.MaxTokensReachedException("truncated")
+        # Per Strands: the partial message is appended to agent.messages
+        # before the exception is raised.
+        fake_agent.messages = [
+            {"role": "assistant", "content": [{"text": "Here's your partial itinerary..."}]}
+        ]
+
+        result = travel_agent.run_agent_turn(fake_agent, "Plan a big trip")
+
+        self.assertIn("Here's your partial itinerary...", result)
+        self.assertIn("cut off", result)
+
+    def test_returns_fallback_message_when_partial_text_is_empty(self):
+        fake_agent = MagicMock()
+        fake_agent.side_effect = travel_agent.MaxTokensReachedException("truncated")
+        fake_agent.messages = [{"role": "assistant", "content": []}]
+
+        result = travel_agent.run_agent_turn(fake_agent, "Plan a big trip")
+
+        self.assertIn("cut off", result)
+        self.assertNotIn("None", result)
 
 
 if __name__ == "__main__":

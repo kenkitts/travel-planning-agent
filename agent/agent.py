@@ -39,6 +39,7 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
+from strands.types.exceptions import MaxTokensReachedException
 from strands.tools.mcp.mcp_client import MCPClient
 
 from prompts import SYSTEM_PROMPT
@@ -52,6 +53,17 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Sonnet is the design's chosen model (see DESIGN.md decision #7) for its
 # multi-step reasoning and tool-use reliability across the three Gateway tools.
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
+# Bedrock's Converse API defaults to a fairly low per-model max output token
+# limit if maxTokens is omitted from the request (BedrockModel only sets it
+# when max_tokens is explicitly configured). A real multi-day, tool-grounded
+# itinerary response can be long — confirmed in production: a 3-day trip
+# request that made 13 tool calls before writing its answer hit
+# strands.types.exceptions.MaxTokensReachedException partway through the
+# itinerary, which surfaced to callers as an opaque
+# InvokeAgentRuntime 500 error. 8192 gives long itineraries realistic room
+# to complete; MAX_TOKENS_REACHED is still handled gracefully in invoke()
+# below in case an even longer response exceeds this.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
 
 # Namespace patterns must match those configured on the Memory resource in
 # cdk/stacks/memory_stack.py.
@@ -79,6 +91,35 @@ def extract_response_text(message: dict) -> str:
     content = message.get("content") or []
     text_parts = [block["text"] for block in content if isinstance(block, dict) and "text" in block]
     return "\n".join(text_parts).strip()
+
+
+def run_agent_turn(agent: Agent, user_message: str) -> str:
+    """Run one turn and return the assistant's plain-text reply.
+
+    Handles strands.types.exceptions.MaxTokensReachedException gracefully:
+    if the model runs out of its output token budget mid-response (confirmed
+    in production for a long, tool-heavy multi-day itinerary), Strands has
+    already appended the partial assistant message to `agent.messages`
+    before raising — rather than letting that exception propagate out of
+    the AgentCore Runtime entrypoint as an opaque InvokeAgentRuntime 500
+    error, return the partial text with a note so the traveler still gets a
+    usable (if truncated) answer and knows to ask for more.
+    """
+    try:
+        result = agent(user_message)
+        return extract_response_text(result.message)
+    except MaxTokensReachedException:
+        logger.warning("Model hit max_tokens mid-response; returning partial reply")
+        partial_text = extract_response_text(agent.messages[-1])
+        note = (
+            "\n\n*(That response got cut off — it was longer than I could send in one "
+            "go. Ask me to continue, or ask for a shorter version, and I'll pick up "
+            "where I left off.)*"
+        )
+        return (partial_text + note) if partial_text else (
+            "Sorry, that response got cut off before I could write anything back to "
+            "you. Could you try again, maybe asking for a shorter answer?"
+        )
 
 
 def parse_runtime_session_id(runtime_session_id: Optional[str]) -> tuple[str, str]:
@@ -186,7 +227,9 @@ def invoke(payload: dict, context: Any = None) -> dict:
 
     session_manager = build_session_manager(actor_id, session_id)
     mcp_client = build_mcp_client()
-    model = BedrockModel(model_id=MODEL_ID, region_name=AWS_REGION)
+    model = BedrockModel(
+        model_id=MODEL_ID, region_name=AWS_REGION, max_tokens=MAX_OUTPUT_TOKENS
+    )
 
     if mcp_client is None:
         agent = Agent(
@@ -194,8 +237,7 @@ def invoke(payload: dict, context: Any = None) -> dict:
             system_prompt=SYSTEM_PROMPT,
             session_manager=session_manager,
         )
-        result = agent(user_message)
-        return {"response": extract_response_text(result.message)}
+        return {"response": run_agent_turn(agent, user_message)}
 
     with mcp_client:
         tools = mcp_client.list_tools_sync()
@@ -207,8 +249,7 @@ def invoke(payload: dict, context: Any = None) -> dict:
             system_prompt=SYSTEM_PROMPT,
             session_manager=session_manager,
         )
-        result = agent(user_message)
-        return {"response": extract_response_text(result.message)}
+        return {"response": run_agent_turn(agent, user_message)}
 
 
 if __name__ == "__main__":

@@ -103,8 +103,25 @@ def build_session_manager(actor_id: str, session_id: str) -> Optional[AgentCoreM
         session_id=session_id,
         actor_id=actor_id,
         retrieval_config={
-            USER_PREFERENCE_NAMESPACE: RetrievalConfig(top_k=5, relevance_score=0.5),
-            SUMMARIZATION_NAMESPACE: RetrievalConfig(top_k=3, relevance_score=0.3),
+            # relevance_score=0.0 is set explicitly, NOT omitted. Omitting it
+            # would fall back to RetrievalConfig's own default of 0.2 — still a
+            # nonzero threshold. bedrock-agentcore==1.21.0's
+            # AgentCoreMemorySessionManager.retrieve_customer_context() filters
+            # retrieved records with `m.get("score", 0.0) >= relevance_score`,
+            # but retrieve_memory_records's real memoryRecordSummaries objects
+            # carry no "score" field at all (confirmed against live records via
+            # list-memory-records) — every record defaults to score 0.0, so any
+            # positive threshold discards every record unconditionally. This
+            # silently dropped every retrieved memory before it could be
+            # injected into the model's context, even though an earlier,
+            # unconditional "Retrieved N memories from namespace" log line (in
+            # MemoryClient.retrieve_memories, logged before this filter runs)
+            # made it look like retrieval had succeeded. relevance_score=0.0
+            # disables the filter (the library's own `if
+            # retrieval_config.relevance_score:` guard treats 0.0 as falsy);
+            # top_k alone still bounds how many records come back.
+            USER_PREFERENCE_NAMESPACE: RetrievalConfig(top_k=5, relevance_score=0.0),
+            SUMMARIZATION_NAMESPACE: RetrievalConfig(top_k=3, relevance_score=0.0),
         },
     )
     return AgentCoreMemorySessionManager(

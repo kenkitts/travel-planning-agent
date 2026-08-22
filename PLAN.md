@@ -386,6 +386,53 @@ metadata/`extractionMode`/bare session ID, whitespace normalization,
 empty-title rejection, long-title truncation, 404 when `--memory-id`
 unset, 502 on `ClientError`). Full suite: 74/74 passing.
 
+### Post-Phase-7 feature: delete conversations
+Requested by the user: the ability to remove old conversations from the
+sidebar.
+
+AgentCore Memory has no session-level delete API — confirmed via a wide
+code search across dozens of real implementations (TypeScript
+`SdkSessionsMemoryStore.deleteSession`, several `clear_session`/
+`clear_memory.py` scripts, a Next.js `DELETE` route) — every one of them
+deletes a "session" by listing all of its events and deleting them one at
+a time via `DeleteEvent`; there is no `DeleteSession` or batch-delete-
+events operation. `list_conversations` already skips sessions with zero
+events, so deleting every event is sufficient to make a conversation
+disappear from the sidebar.
+
+New endpoint: `DELETE /api/conversations/{session_id}`. Implementation:
+`_list_all_event_ids()` pages through `ListEvents` with
+`includePayloads=False` (IDs only; payloads are dead weight on the delete
+path) and collects every event ID *before* deleting any of them — deleting
+while paging can invalidate the pagination token, a failure mode called
+out in more than one of the real implementations found. Deletion is then
+best-effort: one failed `DeleteEvent` call doesn't abort the rest (there's
+no batch/atomic delete to make this transactional), and the response
+reports `deleted_events`/`failed_events` counts rather than an all-or-
+nothing success/failure — a session with leftover events just doesn't
+fully disappear from the sidebar, which is visible and re-triable rather
+than a silent partial/corrupt state. 404s if the session has zero events
+to begin with (nothing to delete) or on `ResourceNotFoundException`.
+
+Frontend: each sidebar item gained a trash icon (same hover/mobile-visible
+behavior as the rename pencil) that shows a native `window.confirm()`
+prompt — appropriate for a local, single-user dev tool, not worth a custom
+modal — before calling the endpoint. If the deleted conversation was the
+currently active session, the UI starts a fresh conversation afterward
+rather than leaving a transcript on screen for a session that no longer
+exists.
+
+Verified live end-to-end against the real deployed Runtime + Memory
+resource: created a conversation, confirmed it appeared in the list,
+deleted it (5 events — 2 chat turns plus 3 Strands session-state
+snapshots), confirmed the list came back empty and
+`GET /api/conversations/{id}` correctly 404'd afterward.
+
+Added 7 tests to `web/tests/test_server.py` (full deletion, multi-page
+pagination, partial-failure reporting, 404 on an empty/nonexistent
+session, 404 on `ResourceNotFoundException` vs. 502 on other `ClientError`
+codes, 404 when `--memory-id` is unset). Full suite: 81/81 passing.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

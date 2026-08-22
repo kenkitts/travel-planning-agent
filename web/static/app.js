@@ -245,7 +245,50 @@ function renderConversationList(conversations) {
     });
     li.appendChild(renameBtn);
 
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "icon-btn conversation-delete-btn";
+    deleteBtn.title = "Delete conversation";
+    deleteBtn.setAttribute("aria-label", "Delete conversation");
+    deleteBtn.textContent = "🗑";
+    deleteBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      confirmAndDelete(conv);
+    });
+    li.appendChild(deleteBtn);
+
     conversationListEl.appendChild(li);
+  }
+}
+
+async function confirmAndDelete(conv) {
+  const label = conv.title || conv.preview;
+  const confirmed = window.confirm(
+    `Delete "${label}"? This permanently removes it from AgentCore Memory and cannot be undone.`
+  );
+  if (!confirmed) return;
+
+  try {
+    const res = await fetch(`/api/conversations/${encodeURIComponent(conv.session_id)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      appendMessage("error", data.detail || "Could not delete that conversation.");
+      return;
+    }
+
+    // If the deleted conversation was the active one, there's nothing left
+    // to show — start a fresh conversation rather than leaving a stale
+    // transcript on screen for a session that no longer exists.
+    if (conv.session_id === sessionId) {
+      sessionId = buildSessionId(actorId);
+      localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+      messagesEl.innerHTML = "";
+    }
+  } catch (err) {
+    appendMessage("error", `Could not delete that conversation: ${err.message}`);
+  } finally {
+    refreshConversationList();
   }
 }
 

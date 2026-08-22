@@ -120,8 +120,22 @@ body {
   padding: 0.15rem 0.35rem;
 }
 
+.conversation-delete-btn {
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  opacity: 0;
+  padding: 0.15rem 0.35rem;
+}
+
+.conversation-delete-btn:hover {
+  background: #fef2f2;
+  color: var(--error);
+}
+
 .conversation-item:hover .conversation-rename-btn,
-.conversation-item:focus-within .conversation-rename-btn {
+.conversation-item:focus-within .conversation-rename-btn,
+.conversation-item:hover .conversation-delete-btn,
+.conversation-item:focus-within .conversation-delete-btn {
   opacity: 1;
 }
 
@@ -168,8 +182,9 @@ body {
     display: inline-block;
   }
 
-  /* No hover on touch — keep the rename button reachable. */
-  .conversation-rename-btn {
+  /* No hover on touch — keep the rename/delete buttons reachable. */
+  .conversation-rename-btn,
+  .conversation-delete-btn {
     opacity: 1;
   }
 }

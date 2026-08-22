@@ -144,16 +144,19 @@ start over. Long-term memory is scoped by `--actor-id`, same as the CLI.
 **conversation history sidebar**: a list of your past conversations with a
 preview of each, read live from AgentCore Memory (`ListSessions`/
 `ListEvents`) rather than any local storage — click one to load its full
-transcript and continue it. Hover a conversation and click the pencil icon
-to give it a custom name, which then replaces the auto-generated preview in
-the sidebar (stored as metadata on a dedicated marker event via
+transcript and continue it. Hover a conversation for two icons: a pencil to
+give it a custom name (stored as metadata on a dedicated marker event via
 `CreateEvent`, since AgentCore Memory has no native session-title field —
 this marker is excluded from the transcript and long-term memory
-extraction). Omit `--memory-id` to run without the sidebar.
+extraction), and a trash icon to permanently delete it (with a confirmation
+prompt — AgentCore Memory has no session-level delete API either, so this
+deletes every event in the session one at a time via `DeleteEvent`). Omit
+`--memory-id` to run without the sidebar.
 This requires your local AWS credentials to additionally have
-`bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and
-`bedrock-agentcore:CreateEvent` permission on the Memory resource
-(`InvokeAgentRuntime` alone, as used for chat, is not sufficient).
+`bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`,
+`bedrock-agentcore:CreateEvent`, and `bedrock-agentcore:DeleteEvent`
+permission on the Memory resource (`InvokeAgentRuntime` alone, as used for
+chat, is not sufficient).
 
 Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
 - No login/auth — it's a local dev tool for one person, not multi-user or
@@ -163,8 +166,10 @@ Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
 - No token-by-token streaming — full responses only, matching the CLI.
 - No structured itinerary rendering — agent responses are rendered as
   plain markdown (headings, bold/italic, lists) in the chat bubble.
-- Conversation history is read-only and scoped to the current `--actor-id`
-  — there's no delete/search across actors, only rename (custom titles).
+- Conversation history is scoped to the current `--actor-id` — no search or
+  history across different actors. Rename and delete are supported;
+  deletion is permanent (there is no undo, and no confirmation beyond the
+  browser's own confirm prompt).
 
 ## Testing
 

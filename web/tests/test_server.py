@@ -543,6 +543,112 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
 
+    def test_delete_conversation_deletes_all_events(self):
+        self.mock_client.list_events.return_value = {
+            "events": [{"eventId": "e1"}, {"eventId": "e2"}, {"eventId": "e3"}]
+        }
+        self.mock_client.delete_event.return_value = {}
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"session_id": VALID_SESSION_ID, "deleted_events": 3, "failed_events": 0},
+        )
+        self.assertEqual(self.mock_client.delete_event.call_count, 3)
+        for call in self.mock_client.delete_event.call_args_list:
+            self.assertEqual(call.kwargs["memoryId"], "mem-123")
+            self.assertEqual(call.kwargs["actorId"], "web-user")
+            # The full runtimeSessionId in the URL must be stripped to the
+            # bare component, same as the other endpoints.
+            self.assertEqual(call.kwargs["sessionId"], BARE_SESSION_ID)
+
+        self.mock_client.list_events.assert_called_once_with(
+            memoryId="mem-123",
+            actorId="web-user",
+            sessionId=BARE_SESSION_ID,
+            maxResults=100,
+            includePayloads=False,
+        )
+
+    def test_delete_conversation_paginates_through_all_events(self):
+        self.mock_client.list_events.side_effect = [
+            {"events": [{"eventId": "e1"}], "nextToken": "page2"},
+            {"events": [{"eventId": "e2"}]},
+        ]
+        self.mock_client.delete_event.return_value = {}
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["deleted_events"], 2)
+        self.assertEqual(self.mock_client.list_events.call_count, 2)
+        second_call_kwargs = self.mock_client.list_events.call_args_list[1].kwargs
+        self.assertEqual(second_call_kwargs["nextToken"], "page2")
+
+    def test_delete_conversation_reports_partial_failure(self):
+        self.mock_client.list_events.return_value = {
+            "events": [{"eventId": "e1"}, {"eventId": "e2"}]
+        }
+        self.mock_client.delete_event.side_effect = [
+            {},
+            ClientError(
+                {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+                "DeleteEvent",
+            ),
+        ]
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        # Best-effort: a partial failure is still a 200 with the failure
+        # count surfaced, not a 502 — the caller can see what happened and
+        # retry, rather than the whole delete aborting on one bad event.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"session_id": VALID_SESSION_ID, "deleted_events": 1, "failed_events": 1},
+        )
+
+    def test_delete_conversation_returns_404_for_empty_session(self):
+        self.mock_client.list_events.return_value = {"events": []}
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 404)
+        self.mock_client.delete_event.assert_not_called()
+
+    def test_delete_conversation_returns_404_for_resource_not_found_error(self):
+        self.mock_client.list_events.side_effect = _resource_not_found_error(
+            "ListEvents"
+        )
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_conversation_returns_502_on_other_client_error(self):
+        self.mock_client.list_events.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+            "ListEvents",
+        )
+
+        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_delete_conversation_returns_404_when_memory_id_not_configured(self):
+        app = web_server.create_app(
+            agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
+            region="us-east-1",
+            actor_id="web-user",
+        )
+        client = TestClient(app)
+
+        response = client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+
+        self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

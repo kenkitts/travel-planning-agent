@@ -19,8 +19,9 @@ Then open http://localhost:<port> in a browser.
 
 Auth: standard AWS credential resolution (env vars, profile, IAM role).
 The invoking principal must have `bedrock-agentcore:InvokeAgentRuntime`
-permission on the target agent runtime, and `bedrock-agentcore:ListSessions`
-+ `bedrock-agentcore:ListEvents` on the Memory resource for the
+permission on the target agent runtime, and `bedrock-agentcore:ListSessions`,
+`bedrock-agentcore:ListEvents`, `bedrock-agentcore:CreateEvent`, and
+`bedrock-agentcore:DeleteEvent` on the Memory resource for the
 conversation-history endpoints (IAM-only auth, per DESIGN.md decision #15 —
 there is no separate API key or bearer token). Because this server holds
 real AWS credentials and proxies them into agent calls, it must not be
@@ -114,6 +115,14 @@ class SetTitleRequest(BaseModel):
     """Request body for PUT /api/conversations/{session_id}/title."""
 
     title: str
+
+
+class DeleteConversationResponse(BaseModel):
+    """Response body for DELETE /api/conversations/{session_id}."""
+
+    session_id: str
+    deleted_events: int
+    failed_events: int
 
 
 def _is_title_marker_event(event: dict) -> bool:
@@ -218,6 +227,38 @@ def _first_user_preview(events: list[dict]) -> str:
                     text = text[:PREVIEW_MAX_CHARS].rstrip() + "…"
                 return text
     return "(empty conversation)"
+
+
+def _list_all_event_ids(client, memory_id: str, actor_id: str, session_id: str) -> list[str]:
+    """Collect every eventId for a session, paginating via nextToken.
+
+    Used by DELETE /api/conversations/{session_id}: AgentCore Memory has no
+    session-level delete API (confirmed via code search across dozens of
+    real implementations — every one deletes a "session" by deleting all
+    of its events one at a time; there is no DeleteSession/batch-delete-
+    events operation). Collecting all IDs first, then deleting, avoids
+    invalidating the pagination token mid-delete.
+    """
+    event_ids: list[str] = []
+    next_token: Optional[str] = None
+    while True:
+        kwargs = {
+            "memoryId": memory_id,
+            "actorId": actor_id,
+            "sessionId": session_id,
+            "maxResults": 100,
+            "includePayloads": False,  # IDs only; payloads are dead weight here.
+        }
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = client.list_events(**kwargs)
+        event_ids.extend(
+            event["eventId"] for event in response.get("events", []) if event.get("eventId")
+        )
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return event_ids
 
 
 def create_app(
@@ -434,6 +475,56 @@ def create_app(
 
         return {"session_id": session_id, "title": title}
 
+    @app.delete(
+        "/api/conversations/{session_id}", response_model=DeleteConversationResponse
+    )
+    def delete_conversation(session_id: str) -> DeleteConversationResponse:
+        if memory_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation history is unavailable: server was started "
+                "without --memory-id",
+            )
+
+        bare_session_id = session_id.split(RUNTIME_SESSION_ID_SEPARATOR, 1)[-1]
+
+        try:
+            event_ids = _list_all_event_ids(client, memory_id, actor_id, bare_session_id)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                raise HTTPException(
+                    status_code=404, detail="Conversation not found"
+                ) from e
+            raise HTTPException(
+                status_code=502, detail=f"Failed to delete conversation: {e}"
+            ) from e
+
+        if not event_ids:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Best-effort: one failed DeleteEvent call shouldn't abort the rest,
+        # matching every real-world implementation found for this pattern
+        # (there's no batch-delete-events API to make this atomic). A
+        # session with leftover events just doesn't fully disappear from
+        # the sidebar — visible and re-triable, not a partial/corrupt state.
+        deleted = 0
+        failed = 0
+        for event_id in event_ids:
+            try:
+                client.delete_event(
+                    memoryId=memory_id,
+                    actorId=actor_id,
+                    sessionId=bare_session_id,
+                    eventId=event_id,
+                )
+                deleted += 1
+            except (ClientError, BotoCoreError):
+                failed += 1
+
+        return DeleteConversationResponse(
+            session_id=session_id, deleted_events=deleted, failed_events=failed
+        )
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
 
@@ -473,8 +564,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="AgentCore Memory resource ID (see the TravelAgentMemoryStack "
         "CloudFormation outputs). Enables the conversation-history sidebar "
         "(GET /api/conversations); omit to run without it. Requires the "
-        "caller's AWS credentials to have bedrock-agentcore:ListSessions "
-        "and bedrock-agentcore:ListEvents on this Memory resource.",
+        "caller's AWS credentials to have bedrock-agentcore:ListSessions, "
+        "bedrock-agentcore:ListEvents, bedrock-agentcore:CreateEvent (for "
+        "renaming), and bedrock-agentcore:DeleteEvent (for deleting) on "
+        "this Memory resource.",
     )
     parser.add_argument(
         "--host",

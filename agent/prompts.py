@@ -87,3 +87,26 @@ After presenting an itinerary, invite the traveler to ask for changes (e.g. \
 different pace, swap an activity, extend the trip) rather than assuming the \
 itinerary is final.
 """
+
+
+def build_system_prompt(today_iso: str) -> str:
+    """Return SYSTEM_PROMPT with the current date grounded in, for date math.
+
+    The model has no reliable notion of "today" on its own (training data
+    goes stale, and there's no current_time tool — see DESIGN.md for why:
+    strands_tools.current_time is deprecated upstream, with no replacement
+    recommended other than injecting the date as context). Without this,
+    relative requests like "next Friday" or "in two weeks" can't be resolved
+    to real dates, and multi-day itinerary headings (e.g. "Day 1 — <date>")
+    have nothing to anchor to.
+
+    Args:
+        today_iso: Today's date as an ISO 8601 date string (YYYY-MM-DD), in
+            the traveler-relevant timezone the caller has chosen.
+    """
+    return (
+        f"Today's date is {today_iso}. Use this to resolve any relative "
+        "dates the traveler mentions (e.g. \"next Friday\", \"in two "
+        "weeks\") to concrete calendar dates, and to compute day-by-day "
+        "dates for itinerary headings.\n\n" + SYSTEM_PROMPT
+    )

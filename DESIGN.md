@@ -1,7 +1,6 @@
 # Travel Planning Agent — Design Decisions
 
 Status: Approved (interview complete, 2026-08-17)
-Owner: kenkitts
 
 ## 1. Purpose & Scope
 

@@ -12,6 +12,10 @@ Wires together:
     preferences and session summaries) via the Strands session_manager
     integration, so the agent recalls context within a session and across
     separate trips for the same traveler.
+  - A SummarizingConversationManager (proactive_compression=True, pin_first=6)
+    to bound in-session context growth for long-running conversations — see
+    build_conversation_manager() for why this replaces Strands' own silent
+    default.
 
 Configuration is read from environment variables set by RuntimeStack:
   GATEWAY_URL  - the AgentCore Gateway's MCP endpoint
@@ -26,6 +30,7 @@ invocations land on the same container.
 """
 import logging
 import os
+from datetime import date
 from typing import Any, Optional
 
 from bedrock_agentcore.memory.integrations.strands.config import (
@@ -38,11 +43,12 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
+from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models import BedrockModel
 from strands.types.exceptions import MaxTokensReachedException
 from strands.tools.mcp.mcp_client import MCPClient
 
-from prompts import SYSTEM_PROMPT
+from prompts import build_system_prompt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -211,6 +217,30 @@ def build_mcp_client() -> Optional[MCPClient]:
     )
 
 
+def build_conversation_manager() -> SummarizingConversationManager:
+    """Build the conversation manager that bounds in-session context growth.
+
+    Without this, Strands' own default (an unconfigured SlidingWindowConversationManager,
+    window_size=40) silently drops the oldest messages once a session passes ~15-20 turns,
+    with no summarization and no protection for anything said early in the conversation —
+    a real risk here, since a traveler's opening constraints (dates, party, budget, hard
+    must-avoids) need to still hold at turn 40 of a long itinerary-planning session.
+
+    - proactive_compression=True: compress ahead of a hard overflow (at ~70% of the
+      context window used) rather than waiting for a ContextWindowOverflowException,
+      which is SummarizingConversationManager's default (reactive-only) behavior.
+    - pin_first=6: permanently protects the first 6 messages (the traveler's opening
+      request and the agent's initial clarifying exchange) from summarization or eviction.
+      This is a blunt "protect the prefix" instrument, not a semantic one — constraints
+      stated later in a long clarifying back-and-forth aren't covered by it.
+    - summarization_agent is intentionally left unset: this reuses the same Sonnet model
+      already configured for the agent's normal turns (Strands calls agent.model directly
+      for the summarization call in that case). A separate, possibly cheaper model for
+      summarization specifically is a deliberate backlog item, not implemented here.
+    """
+    return SummarizingConversationManager(proactive_compression=True, pin_first=6)
+
+
 @app.entrypoint
 def invoke(payload: dict, context: Any = None) -> dict:
     """AgentCore Runtime entrypoint: one turn of the itinerary conversation.
@@ -230,12 +260,20 @@ def invoke(payload: dict, context: Any = None) -> dict:
     model = BedrockModel(
         model_id=MODEL_ID, region_name=AWS_REGION, max_tokens=MAX_OUTPUT_TOKENS
     )
+    # UTC "today" — there's no per-traveler timezone collected from the
+    # conversation (see prompts.py's requirements list), so this is the only
+    # unambiguous default. AgentCore Runtime containers run in UTC, so
+    # date.today() is already UTC here. At day granularity this only
+    # misaligns with a traveler's actual local date within a few hours of
+    # UTC midnight, which doesn't meaningfully affect itinerary date math.
+    system_prompt = build_system_prompt(date.today().isoformat())
 
     if mcp_client is None:
         agent = Agent(
             model=model,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             session_manager=session_manager,
+            conversation_manager=build_conversation_manager(),
         )
         return {"response": run_agent_turn(agent, user_message)}
 
@@ -246,8 +284,9 @@ def invoke(payload: dict, context: Any = None) -> dict:
         agent = Agent(
             model=model,
             tools=tools,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             session_manager=session_manager,
+            conversation_manager=build_conversation_manager(),
         )
         return {"response": run_agent_turn(agent, user_message)}
 

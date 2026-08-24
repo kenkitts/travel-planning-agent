@@ -72,7 +72,7 @@ travel-planning-agent/
       strategy enabled (built-in preference-extraction strategy) plus
       short-term event storage
 - [x] `cdk deploy` all stacks; capture Gateway URL/ARN + Memory ID as outputs
-      — deployed to account 800206160271, us-east-1. All 4 stacks
+      — deployed to a personal AWS account, us-east-1. All 4 stacks
       (`TravelAgentToolsStack`, `TravelAgentGatewayStack`,
       `TravelAgentMemoryStack`, `TravelAgentRuntimeStack`) reached
       `CREATE_COMPLETE`/`UPDATE_COMPLETE`.
@@ -159,7 +159,7 @@ travel-planning-agent/
 ## Phase 6 — Wrap-up
 - [x] `README.md` — setup, deploy, and usage instructions
 - [x] Review AWS costs incurred (Bedrock invocations, Lambda, Location Service calls)
-      — checked Cost Explorer for account 800206160271: no dedicated
+      — checked Cost Explorer for the deployment account: no dedicated
       Bedrock / Bedrock AgentCore / Location Service line items had posted
       yet as of this check (Cost Explorer has a ~24h+ reporting lag, and
       this session's usage happened same-day). Lambda cost so far is

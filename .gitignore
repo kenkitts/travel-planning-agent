@@ -35,5 +35,5 @@ htmlcov/
 .idea/
 .DS_Store
 
-# Logs
-*.log
+# Cache / generated artifacts (non-source, tool-specific)
+preflabel-iri-cache.json

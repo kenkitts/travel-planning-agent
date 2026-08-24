@@ -12,6 +12,20 @@ variables (GATEWAY_URL, MEMORY_ID) — this stack wires those from the
 GatewayStack and MemoryStack outputs, and grants the Runtime's execution
 role the permissions it needs to invoke the Bedrock model and call the
 Gateway.
+
+OTEL tracing (confirmed against a real deployment, contrary to the "no
+config needed for Runtime-hosted agents" framing in the AWS docs — that
+framing matches the `agentcore create`/`agentcore deploy` CLI flow, whose
+generated template bakes in ADOT; a hand-built code-asset zip via
+AgentRuntimeArtifact.from_code_asset does not get that for free) requires
+three things together, all present below: (1) aws-opentelemetry-distro in
+agent/requirements.txt, (2) the "opentelemetry-instrument" entrypoint
+wrapper on agent_runtime_artifact, and (3) the AGENT_OBSERVABILITY_ENABLED
+/ OTEL_PYTHON_DISTRO / OTEL_PYTHON_CONFIGURATOR environment variables.
+tracing_enabled=True on the Runtime construct is a separate, fourth
+requirement — it provisions the traces-delivery pipeline that ships
+already-emitted spans to CloudWatch, but does not itself cause any spans
+to be emitted.
 """
 from pathlib import Path
 
@@ -45,7 +59,16 @@ class RuntimeStack(Stack):
         agent_runtime_artifact = agentcore.AgentRuntimeArtifact.from_code_asset(
             path=str(AGENT_DIR),
             runtime=agentcore.AgentCoreRuntime.PYTHON_3_12,
-            entrypoint=["agent.py"],
+            # "opentelemetry-instrument" wraps the process with the ADOT auto-
+            # instrumentation entrypoint — required for code-asset (zip)
+            # AgentCore Runtime deployments to actually emit OTEL spans.
+            # Without this wrapper, aws-opentelemetry-distro is present in
+            # requirements.txt but never invoked, and the Runtime's `spans`
+            # log stream / X-Ray traces stay empty despite tracing_enabled
+            # on the CDK Runtime construct (confirmed against a real
+            # deployment: that flag only wires the traces-delivery pipeline,
+            # not the process instrumentation itself).
+            entrypoint=["opentelemetry-instrument", "agent.py"],
             bundling=BundlingOptions(
                 image=lambda_.Runtime.PYTHON_3_12.bundling_image,
                 command=[
@@ -73,7 +96,27 @@ class RuntimeStack(Stack):
                 "MEMORY_ID": memory.memory_id,
                 "AWS_REGION": self.region,
                 "MODEL_ID": DEFAULT_MODEL_ID,
+                # Required alongside the opentelemetry-instrument entrypoint
+                # wrapper (see agent_runtime_artifact above) for ADOT to
+                # activate AgentCore's GenAI-specific span processing and
+                # route telemetry to this Runtime's own CloudWatch log group
+                # (spans/otel-rt-logs streams) instead of a no-op exporter.
+                "AGENT_OBSERVABILITY_ENABLED": "true",
+                "OTEL_PYTHON_DISTRO": "aws_distro",
+                "OTEL_PYTHON_CONFIGURATOR": "aws_configurator",
             },
+            # Creates the traces-delivery pipeline (delivery source ->
+            # destination -> delivery) that routes this Runtime's X-Ray
+            # trace segments into CloudWatch Logs. This is plumbing only —
+            # it does not instrument the agent process itself. The actual
+            # span emission comes from the opentelemetry-instrument
+            # entrypoint wrapper + AGENT_OBSERVABILITY_ENABLED above.
+            # Requires CloudWatch Transaction Search enabled once per
+            # account (confirmed already enabled here: TransactionSearchXRayAccess
+            # resource policy + trace segment destination = CloudWatchLogs,
+            # 100% indexing) for spans to reach the GenAI Observability
+            # dashboard.
+            tracing_enabled=True,
         )
 
         # Claude Sonnet invocation for the agent's own reasoning. The "us."

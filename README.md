@@ -163,7 +163,11 @@ Scope/non-goals for the web UI (see `DESIGN.md` if you want to extend it):
   public-facing. Do not bind it to anything other than `127.0.0.1` (the
   default) or expose it beyond your machine — it holds your real AWS
   credentials.
-- No token-by-token streaming — full responses only, matching the CLI.
+- Live token-by-token streaming, with an optional diagnostic panel (off by
+  default) showing every event the agent emits — reasoning, tool calls,
+  full raw tool results, and the final answer — in a collapsible view. The
+  CLI does not stream visibly; it consumes the same event stream
+  internally and prints the final reply, matching its original UX.
 - No structured itinerary rendering — agent responses are rendered as
   plain markdown (headings, bold/italic, lists) in the chat bubble.
 - Conversation history is scoped to the current `--actor-id` — no search or

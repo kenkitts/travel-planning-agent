@@ -1,7 +1,8 @@
 """Unit tests for web/server.py.
 
-All calls to the AgentCore Runtime are mocked (via agent_client.invoke_agent)
-— no live network access, no real AWS credentials required.
+All calls to the AgentCore Runtime are mocked (via
+agent_client.stream_agent_events) — no live network access, no real AWS
+credentials required.
 """
 import importlib.util
 import json
@@ -40,6 +41,18 @@ def _resource_not_found_error(operation_name: str) -> ClientError:
     )
 
 
+def _parse_sse(body: str) -> list[dict]:
+    """Parse a "data: <json>\\n\\n"-framed SSE response body into event dicts."""
+    events = []
+    for frame in body.split("\n\n"):
+        frame = frame.strip()
+        if not frame:
+            continue
+        if frame.startswith("data: "):
+            events.append(json.loads(frame[len("data: "):]))
+    return events
+
+
 class ChatEndpointTests(unittest.TestCase):
     def setUp(self):
         # boto3.client() is created inside create_app(); patch it so no
@@ -57,9 +70,15 @@ class ChatEndpointTests(unittest.TestCase):
         )
         self.client = TestClient(self.app)
 
-    @patch("web_server.invoke_agent")
-    def test_chat_returns_agent_response(self, mock_invoke_agent):
-        mock_invoke_agent.return_value = "Here's a 2-day Boston itinerary..."
+    @patch("web_server.stream_agent_events")
+    def test_chat_returns_agent_response(self, mock_stream_agent_events):
+        mock_stream_agent_events.return_value = iter(
+            [
+                {"type": "text", "data": "Here's a 2-day "},
+                {"type": "text", "data": "Boston itinerary..."},
+                {"type": "done", "data": "Here's a 2-day Boston itinerary..."},
+            ]
+        )
 
         response = self.client.post(
             "/api/chat",
@@ -67,26 +86,33 @@ class ChatEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("text/event-stream", response.headers["content-type"])
+        events = _parse_sse(response.text)
         self.assertEqual(
-            response.json(), {"response": "Here's a 2-day Boston itinerary..."}
+            events,
+            [
+                {"type": "text", "data": "Here's a 2-day "},
+                {"type": "text", "data": "Boston itinerary..."},
+                {"type": "done", "data": "Here's a 2-day Boston itinerary..."},
+            ],
         )
-        mock_invoke_agent.assert_called_once()
-        call_args = mock_invoke_agent.call_args.args
-        # invoke_agent(client, agent_runtime_arn, runtime_session_id, prompt, qualifier)
+        mock_stream_agent_events.assert_called_once()
+        call_args = mock_stream_agent_events.call_args.args
+        # stream_agent_events(client, agent_runtime_arn, runtime_session_id, prompt, qualifier)
         self.assertEqual(call_args[1], "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test")
         self.assertEqual(call_args[2], VALID_SESSION_ID)
         self.assertEqual(call_args[3], "Plan a trip to Boston")
 
-    @patch("web_server.invoke_agent")
-    def test_chat_strips_whitespace_from_prompt(self, mock_invoke_agent):
-        mock_invoke_agent.return_value = "ok"
+    @patch("web_server.stream_agent_events")
+    def test_chat_strips_whitespace_from_prompt(self, mock_stream_agent_events):
+        mock_stream_agent_events.return_value = iter([{"type": "done", "data": "ok"}])
 
         self.client.post(
             "/api/chat",
             json={"prompt": "  Plan a trip  ", "session_id": VALID_SESSION_ID},
         )
 
-        call_args = mock_invoke_agent.call_args.args
+        call_args = mock_stream_agent_events.call_args.args
         self.assertEqual(call_args[3], "Plan a trip")
 
     def test_chat_rejects_empty_prompt(self):
@@ -107,17 +133,27 @@ class ChatEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("33 characters", response.json()["detail"])
 
-    @patch("web_server.invoke_agent")
-    def test_chat_propagates_agent_error_as_502(self, mock_invoke_agent):
-        mock_invoke_agent.side_effect = RuntimeError("Agent returned an error: boom")
+    @patch("web_server.stream_agent_events")
+    def test_chat_forwards_agent_error_as_in_band_sse_event(self, mock_stream_agent_events):
+        # A transport-level failure discovered mid-stream can't become an
+        # HTTPException — the response already started with a 200 — so it's
+        # forwarded as one more SSE event instead (see _event_stream()).
+        def _raising_generator():
+            yield {"type": "text", "data": "partial "}
+            raise RuntimeError("Agent returned an error: boom")
+
+        mock_stream_agent_events.return_value = _raising_generator()
 
         response = self.client.post(
             "/api/chat",
             json={"prompt": "hello", "session_id": VALID_SESSION_ID},
         )
 
-        self.assertEqual(response.status_code, 502)
-        self.assertIn("boom", response.json()["detail"])
+        self.assertEqual(response.status_code, 200)
+        events = _parse_sse(response.text)
+        self.assertEqual(events[0], {"type": "text", "data": "partial "})
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertIn("boom", events[-1]["data"]["note"])
 
     def test_config_endpoint_returns_actor_id(self):
         response = self.client.get("/api/config")

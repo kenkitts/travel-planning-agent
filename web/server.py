@@ -2,13 +2,24 @@
 """Local web UI backend for the Travel Planning Agent.
 
 Runs entirely on localhost — no new AWS infrastructure. Serves a small
-static chat UI and a JSON API that invokes the deployed AgentCore Runtime
-agent using the same `agent_client` module `cli/chat.py` uses (boto3's
-`bedrock-agentcore` client, standard AWS credential resolution), plus
-read-only endpoints that list and replay past conversations directly from
-AgentCore Memory (no separate local storage — Memory is the source of
+static chat UI and a streaming API that invokes the deployed AgentCore
+Runtime agent using the same `agent_client` module `cli/chat.py` uses
+(boto3's `bedrock-agentcore` client, standard AWS credential resolution),
+plus read-only endpoints that list and replay past conversations directly
+from AgentCore Memory (no separate local storage — Memory is the source of
 truth). Not designed for multi-user or public exposure: there is no login,
 and the agent's `actor_id` is fixed per server process via `--actor-id`.
+
+`POST /api/chat` streams the agent's response as Server-Sent Events —
+every labeled event the Runtime emits (reasoning/text/tool_use/tool_result/
+done/error, see agent/agent.py's stream_agent_turn()) is forwarded to the
+browser verbatim, live as the turn progresses. The frontend renders only
+"text" deltas into the chat bubble by default; a diagnostic toggle (off by
+default, see static/app.js) additionally shows every event — including
+full raw tool-result payloads — in a collapsible panel. Past-conversation
+replay (the sidebar's `GET /api/conversations/{session_id}`) is unaffected
+by this — it reads a session's already-persisted transcript from AgentCore
+Memory in one shot, not a re-simulated stream.
 
 Usage:
     python server.py --agent-runtime-arn <arn> --memory-id <id> \\
@@ -38,13 +49,13 @@ import boto3
 import uvicorn
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Reuse the same session-ID + InvokeAgentRuntime logic as cli/chat.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cli"))
-from agent_client import invoke_agent  # noqa: E402
+from agent_client import stream_agent_events  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -80,12 +91,6 @@ class ChatRequest(BaseModel):
 
     prompt: str
     session_id: str
-
-
-class ChatResponse(BaseModel):
-    """Response body for POST /api/chat."""
-
-    response: str
 
 
 class ConversationSummary(BaseModel):
@@ -284,8 +289,18 @@ def create_app(
         # frontend whether to show the conversation-history sidebar at all.
         return {"actor_id": actor_id, "history_enabled": memory_id is not None}
 
-    @app.post("/api/chat", response_model=ChatResponse)
-    def chat(request: ChatRequest) -> ChatResponse:
+    @app.post("/api/chat")
+    def chat(request: ChatRequest) -> StreamingResponse:
+        """Stream one turn's labeled events to the browser as SSE.
+
+        Forwards agent_client.stream_agent_events()'s parsed event dicts
+        (already validated to have a "type" key) back out as SSE frames —
+        the browser's EventSource-equivalent fetch/reader consumes these
+        directly; see static/app.js. A validation failure (empty prompt,
+        short session_id) is still a plain 400 JSON response, raised before
+        any streaming starts, since those are checked before the agent is
+        ever invoked.
+        """
         prompt = request.prompt.strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt must not be empty")
@@ -299,14 +314,25 @@ def create_app(
                 "(AgentCore Runtime requirement)",
             )
 
-        try:
-            response_text = invoke_agent(
-                client, agent_runtime_arn, request.session_id, prompt, qualifier
-            )
-        except RuntimeError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
+        def _event_stream():
+            try:
+                for event in stream_agent_events(
+                    client, agent_runtime_arn, request.session_id, prompt, qualifier
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except RuntimeError as e:
+                # A transport-level failure (AWS error, malformed SSE from
+                # the Runtime) discovered mid-stream — the response has
+                # already started with a 200, so this can't become an
+                # HTTPException; forward it as one more in-band error event
+                # instead, matching the shape of an agent-raised error event.
+                yield f"data: {json.dumps({'type': 'error', 'data': {'note': str(e)}})}\n\n"
 
-        return ChatResponse(response=response_text)
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     @app.get("/api/conversations", response_model=list[ConversationSummary])
     def list_conversations() -> list[ConversationSummary]:

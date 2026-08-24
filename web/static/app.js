@@ -13,6 +13,7 @@
 // which reads it straight out of Memory via ListEvents.
 
 const SESSION_STORAGE_KEY = "travel-agent-session-id";
+const DIAGNOSTIC_STORAGE_KEY = "travel-agent-diagnostics-enabled";
 // AgentCore Runtime requires runtimeSessionId to be 33-256 characters.
 const MIN_SESSION_ID_LENGTH = 33;
 
@@ -25,10 +26,12 @@ const sidebarEl = document.getElementById("sidebar");
 const conversationListEl = document.getElementById("conversation-list");
 const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
 const sidebarCloseBtn = document.getElementById("sidebar-close-btn");
+const diagnosticToggleInput = document.getElementById("diagnostic-toggle-input");
 
 let actorId = "web-user";
 let sessionId = null;
 let historyEnabled = false;
+let diagnosticsEnabled = false;
 
 function randomHex(length) {
   const bytes = new Uint8Array(Math.ceil(length / 2));
@@ -167,12 +170,120 @@ function renderTranscript(turns) {
   }
 }
 
-// --- Chat submission ---------------------------------------------------
+// --- Diagnostic panel ------------------------------------------------------
+// Only rendered when diagnosticsEnabled is true. One <details> entry per
+// non-text event, appended live as the stream progresses. Full raw
+// payloads are shown verbatim (this is a diagnostics feature — see
+// stream_agent_turn() in agent/agent.py for why nothing is summarized away).
+
+function badgeLabel(type) {
+  return type.replace(/_/g, " ");
+}
+
+function prettyPrintIfJson(text) {
+  // Tool results (weather/places/web-search) often return JSON serialized
+  // as a single-line text string — pretty-print it for readability in the
+  // diagnostic panel. Falls back to the raw text unchanged if it isn't
+  // valid JSON (e.g. plain prose from a tool), since this is a display-only
+  // convenience — the underlying data streamed from the backend is never
+  // altered.
+  const trimmed = text.trim();
+  if (!trimmed) return text;
+  const looksLikeJson = trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (!looksLikeJson) return text;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+function formatDiagnosticBody(type, data) {
+  if (type === "reasoning") {
+    return typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  }
+  if (type === "tool_use") {
+    return `${data.name || "(unknown tool)"}\n\n${JSON.stringify(data.input, null, 2)}`;
+  }
+  if (type === "tool_result") {
+    const status = data.status ? `[${data.status}]\n\n` : "";
+    return `${status}${prettyPrintIfJson(data.text || "")}`;
+  }
+  if (type === "error") {
+    if (data && typeof data === "object") {
+      return data.note || JSON.stringify(data, null, 2);
+    }
+    return String(data);
+  }
+  return typeof data === "string" ? data : JSON.stringify(data, null, 2);
+}
+
+function summaryLabel(type, data) {
+  if (type === "tool_use") return `tool_use: ${data.name || "unknown"}`;
+  if (type === "tool_result") {
+    const len = (data.text || "").length;
+    return `tool_result: ${len} chars`;
+  }
+  if (type === "reasoning") {
+    const text = typeof data === "string" ? data : "";
+    return `reasoning: ${text.length} chars`;
+  }
+  if (type === "error") return "error";
+  return type;
+}
+
+function appendDiagnosticEntry(panelEl, type, data) {
+  const details = document.createElement("details");
+  details.className = "diagnostic-entry";
+
+  const summary = document.createElement("summary");
+  const badge = document.createElement("span");
+  badge.className = `diagnostic-badge ${type}`;
+  badge.textContent = badgeLabel(type);
+  summary.appendChild(badge);
+  const summaryText = document.createTextNode(summaryLabel(type, data));
+  summary.appendChild(summaryText);
+  details.appendChild(summary);
+
+  const pre = document.createElement("pre");
+  pre.textContent = formatDiagnosticBody(type, data);
+  details.appendChild(pre);
+
+  panelEl.appendChild(details);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return { details, summaryText, pre };
+}
+
+function updateDiagnosticEntry(entry, type, data) {
+  entry.summaryText.textContent = summaryLabel(type, data);
+  entry.pre.textContent = formatDiagnosticBody(type, data);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// --- Chat submission (streaming) -------------------------------------------
 
 async function sendMessage(prompt) {
   appendMessage("user", prompt);
   const pendingEl = appendPending();
   sendBtn.disabled = true;
+
+  let agentEl = null;
+  let diagnosticPanelEl = null;
+  let accumulatedText = "";
+  let reasoningEntry = null;
+  let accumulatedReasoning = "";
+
+  function ensureAgentBubble() {
+    if (!agentEl) {
+      pendingEl.remove();
+      agentEl = appendMessage("agent", "");
+      if (diagnosticsEnabled) {
+        diagnosticPanelEl = document.createElement("div");
+        diagnosticPanelEl.className = "diagnostic-panel";
+        messagesEl.appendChild(diagnosticPanelEl);
+      }
+    }
+  }
 
   try {
     const res = await fetch("/api/chat", {
@@ -180,14 +291,91 @@ async function sendMessage(prompt) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, session_id: sessionId }),
     });
-    const data = await res.json();
-    pendingEl.remove();
 
-    if (!res.ok) {
+    if (!res.ok || !res.body) {
+      pendingEl.remove();
+      const data = await res.json().catch(() => ({}));
       appendMessage("error", data.detail || "The agent returned an error.");
       return;
     }
-    appendMessage("agent", data.response);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are "data: <json>\n\n" — split on blank-line boundaries.
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (!frame.startsWith("data: ")) continue;
+
+        let event;
+        try {
+          event = JSON.parse(frame.slice(6));
+        } catch {
+          continue; // Malformed frame — skip rather than break the whole stream.
+        }
+
+        if (event.type === "text") {
+          ensureAgentBubble();
+          accumulatedText += event.data;
+          agentEl.innerHTML = renderMarkdown(accumulatedText);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (event.type === "done") {
+          ensureAgentBubble();
+          // "done" carries the guaranteed-complete final text — prefer it
+          // over the accumulated deltas in case any were missed.
+          const finalText = event.data || accumulatedText;
+          agentEl.innerHTML = renderMarkdown(finalText);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (event.type === "error") {
+          ensureAgentBubble();
+          if (diagnosticsEnabled && diagnosticPanelEl) {
+            appendDiagnosticEntry(diagnosticPanelEl, "error", event.data);
+          }
+          const note =
+            event.data && typeof event.data === "object" ? event.data.note : event.data;
+          if (note && !accumulatedText) {
+            appendMessage("error", note);
+          } else if (note) {
+            agentEl.innerHTML += `<p><em>${escapeHtml(note)}</em></p>`;
+          }
+        } else if (event.type === "reasoning" && diagnosticsEnabled && diagnosticPanelEl) {
+          // Strands streams reasoning as many small text deltas (like
+          // "text" events). Accumulate into one running entry instead of
+          // creating a new diagnostic block per token.
+          ensureAgentBubble();
+          accumulatedReasoning += event.data;
+          if (!reasoningEntry) {
+            reasoningEntry = appendDiagnosticEntry(
+              diagnosticPanelEl,
+              "reasoning",
+              accumulatedReasoning
+            );
+          } else {
+            updateDiagnosticEntry(reasoningEntry, "reasoning", accumulatedReasoning);
+          }
+        } else if (diagnosticsEnabled && diagnosticPanelEl) {
+          // tool_use / tool_result — each already arrives once (deduped by
+          // toolUseId upstream), so one entry per event is correct here.
+          ensureAgentBubble();
+          appendDiagnosticEntry(diagnosticPanelEl, event.type, event.data);
+        } else {
+          // Diagnostics off: still need the bubble to exist so reasoning/
+          // tool events preceding the first text delta don't leave the
+          // "Thinking…" placeholder up with nothing to replace it.
+          ensureAgentBubble();
+        }
+      }
+    }
+
+    pendingEl.remove();
     refreshConversationList();
   } catch (err) {
     pendingEl.remove();
@@ -419,9 +607,19 @@ newConversationBtn.addEventListener("click", () => {
 sidebarToggleBtn.addEventListener("click", () => setSidebarOpen(true));
 sidebarCloseBtn.addEventListener("click", () => setSidebarOpen(false));
 
+diagnosticToggleInput.addEventListener("change", () => {
+  diagnosticsEnabled = diagnosticToggleInput.checked;
+  localStorage.setItem(DIAGNOSTIC_STORAGE_KEY, diagnosticsEnabled ? "1" : "0");
+});
+
 // --- Init ----------------------------------------------------------------
 
 async function init() {
+  // Off by default — this is a diagnostics feature (raw reasoning/tool
+  // payloads), not something a normal chat session should show unasked.
+  diagnosticsEnabled = localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) === "1";
+  diagnosticToggleInput.checked = diagnosticsEnabled;
+
   try {
     const res = await fetch("/api/config");
     const config = await res.json();

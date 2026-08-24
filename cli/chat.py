@@ -7,7 +7,11 @@ runtime session ID across turns so the agent's short-term memory and
 conversation context carry over within one CLI session.
 
 Session-ID construction and the actual `InvokeAgentRuntime` call live in
-`agent_client.py`, shared with `web/server.py`.
+`agent_client.py`, shared with `web/server.py`. The Runtime always streams
+its response (agent/agent.py's entrypoint is a streaming async generator);
+this CLI has no diagnostic UI, so `_consume_stream()` drains the event
+stream internally and prints only the final reply, preserving the CLI's
+original one-line "agent> <response>" UX.
 
 Usage:
     python chat.py --agent-runtime-arn <arn> [--actor-id <id>] [--region <region>]
@@ -23,7 +27,40 @@ from typing import Optional
 
 import boto3
 
-from agent_client import build_runtime_session_id, invoke_agent
+from agent_client import build_runtime_session_id, stream_agent_events
+
+
+def _consume_stream(client, agent_runtime_arn, runtime_session_id, user_input, qualifier):
+    """Drain one turn's event stream and return the final reply text.
+
+    Only the web UI needs live/diagnostic streaming (reasoning, tool_use,
+    tool_result events); the CLI's existing UX is a single "agent> <reply>"
+    line printed once the full response is ready, so this collects "text"
+    deltas as they arrive and returns the joined result — or, if the stream
+    ends in an {"type": "error"} event (e.g. the MaxTokensReachedException
+    cutoff case), whatever partial text streamed plus the note.
+    """
+    text_parts: list[str] = []
+    for event in stream_agent_events(
+        client, agent_runtime_arn, runtime_session_id, user_input, qualifier
+    ):
+        event_type = event.get("type")
+        if event_type == "text":
+            text_parts.append(event["data"])
+        elif event_type == "done":
+            # "done" carries the full final text (redundant with the joined
+            # deltas in the normal case) — prefer it since it's guaranteed
+            # complete even if a delta was somehow missed.
+            final_text = event.get("data") or "".join(text_parts)
+            return final_text
+        elif event_type == "error":
+            data = event.get("data")
+            if isinstance(data, dict):
+                partial = data.get("partial_text") or "".join(text_parts)
+                note = data.get("note", "")
+                return f"{partial}\n\n*({note})*" if note else partial
+            return data or "".join(text_parts) or "Sorry, something went wrong."
+    return "".join(text_parts)
 
 
 def run_repl(
@@ -54,7 +91,7 @@ def run_repl(
             return
 
         try:
-            response_text = invoke_agent(
+            response_text = _consume_stream(
                 client, agent_runtime_arn, runtime_session_id, user_input, qualifier
             )
         except RuntimeError as e:

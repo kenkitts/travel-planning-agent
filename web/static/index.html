@@ -20,7 +20,13 @@
       <header class="app-header">
         <button id="sidebar-toggle-btn" class="icon-btn" title="Show conversations" aria-label="Show conversations">☰</button>
         <h1>Travel Planning Agent</h1>
-        <button id="new-conversation-btn" title="Start a new conversation">New conversation</button>
+        <div class="header-actions">
+          <label class="diagnostic-toggle" title="Show reasoning, tool calls, and raw tool results as the agent responds">
+            <input type="checkbox" id="diagnostic-toggle-input" />
+            Diagnostics
+          </label>
+          <button id="new-conversation-btn" title="Start a new conversation">New conversation</button>
+        </div>
       </header>
 
       <main id="messages" class="messages" aria-live="polite"></main>

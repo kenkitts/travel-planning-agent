@@ -17,6 +17,13 @@ Wires together:
     build_conversation_manager() for why this replaces Strands' own silent
     default.
 
+The entrypoint (invoke()) is an async generator: it streams labeled
+diagnostic events (reasoning/text/tool_use/tool_result/done/error) as an
+SSE response, one per turn of agent.stream_async(). BedrockAgentCoreApp
+auto-detects the async-generator return and wraps it as a
+text/event-stream StreamingResponse — see stream_agent_turn() for the
+event-shape translation and MaxTokensReachedException handling.
+
 Configuration is read from environment variables set by RuntimeStack:
   GATEWAY_URL  - the AgentCore Gateway's MCP endpoint
   MEMORY_ID    - the AgentCore Memory resource ID
@@ -28,6 +35,7 @@ following the documented safe pattern for AgentCore Runtime: it avoids
 cross-request state leakage and thread-safety issues if concurrent
 invocations land on the same container.
 """
+import json
 import logging
 import os
 from datetime import date
@@ -99,33 +107,144 @@ def extract_response_text(message: dict) -> str:
     return "\n".join(text_parts).strip()
 
 
-def run_agent_turn(agent: Agent, user_message: str) -> str:
-    """Run one turn and return the assistant's plain-text reply.
+def extract_tool_result_text(tool_result: dict) -> str:
+    """Extract the plain-text payload from a Strands toolResult block.
 
-    Handles strands.types.exceptions.MaxTokensReachedException gracefully:
-    if the model runs out of its output token budget mid-response (confirmed
-    in production for a long, tool-heavy multi-day itinerary), Strands has
-    already appended the partial assistant message to `agent.messages`
-    before raising — rather than letting that exception propagate out of
-    the AgentCore Runtime entrypoint as an opaque InvokeAgentRuntime 500
-    error, return the partial text with a note so the traveler still gets a
-    usable (if truncated) answer and knows to ask for more.
+    `tool_result["content"]` is a list of blocks, normally a single
+    `{"text": "..."}` block for the tools this agent uses (Web Search,
+    weather, places all return text/JSON-as-text). Concatenates any text
+    blocks found; falls back to a str() of the raw content list if no text
+    block is present, so an unexpected tool result shape still surfaces
+    something in the diagnostic stream rather than silently dropping it.
     """
+    content = tool_result.get("content") or []
+    text_parts = [block["text"] for block in content if isinstance(block, dict) and "text" in block]
+    if text_parts:
+        return "\n".join(text_parts)
+    return str(content) if content else ""
+
+
+async def stream_agent_turn(agent: Agent, user_message: str):
+    """Run one turn, yielding labeled diagnostic events as they occur.
+
+    Translates strands.Agent.stream_async()'s raw event stream into a small,
+    stable set of labeled events for the web UI's diagnostic panel and live
+    chat bubble: {"type": "reasoning" | "text" | "tool_use" | "tool_result"
+    | "done" | "error", "data": ...}. Full raw tool-result payloads are
+    passed through verbatim (no truncation) — this is a diagnostics feature,
+    so completeness matters more than payload size; the frontend is
+    responsible for making large payloads collapsible rather than this
+    layer summarizing them away.
+
+    Real strands.Agent.stream_async() event shapes (confirmed against the
+    installed strands-agents==1.52.0 source directly, not assumed):
+      - text delta:      "data" in event                         -> event["data"]
+      - reasoning delta: event.get("reasoning") truthy           -> event.get("reasoningText")
+      - tool-use delta:  "current_tool_use" in event              -> {toolUseId, name, input}
+                         (input accumulates across deltas as the model streams
+                         the tool call's JSON arguments as a raw string, one
+                         fragment at a time; there's no explicit "done"
+                         signal for a given toolUseId, so this is only
+                         forwarded once `input` has accumulated into a
+                         complete, parseable JSON *object* — parsing alone
+                         isn't enough, since an in-progress fragment can
+                         coincidentally parse as a valid non-object JSON
+                         value, such as a bare string, before the real
+                         arguments object is complete)
+      - tool result:     "message" in event, message["role"] == "user",
+                         content list contains a "toolResult" block
+      - final result:    "result" in event -> AgentResult (message has the
+                         final assistant text; used for the "done" event and,
+                         by the caller, for the MaxTokensReachedException
+                         partial-response path)
+    Lifecycle events (init_event_loop/start_event_loop/force_stop) and bare
+    delta-only chunks with nothing new to show are intentionally skipped —
+    they carry no information the diagnostic panel doesn't already get from
+    the events above.
+
+    Handles strands.types.exceptions.MaxTokensReachedException the same way
+    run_agent_turn() used to for the non-streaming path: if the model runs
+    out of its output token budget mid-response, Strands has already
+    appended the partial assistant message to `agent.messages` before
+    raising, so the partial text (already streamed to the client via prior
+    "text" events) is followed by a final "error" event with a cut-off note,
+    instead of letting the exception propagate out of the AgentCore Runtime
+    entrypoint as an opaque failure.
+    """
+    seen_tool_use_ids: set[str] = set()
     try:
-        result = agent(user_message)
-        return extract_response_text(result.message)
+        async for event in agent.stream_async(user_message):
+            if event.get("reasoning") and event.get("reasoningText"):
+                yield {"type": "reasoning", "data": event["reasoningText"]}
+            elif "data" in event:
+                yield {"type": "text", "data": event["data"]}
+            elif "current_tool_use" in event:
+                tool_use = event["current_tool_use"]
+                tool_use_id = tool_use.get("toolUseId")
+                name = tool_use.get("name")
+                raw_input = tool_use.get("input")
+                if name and tool_use_id and tool_use_id not in seen_tool_use_ids:
+                    # `input` is the tool call's JSON arguments, streamed in
+                    # as a raw string fragment-by-fragment (starts as "" on
+                    # the same event that first carries the tool name, then
+                    # grows with each subsequent delta). There's no distinct
+                    # "tool_use finished" event, so completeness is detected
+                    # by the input string having become a complete, valid
+                    # JSON *object* — the same check Strands itself uses
+                    # before invoking the tool. Checking for "parses as any
+                    # JSON value" is not sufficient: an in-progress fragment
+                    # can coincidentally parse as a valid (but wrong-typed)
+                    # JSON value before the object itself is complete —
+                    # e.g. a fragment sequence that closes a quoted string
+                    # early parses as a bare JSON string ("") rather than
+                    # the args object, which was observed live producing an
+                    # empty-looking tool_use event in the diagnostic panel.
+                    # Tool arguments are always a JSON object, never a bare
+                    # string/number/etc., so requiring a dict rules that out.
+                    parsed_input = None
+                    if raw_input:
+                        try:
+                            candidate = json.loads(raw_input)
+                        except (TypeError, ValueError):
+                            candidate = None
+                        if isinstance(candidate, dict):
+                            parsed_input = candidate
+                    if parsed_input is not None:
+                        seen_tool_use_ids.add(tool_use_id)
+                        yield {
+                            "type": "tool_use",
+                            "data": {
+                                "toolUseId": tool_use_id,
+                                "name": name,
+                                "input": parsed_input,
+                            },
+                        }
+            elif "message" in event:
+                message = event["message"]
+                if message.get("role") == "user":
+                    for block in message.get("content") or []:
+                        if isinstance(block, dict) and "toolResult" in block:
+                            tool_result = block["toolResult"]
+                            yield {
+                                "type": "tool_result",
+                                "data": {
+                                    "toolUseId": tool_result.get("toolUseId"),
+                                    "status": tool_result.get("status"),
+                                    "text": extract_tool_result_text(tool_result),
+                                },
+                            }
+            elif "result" in event:
+                result = event["result"]
+                yield {"type": "done", "data": extract_response_text(result.message)}
     except MaxTokensReachedException:
-        logger.warning("Model hit max_tokens mid-response; returning partial reply")
+        logger.warning("Model hit max_tokens mid-response; ending stream with partial reply")
         partial_text = extract_response_text(agent.messages[-1])
         note = (
-            "\n\n*(That response got cut off — it was longer than I could send in one "
+            "That response got cut off — it was longer than I could send in one "
             "go. Ask me to continue, or ask for a shorter version, and I'll pick up "
-            "where I left off.)*"
+            "where I left off."
         )
-        return (partial_text + note) if partial_text else (
-            "Sorry, that response got cut off before I could write anything back to "
-            "you. Could you try again, maybe asking for a shorter answer?"
-        )
+        yield {"type": "error", "data": {"partial_text": partial_text, "note": note}}
 
 
 def parse_runtime_session_id(runtime_session_id: Optional[str]) -> tuple[str, str]:
@@ -242,15 +361,28 @@ def build_conversation_manager() -> SummarizingConversationManager:
 
 
 @app.entrypoint
-def invoke(payload: dict, context: Any = None) -> dict:
+async def invoke(payload: dict, context: Any = None):
     """AgentCore Runtime entrypoint: one turn of the itinerary conversation.
 
     Payload: {"prompt": "<user message>"}
-    Returns: {"response": "<assistant markdown reply>"}
+    Streams labeled diagnostic events as an SSE response — BedrockAgentCoreApp
+    auto-detects that this is an async generator (confirmed against real
+    source: inspect.isasyncgen(result) in _handle_invocation) and wraps it as
+    a text/event-stream StreamingResponse, converting each yielded dict to a
+    "data: <json>\n\n" frame automatically. See stream_agent_turn() for the
+    event shapes yielded: reasoning | text | tool_use | tool_result | done | error.
+
+    A malformed request (missing prompt) still needs a single event, not a
+    plain dict return — BedrockAgentCoreApp's streaming detection is based
+    on the entrypoint function itself being a generator, and an async
+    generator function always returns an async generator object even on an
+    early "return" (which just ends iteration after zero yields), so the
+    error case below yields one error event rather than returning a dict.
     """
     user_message = (payload or {}).get("prompt", "").strip()
     if not user_message:
-        return {"error": "'prompt' is required"}
+        yield {"type": "error", "data": {"note": "'prompt' is required"}}
+        return
 
     runtime_session_id = getattr(context, "session_id", None) if context else None
     actor_id, session_id = parse_runtime_session_id(runtime_session_id)
@@ -258,7 +390,44 @@ def invoke(payload: dict, context: Any = None) -> dict:
     session_manager = build_session_manager(actor_id, session_id)
     mcp_client = build_mcp_client()
     model = BedrockModel(
-        model_id=MODEL_ID, region_name=AWS_REGION, max_tokens=MAX_OUTPUT_TOKENS
+        model_id=MODEL_ID,
+        region_name=AWS_REGION,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        # Enables the "reasoning" stream_agent_turn() event (Claude's
+        # extended-thinking content) for the diagnostic panel. Off by
+        # default on Bedrock — without this, Claude never emits
+        # reasoningContent at all, so the "reasoning" branch below has
+        # nothing to translate (confirmed live: a real turn produced
+        # tool_use/tool_result/text/done but zero reasoning events before
+        # this was added). Claude Sonnet 5 specifically requires the
+        # *adaptive* form — the older manual form
+        # (thinking: {"type": "enabled", "budget_tokens": N}) is removed on
+        # this model and returns a 400 error (confirmed against AWS's own
+        # Claude migration-guide docs); adaptive thinking lets the model
+        # decide per-request whether/how much to think, with no token
+        # budget to tune. This means some turns will now spend extra tokens
+        # (cost/latency) thinking that previously spent none — an accepted
+        # tradeoff for the diagnostic visibility this project wants.
+        #
+        # display="summarized" is required to get any reasoningText.text
+        # at all — confirmed by testing the raw Bedrock Converse API
+        # directly (bypassing Strands) on 2026-08-24: with just
+        # {"type": "adaptive"}, reasoningText.text came back as an empty
+        # string even on a turn that did produce a reasoningContent block —
+        # the actual thinking was locked in an opaque, non-text `signature`
+        # blob. Adding display="summarized" made the same kind of prompt
+        # return real, human-readable summarized reasoning text.
+        #
+        # REMAINING LIMITATION (still real, unaffected by display): Claude
+        # Sonnet 5 decides per-request whether to think at all — a
+        # tool-heavy, multi-step itinerary-planning turn produced zero
+        # reasoningContent blocks even with display="summarized" set, while
+        # a plain multi-step reasoning question did produce one. So the
+        # "reasoning" event in stream_agent_turn() will still be
+        # inconsistent turn-to-turn on this model; that's expected, not a
+        # bug — it now actually has text to show on the turns where the
+        # model chooses to think.
+        additional_request_fields={"thinking": {"type": "adaptive", "display": "summarized"}},
     )
     # UTC "today" — there's no per-traveler timezone collected from the
     # conversation (see prompts.py's requirements list), so this is the only
@@ -275,7 +444,9 @@ def invoke(payload: dict, context: Any = None) -> dict:
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
         )
-        return {"response": run_agent_turn(agent, user_message)}
+        async for event in stream_agent_turn(agent, user_message):
+            yield event
+        return
 
     with mcp_client:
         tools = mcp_client.list_tools_sync()
@@ -288,7 +459,8 @@ def invoke(payload: dict, context: Any = None) -> dict:
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
         )
-        return {"response": run_agent_turn(agent, user_message)}
+        async for event in stream_agent_turn(agent, user_message):
+            yield event
 
 
 if __name__ == "__main__":

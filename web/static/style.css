@@ -209,6 +209,26 @@ body {
   margin: 0;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.diagnostic-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: #555;
+  cursor: pointer;
+  user-select: none;
+}
+
+.diagnostic-toggle input {
+  cursor: pointer;
+}
+
 #new-conversation-btn {
   background: none;
   border: 1px solid var(--border);
@@ -268,6 +288,93 @@ body {
   background: transparent;
   border: none;
   padding: 0.2rem 0.9rem;
+}
+
+/* --- Diagnostic panel ---------------------------------------------------- */
+/* Rendered only when the "Diagnostics" toggle is on. One collapsible entry
+   per non-text event (reasoning/tool_use/tool_result/error), appended live
+   as the stream progresses, directly below the agent's chat bubble for
+   that turn. */
+
+.diagnostic-panel {
+  max-width: 70ch;
+  align-self: flex-start;
+  margin-top: -0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.diagnostic-entry {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafafa;
+  font-size: 0.82rem;
+}
+
+.diagnostic-entry summary {
+  cursor: pointer;
+  padding: 0.4rem 0.65rem;
+  color: #444;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.diagnostic-entry summary::-webkit-details-marker {
+  display: none;
+}
+
+.diagnostic-entry summary::before {
+  content: "▶";
+  font-size: 0.7rem;
+  color: #888;
+}
+
+.diagnostic-entry[open] summary::before {
+  content: "▼";
+}
+
+.diagnostic-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.diagnostic-badge.reasoning {
+  background: #f3e8ff;
+  color: #6b21a8;
+}
+
+.diagnostic-badge.tool_use {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.diagnostic-badge.tool_result {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.diagnostic-badge.error {
+  background: #fef2f2;
+  color: var(--error);
+}
+
+.diagnostic-entry pre {
+  margin: 0;
+  padding: 0.6rem 0.65rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #fff;
 }
 
 .message p {

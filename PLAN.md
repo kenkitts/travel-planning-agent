@@ -598,6 +598,53 @@ surfaced two real issues, both fixed and re-verified live:
    correctly prefixed with the sanitized `kenkitts-amazon-com` actor_id
    matching what the agent itself uses server-side.
 
+## Phase 9 — Gateway Observability (CloudWatch logs + traces)
+
+Prompted by an opaque `"An internal error occurred. Please retry later."`
+surfaced through the agent when a Gateway tool call failed, with no way to
+see the actual underlying error. Confirmed via AWS docs that, unlike
+Runtime (which gets a CloudWatch log group automatically), AgentCore does
+**not** provision any log/trace destination for Gateway resources by
+default — it has to be configured explicitly, one-time, per Gateway.
+
+- [x] `cdk/stacks/gateway_stack.py` — added `_configure_observability()`,
+      wiring up both application logs and X-Ray traces for the Gateway,
+      per AWS's documented SDK pattern (a delivery source + delivery
+      destination + delivery, for each of the two log types):
+      - A dedicated `logs.LogGroup` (`/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/travel-planning-agent-gateway`,
+        1-month retention).
+      - `logs.CfnDeliverySource` (×2: one `log_type="APPLICATION_LOGS"`,
+        one `log_type="TRACES"`), both with `resource_arn` set to the
+        Gateway's own ARN.
+      - `logs.CfnDeliveryDestination` (×2): a `CWL` destination pointed at
+        the new log group, and an `XRAY` destination (X-Ray is the only
+        supported trace destination type for this resource).
+      - `logs.CfnDelivery` (×2) connecting each source to its matching
+        destination, with explicit `node.add_dependency()` calls since
+        CloudFormation doesn't infer the source/destination ordering from
+        the plain string `name`/ARN references these constructs take.
+      Confirmed CloudWatch Transaction Search (required for X-Ray spans to
+      actually land in CloudWatch) was already enabled and `ACTIVE` in
+      this account via `xray get-trace-segment-destination` — no extra
+      account-level setup needed.
+- [x] Verified via `cdk synth` (clean resource graph: both delivery
+      sources/destinations/deliveries present, correctly cross-referenced)
+      and a full `cdk deploy TravelAgentGatewayStack` (all 10 resources
+      `CREATE_COMPLETE`).
+- [x] Full test suite still passing (138/138) — this is pure infra
+      configuration, no new application logic to unit test.
+- [x] Live-verified the new logs are actually useful: reproduced a real
+      Web Search tool failure via the CLI, then pulled the newly-vended
+      Gateway application logs (`/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/travel-planning-agent-gateway`,
+      stream `BedrockAgentCoreGateway_ApplicationLogs`) and found the
+      specific underlying error — a target-connectivity failure inside
+      the managed Web Search connector's own backend, unrelated to this
+      project's account/VPC/IAM configuration and outside anything fixable
+      from this codebase. Before this phase, that failure surfaced to the
+      end user only as the generic "An internal error occurred" message,
+      with no way to see request/response bodies, target names, or
+      trace/span IDs to correlate a failure back to a specific tool call.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

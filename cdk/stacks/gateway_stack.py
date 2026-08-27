@@ -21,6 +21,21 @@ target and gateway both show status READY. This exact two-statement policy
 is AWS's documented setup for the Web Search connector's gateway service
 role (see the "Configure the Gateway Service Role" section of the Web
 Search connector target docs) — confirmed against a live deployment.
+
+Also configures CloudWatch observability (application logs + X-Ray traces)
+for the Gateway. AgentCore does NOT enable this by default for gateway
+resources (unlike Runtime, which gets a log group automatically) — without
+it, tool call failures (e.g. "An internal error occurred. Please retry
+later." from a target) are opaque, with no way to see the actual upstream
+error, request/response bodies, or trace/span IDs. Wired up per AWS's
+documented SDK pattern (Add observability to your Amazon Bedrock AgentCore
+resources): a dedicated log group, one delivery source each for
+APPLICATION_LOGS and TRACES on the Gateway's own ARN, a CloudWatch Logs
+destination for the former and an X-Ray destination for the latter (X-Ray
+is the only supported trace destination type; CloudWatch Transaction
+Search must be enabled once per account/region for X-Ray to actually land
+spans in CloudWatch — see README's Observability section), and a
+CfnDelivery connecting each source to its destination.
 """
 from pathlib import Path
 
@@ -28,6 +43,7 @@ from aws_cdk import Stack
 from aws_cdk import aws_bedrockagentcore as agentcore
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +51,7 @@ LAMBDAS_DIR = REPO_ROOT / "lambdas"
 
 WEB_SEARCH_CONNECTOR_ID = "web-search"
 WEB_SEARCH_CONFIGURATION_NAME = "WebSearch"
+GATEWAY_LOG_GROUP_NAME = "/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/travel-planning-agent-gateway"
 
 
 class GatewayStack(Stack):
@@ -89,6 +106,72 @@ class GatewayStack(Stack):
                 str(LAMBDAS_DIR / "places" / "tool_schema.json")
             ),
         )
+
+        self._configure_observability()
+
+    def _configure_observability(self) -> None:
+        """Wire up CloudWatch application logs + X-Ray traces for the Gateway.
+
+        See this module's docstring for the full rationale. Both the logs
+        and traces deliveries are created together — AWS's docs mark the
+        traces delivery source/destination as "required" alongside logs
+        for gateway resources, not optional.
+        """
+        log_group = logs.LogGroup(
+            self,
+            "GatewayLogGroup",
+            log_group_name=GATEWAY_LOG_GROUP_NAME,
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+
+        logs_source = logs.CfnDeliverySource(
+            self,
+            "GatewayLogsDeliverySource",
+            name="travel-planning-agent-gateway-logs-source",
+            log_type="APPLICATION_LOGS",
+            resource_arn=self.gateway.gateway_arn,
+        )
+        traces_source = logs.CfnDeliverySource(
+            self,
+            "GatewayTracesDeliverySource",
+            name="travel-planning-agent-gateway-traces-source",
+            log_type="TRACES",
+            resource_arn=self.gateway.gateway_arn,
+        )
+
+        logs_destination = logs.CfnDeliveryDestination(
+            self,
+            "GatewayLogsDeliveryDestination",
+            name="travel-planning-agent-gateway-logs-destination",
+            delivery_destination_type="CWL",
+            destination_resource_arn=log_group.log_group_arn,
+        )
+        traces_destination = logs.CfnDeliveryDestination(
+            self,
+            "GatewayTracesDeliveryDestination",
+            name="travel-planning-agent-gateway-traces-destination",
+            delivery_destination_type="XRAY",
+        )
+
+        logs_delivery = logs.CfnDelivery(
+            self,
+            "GatewayLogsDelivery",
+            delivery_source_name=logs_source.name,
+            delivery_destination_arn=logs_destination.attr_arn,
+        )
+        logs_delivery.node.add_dependency(logs_source)
+        logs_delivery.node.add_dependency(logs_destination)
+
+        traces_delivery = logs.CfnDelivery(
+            self,
+            "GatewayTracesDelivery",
+            delivery_source_name=traces_source.name,
+            delivery_destination_arn=traces_destination.attr_arn,
+        )
+        traces_delivery.node.add_dependency(traces_source)
+        traces_delivery.node.add_dependency(traces_destination)
+
+        self.log_group = log_group
 
     def _grant_web_search_invoke(self) -> None:
         """Grant the Gateway's own service role permission to call the

@@ -292,6 +292,36 @@ Runtime's JWT authorizer) and by the CLI/web UI clients (to acquire
 tokens) — `.env` is read by `cli/agent_client.py`/`cdk/app.py` directly,
 not passed to the deployed agent process itself.
 
+## Observability
+
+The Runtime gets a CloudWatch log group automatically (AgentCore's
+default behavior for Runtime resources). The Gateway does **not** — by
+default, a failing tool call surfaces to the end user only as a generic
+"An internal error occurred. Please retry later.", with no visibility
+into which target failed or why.
+
+`TravelAgentGatewayStack` configures both CloudWatch application logs and
+X-Ray traces for the Gateway:
+
+- **Application logs**: `/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/travel-planning-agent-gateway`,
+  stream `BedrockAgentCoreGateway_ApplicationLogs`. Each request/response
+  is logged with `request_id`/`trace_id`/`span_id`, the target name, and
+  (for errors) the actual upstream error message — e.g. a failing target
+  logs both `"An error occurred while executing tool: <tool> from target
+  <targetId>"` and the specific underlying failure on the next line.
+- **Traces**: delivered to X-Ray (viewable via CloudWatch's GenAI
+  Observability page, or the X-Ray console directly), correlated to the
+  logs above via `trace_id`/`span_id`.
+
+To debug a failing tool call, check the application log group first —
+`aws logs get-log-events --log-group-name
+/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/travel-planning-agent-gateway
+--log-stream-name BedrockAgentCoreGateway_ApplicationLogs` (or `filter-log-events`
+across a time range) — before assuming the problem is in this repo's own
+code; several real failures have turned out to be inside AWS's own managed
+connector backends, visible in these logs but not fixable from this
+codebase.
+
 ## Known limitations
 
 - No booking integrations, structured/JSON output, or automated integration

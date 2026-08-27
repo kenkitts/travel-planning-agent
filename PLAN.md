@@ -433,9 +433,175 @@ pagination, partial-failure reporting, 404 on an empty/nonexistent
 session, 404 on `ResourceNotFoundException` vs. 502 on other `ClientError`
 codes, 404 when `--memory-id` is unset). Full suite: 81/81 passing.
 
+## Phase 8 — JWT Authorization (Okta)
+
+See DESIGN.md §2a (decisions #26–35) for full rationale. Execution order:
+
+- [ ] Register a new, dedicated Okta application for the Travel Agent
+      (native/public client, PKCE required, `offline_access` scope) —
+      manual step in the Okta Admin Console, done by the user. Capture the
+      issuer URL and client ID. **(User action required — not done by
+      this build; see summary below.)**
+- [x] `travel-planning-agent/.env.template` (committed) and `.env`
+      (gitignored — already covered by the existing `.env`/`.env.*`
+      `.gitignore` entries) — `OKTA_ISSUER`, `OKTA_CLIENT_ID`,
+      `OKTA_SCOPES`, `OKTA_REDIRECT_PORT` for the new app, distinct from
+      `~/okta-claude-code-token-helper/.env`.
+- [x] `cli/agent_client.py` — added `get_okta_access_token()`, invoking
+      `~/okta-claude-code-token-helper/okta-claude-code-token.py` as a
+      subprocess with the Travel Agent's Okta env vars set explicitly
+      (via a small `load_dotenv()` reader, not that script's own `.env`
+      loading). Raises `RuntimeError` with the helper's stderr on nonzero
+      exit.
+- [x] `cli/agent_client.py`'s `stream_agent_events()` — replaced the
+      SigV4-signed `client.invoke_agent_runtime(...)` boto3 call with a
+      raw `httpx.stream()` HTTPS POST carrying `Authorization: Bearer
+      <token>`. Confirmed via AWS's own docs (JWT bearer auth requires
+      "HTTPS requests required, not managed by AWS SDKs") and multiple
+      real reference implementations that boto3's `bedrock-agentcore`
+      client has no bearer-token path — this was the one open technical
+      question from the design phase, resolved during implementation.
+- [x] `cli/chat.py` — dropped `--actor-id` (superseded by decision #31 —
+      actor_id is now server-derived from the JWT, not client-supplied);
+      calls `get_okta_access_token()` once per turn.
+- [x] `web/server.py` — same token-acquisition and bearer-auth change as
+      `cli/agent_client.py` (shared module); dropped `--actor-id` here
+      too. `create_app()` now acquires one token at startup solely to
+      derive `actor_id` (via `_actor_id_from_token()`, decoding the `sub`
+      claim) for the conversation-history endpoints, which remain on
+      boto3/IAM — Memory access (`ListSessions`/`ListEvents`/`CreateEvent`/
+      `DeleteEvent`) is a separate, unrelated IAM-authorized boundary from
+      the Runtime's JWT authorizer (decision #34's scope is Runtime auth
+      only).
+- [x] `cdk/stacks/runtime_stack.py` — replaced
+      `RuntimeAuthorizerConfiguration.using_iam()` with `.using_jwt(...)`
+      pointed at the Okta discovery URL (`{OKTA_ISSUER}/.well-known/openid-configuration`)
+      and the new app's client ID (`allowed_clients`); added
+      `request_header_configuration=agentcore.RequestHeaderConfiguration(allowlisted_headers=["Authorization"])`
+      so the raw bearer token reaches the agent process (decision #34).
+      Exact parameter names verified by reading the installed
+      `aws_cdk.aws_bedrockagentcore` package source directly, not guessed.
+      `RuntimeStack` now takes `okta_issuer`/`okta_client_id` kwargs;
+      `cdk/app.py` reads them from `.env` (reusing
+      `cli/agent_client.load_dotenv()`) and fails fast if either is unset.
+- [x] `agent/requirements.txt` / `web/requirements.txt` — added
+      `PyJWT==2.13.0`. `cli/requirements.txt` simplified to just
+      `httpx==0.28.1` (boto3 no longer used by the CLI/web client path).
+- [x] `agent/agent.py` — added `get_actor_id(context)`, which reads
+      `context.request_headers["Authorization"]` (confirmed exact key via
+      `bedrock_agentcore.runtime.app.py`'s canonical-casing normalization),
+      decodes the JWT with PyJWT (`verify_signature=False` — the Runtime's
+      JWT authorizer already validated it), and returns the `sub` claim,
+      falling back to `DEFAULT_ACTOR_ID` if absent/malformed.
+      `parse_runtime_session_id()` was renamed to `parse_session_id()` and
+      now only extracts the session_id half of the runtime session ID
+      string — the actor_id half is no longer derived from client-supplied
+      input.
+- [x] `tests/test_agent.py` — replaced `ParseRuntimeSessionIdTests` with
+      `ParseSessionIdTests` + new `GetActorIdTests` (using real,
+      unsigned-key PyJWT-encoded tokens, since signature verification is
+      intentionally skipped in the code under test).
+- [x] `tests/test_agent_client.py` — fully rewritten for `httpx.stream()`
+      mocking (bearer-token headers, URL construction, HTTP-status-error
+      and transport-error paths) plus new `GetOktaAccessTokenTests`
+      (subprocess success/failure/missing-config/missing-script paths).
+      `tests/test_chat.py` updated for `_consume_stream()`'s new
+      `(access_token, arn, region, session_id, prompt, qualifier)`
+      signature.
+- [x] `web/tests/test_server.py` — added a module-level fixed test JWT
+      (`sub=web-user`), patched `web_server.get_okta_access_token`
+      globally in both test classes' `setUp()`, removed the `actor_id=`
+      kwarg from all 7 `create_app()` call sites, updated
+      `stream_agent_events` call-arg index assertions for the new
+      6-argument signature.
+- [x] Manual end-to-end verification against a live deployed Runtime is
+      **deferred to the user** (requires a real Okta app registration and
+      `cdk deploy`, neither of which this build session can perform) — see
+      the summary at the end of this phase for the exact remaining steps
+      (Okta app registration, `.env` setup, `cdk deploy`, live login/chat
+      test, confirming an invalid/missing token is rejected).
+- [x] `README.md` — replaced the IAM/local-AWS-credentials framing in
+      "Usage" and "Web UI" (and the top Architecture diagram) with the new
+      Okta login flow; added a new "Authentication" section documenting
+      the `.env` setup step and the Okta app registration prerequisite.
+- [x] Full test suite passing (`pytest tests/ web/tests/`): **125/125**.
+      CDK synth verified up through stack construction/prop validation
+      (with dummy `OKTA_ISSUER`/`OKTA_CLIENT_ID` values) — reached Lambda
+      asset bundling before failing on an unrelated pre-existing local
+      environment issue (the `finch` container VM was stopped), confirming
+      `RuntimeStack`'s new Okta kwargs and `using_jwt()`/
+      `RequestHeaderConfiguration` wiring are valid at the CDK API level.
+
+### Post-implementation fix: Okta `client_id` claim mismatch, and real deployment
+Live end-to-end verification against a real deployed Runtime (deferred at
+initial implementation time, since it needed a real Okta app registration)
+surfaced two real issues, both fixed and re-verified live:
+
+1. **`allowedClients` never matches real Okta tokens.** A decoded live
+   Okta access token showed no `client_id` claim at all — Okta places the
+   client identifier in a `cid` claim instead. `allowedClients` validates
+   `client_id`, so it would silently reject every real Okta-issued token.
+   Fixed by switching `runtime_stack.py`'s
+   `RuntimeAuthorizerConfiguration.using_jwt()` call from
+   `allowed_clients=[okta_client_id]` to `allowed_audience=[okta_audience]`
+   instead (validates the `aud` claim, which Okta does populate from the
+   authorization server's own configured Audience setting). The user
+   configured that Audience to a static string, `api://travel-planning-
+   agent`, rather than the Runtime's own ARN — a Runtime recreation
+   assigns a new ARN suffix, which would have silently invalidated every
+   previously-issued/cached token had the ARN itself been used as the
+   audience. `.env`/`.env.template`/`cdk/app.py` updated: `OKTA_AUDIENCE`
+   replaces `OKTA_CLIENT_ID` as the value passed into `RuntimeStack`
+   (`OKTA_CLIENT_ID` is retained in `.env` — still needed by the token
+   helper script itself to request tokens, just no longer what the Runtime
+   authorizer checks).
+2. **`sub` claim shape breaks AgentCore Memory's `actorId` constraint.**
+   `cdk deploy` succeeded and the JWT authorizer worked correctly (`401`
+   confirmed for an unauthenticated request), but the first real CLI chat
+   turn failed mid-stream: `ListEvents` raised `ValidationException` on
+   `actorId`. This Okta org's `sub` claim is an email address
+   (`kenkitts@amazon.com`) — AgentCore Memory's `actorId` pattern
+   (`[a-zA-Z0-9][a-zA-Z0-9-_/]*(?::[a-zA-Z0-9-_/]+)*[a-zA-Z0-9-_/]*`,
+   confirmed against the real `ListEvents` API reference) rejects `@`/`.`
+   verbatim. `sub` itself is only OIDC-guaranteed to be unique and stable
+   — never guaranteed to satisfy an arbitrary downstream system's ID
+   format. Fixed by adding `sanitize_actor_id()` to `agent/agent.py`
+   (maps every disallowed character to `-`, strips a leading run of them
+   since the pattern requires an alphanumeric first character,
+   deterministic per input) and calling it from `get_actor_id()`.
+   Deliberately did *not* switch to Okta's `uid` claim instead (which is
+   already regex-safe) — `uid` is Okta-specific, and sanitizing `sub`
+   keeps the code correct against any OIDC-standard-compliant IdP, not
+   just this one. The identical bug existed in `web/server.py`'s
+   `_actor_id_from_token()` (used for the conversation-history sidebar's
+   `ListSessions`/`ListEvents`/`CreateEvent` calls) and surfaced the same
+   way live: `/api/conversations` and `/api/conversations/{id}` both
+   returned `502` in a running web UI session. Fixed with an identical
+   `_sanitize_actor_id()` in `web/server.py` — not extracted into a shared
+   module, since `agent/` is a separate deployment unit with its own
+   `requirements.txt` (matching this project's existing per-component
+   boundary); the two copies are commented as needing to stay in sync.
+
+   Added 7 tests to `tests/test_agent.py` (`SanitizeActorIdTests` +
+   `GetActorIdTests.test_sanitizes_email_shaped_sub_claim`) and 6 to
+   `web/tests/test_server.py` (`SanitizeActorIdTests` +
+   `ActorIdFromTokenTests`). Full suite: **138/138** passing.
+
+   Verified live end-to-end after both fixes and a `cdk deploy
+   TravelAgentRuntimeStack` redeploy: `curl` against the live invocation
+   URL with no `Authorization` header returned `401` (unauthenticated
+   calls correctly rejected); the CLI (`python cli/chat.py
+   --agent-runtime-arn ...`) completed a full turn and correctly recalled
+   a prior-session fact about the user ("Good to see you again, Ken");
+   the web UI's `GET /api/conversations` went from `502` to `200` with
+   the actual conversation history populated, `session_id` values
+   correctly prefixed with the sanitized `kenkitts-amazon-com` actor_id
+   matching what the agent itself uses server-side.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend
-- Cognito/JWT auth
+- A hosted/multi-user web UI deployment (still local-only per user — see
+  DESIGN.md decision #30, unchanged by Phase 8's JWT auth work)
 - Automated integration tests
 - Billing budgets/alarms

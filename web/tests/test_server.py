@@ -2,7 +2,12 @@
 
 All calls to the AgentCore Runtime are mocked (via
 agent_client.stream_agent_events) — no live network access, no real AWS
-credentials required.
+credentials or Okta login required. `web_server.get_okta_access_token` is
+patched globally (module-level, not per-class) to return a fixed test JWT
+whose `sub` claim decodes to "web-user", matching the actor_id every test
+in this file was already written against — create_app() derives actor_id
+from that token at startup (DESIGN.md decision #31), it's no longer a
+constructor kwarg.
 """
 import importlib.util
 import json
@@ -11,6 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import jwt as pyjwt
 from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
@@ -23,6 +29,12 @@ _spec = importlib.util.spec_from_file_location("web_server", _SERVER_PATH)
 web_server = importlib.util.module_from_spec(_spec)
 sys.modules["web_server"] = web_server
 _spec.loader.exec_module(web_server)
+
+# A fixed test token whose `sub` claim is "web-user" — every test in this
+# file was written against that actor_id. Signature verification is
+# skipped by _actor_id_from_token() (the Runtime's JWT authorizer already
+# validated the real token this stands in for), so any signing key works.
+_TEST_TOKEN = pyjwt.encode({"sub": "web-user"}, "unused-test-key", algorithm="HS256")
 
 # A syntactically valid 33+ character runtimeSessionId, matching what the
 # frontend generates via build_runtime_session_id()-equivalent JS logic.
@@ -53,20 +65,60 @@ def _parse_sse(body: str) -> list[dict]:
     return events
 
 
+class SanitizeActorIdTests(unittest.TestCase):
+    """Regression tests: a real Okta org's `sub` claim was an email address,
+    which caused every ListSessions/ListEvents/CreateEvent call to fail
+    with a 502 (ValidationException on actorId) until sanitization was
+    added — confirmed live against a real deployment."""
+
+    def test_leaves_already_valid_id_unchanged(self):
+        self.assertEqual(web_server._sanitize_actor_id("web-user"), "web-user")
+
+    def test_replaces_email_special_characters(self):
+        self.assertEqual(
+            web_server._sanitize_actor_id("kenkitts@amazon.com"), "kenkitts-amazon-com"
+        )
+
+    def test_strips_leading_disallowed_characters(self):
+        self.assertEqual(web_server._sanitize_actor_id("@user123"), "user123")
+
+    def test_falls_back_to_default_when_fully_sanitized_away(self):
+        self.assertEqual(web_server._sanitize_actor_id("@@@"), web_server._DEFAULT_ACTOR_ID)
+
+
+class ActorIdFromTokenTests(unittest.TestCase):
+    def test_sanitizes_email_shaped_sub_claim(self):
+        token = pyjwt.encode({"sub": "kenkitts@amazon.com"}, "unused-test-key", algorithm="HS256")
+
+        self.assertEqual(web_server._actor_id_from_token(token), "kenkitts-amazon-com")
+
+    def test_raises_when_no_sub_claim(self):
+        token = pyjwt.encode({"client_id": "abc"}, "unused-test-key", algorithm="HS256")
+
+        with self.assertRaises(RuntimeError):
+            web_server._actor_id_from_token(token)
+
+
 class ChatEndpointTests(unittest.TestCase):
     def setUp(self):
         # boto3.client() is created inside create_app(); patch it so no
-        # real AWS client/credentials are needed.
+        # real AWS client/credentials are needed. get_okta_access_token()
+        # is also called inside create_app() (once, to derive actor_id) and
+        # per-request inside /api/chat — patched globally to the fixed
+        # test token so no real Okta login/subprocess is invoked.
         patcher = patch("web_server.boto3.client")
         self.mock_boto_client_factory = patcher.start()
         self.addCleanup(patcher.stop)
         self.mock_client = MagicMock()
         self.mock_boto_client_factory.return_value = self.mock_client
 
+        token_patcher = patch("web_server.get_okta_access_token", return_value=_TEST_TOKEN)
+        token_patcher.start()
+        self.addCleanup(token_patcher.stop)
+
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
         )
         self.client = TestClient(self.app)
 
@@ -98,10 +150,12 @@ class ChatEndpointTests(unittest.TestCase):
         )
         mock_stream_agent_events.assert_called_once()
         call_args = mock_stream_agent_events.call_args.args
-        # stream_agent_events(client, agent_runtime_arn, runtime_session_id, prompt, qualifier)
+        # stream_agent_events(access_token, agent_runtime_arn, region, runtime_session_id, prompt, qualifier)
+        self.assertEqual(call_args[0], _TEST_TOKEN)
         self.assertEqual(call_args[1], "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test")
-        self.assertEqual(call_args[2], VALID_SESSION_ID)
-        self.assertEqual(call_args[3], "Plan a trip to Boston")
+        self.assertEqual(call_args[2], "us-east-1")
+        self.assertEqual(call_args[3], VALID_SESSION_ID)
+        self.assertEqual(call_args[4], "Plan a trip to Boston")
 
     @patch("web_server.stream_agent_events")
     def test_chat_strips_whitespace_from_prompt(self, mock_stream_agent_events):
@@ -113,7 +167,7 @@ class ChatEndpointTests(unittest.TestCase):
         )
 
         call_args = mock_stream_agent_events.call_args.args
-        self.assertEqual(call_args[3], "Plan a trip")
+        self.assertEqual(call_args[4], "Plan a trip")
 
     def test_chat_rejects_empty_prompt(self):
         response = self.client.post(
@@ -213,10 +267,13 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         self.mock_client = MagicMock()
         self.mock_boto_client_factory.return_value = self.mock_client
 
+        token_patcher = patch("web_server.get_okta_access_token", return_value=_TEST_TOKEN)
+        token_patcher.start()
+        self.addCleanup(token_patcher.stop)
+
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
             memory_id="mem-123",
         )
         self.client = TestClient(self.app)
@@ -306,7 +363,6 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
         )
         client = TestClient(app)
 
@@ -409,7 +465,6 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
         )
         client = TestClient(app)
 
@@ -555,7 +610,6 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
         )
         client = TestClient(app)
 
@@ -677,7 +731,6 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
-            actor_id="web-user",
         )
         client = TestClient(app)
 

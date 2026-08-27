@@ -2,3 +2,4 @@ fastapi==0.141.1
 uvicorn==0.52.3
 pydantic==2.13.4
 boto3==1.43.73
+PyJWT==2.13.0

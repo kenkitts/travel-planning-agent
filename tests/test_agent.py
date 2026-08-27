@@ -1,11 +1,15 @@
 """Unit tests for agent/agent.py's pure-function helpers.
 
 Covers extract_response_text(), extract_tool_result_text(),
-stream_agent_turn(), and parse_runtime_session_id(). stream_agent_turn() is
-tested with a fake Agent double (an async generator standing in for
-Agent.stream_async(), no real Strands Agent, no AWS/network dependencies)
-so the event-translation and MaxTokensReachedException handling paths can
-be exercised deterministically.
+stream_agent_turn(), parse_session_id(), and get_actor_id().
+stream_agent_turn() is tested with a fake Agent double (an async generator
+standing in for Agent.stream_async(), no real Strands Agent, no AWS/
+network dependencies) so the event-translation and
+MaxTokensReachedException handling paths can be exercised
+deterministically. get_actor_id() is tested with real (unsigned-key)
+PyJWT-encoded tokens, since signature verification is intentionally
+skipped in the code under test (the Runtime's JWT authorizer already
+validated it) — see DESIGN.md decision #31/#35.
 """
 import importlib.util
 import os
@@ -116,23 +120,115 @@ class ExtractToolResultTextTests(unittest.TestCase):
         self.assertEqual(travel_agent.extract_tool_result_text({"content": []}), "")
 
 
-class ParseRuntimeSessionIdTests(unittest.TestCase):
-    def test_splits_actor_and_session(self):
-        actor_id, session_id = travel_agent.parse_runtime_session_id("ken___abc123")
+class ParseSessionIdTests(unittest.TestCase):
+    def test_extracts_session_component(self):
+        session_id = travel_agent.parse_session_id("cli-user___abc123")
 
-        self.assertEqual(actor_id, "ken")
         self.assertEqual(session_id, "abc123")
 
-    def test_falls_back_when_no_separator(self):
-        actor_id, session_id = travel_agent.parse_runtime_session_id("no-separator-here")
+    def test_falls_back_to_raw_value_when_no_separator(self):
+        session_id = travel_agent.parse_session_id("no-separator-here")
 
-        self.assertEqual(actor_id, travel_agent.DEFAULT_ACTOR_ID)
+        self.assertEqual(session_id, "no-separator-here")
 
-    def test_falls_back_when_none(self):
-        actor_id, session_id = travel_agent.parse_runtime_session_id(None)
+    def test_falls_back_to_default_when_none(self):
+        session_id = travel_agent.parse_session_id(None)
 
-        self.assertEqual(actor_id, travel_agent.DEFAULT_ACTOR_ID)
         self.assertEqual(session_id, "default-session")
+
+
+class SanitizeActorIdTests(unittest.TestCase):
+    def test_leaves_already_valid_id_unchanged(self):
+        self.assertEqual(travel_agent.sanitize_actor_id("00u1a2b3c4example"), "00u1a2b3c4example")
+
+    def test_replaces_email_special_characters(self):
+        # Real-world case, confirmed live: this Okta org's `sub` is an
+        # email address, which AgentCore Memory's actorId pattern rejects
+        # verbatim (no "@" or ".").
+        self.assertEqual(
+            travel_agent.sanitize_actor_id("kenkitts@amazon.com"), "kenkitts-amazon-com"
+        )
+
+    def test_strips_leading_disallowed_characters(self):
+        # actorId must start with an alphanumeric per the real API pattern.
+        self.assertEqual(travel_agent.sanitize_actor_id("@user123"), "user123")
+
+    def test_preserves_allowed_punctuation(self):
+        self.assertEqual(travel_agent.sanitize_actor_id("user-name_1/2:3"), "user-name_1/2:3")
+
+    def test_falls_back_to_default_when_fully_sanitized_away(self):
+        self.assertEqual(travel_agent.sanitize_actor_id("@@@"), travel_agent.DEFAULT_ACTOR_ID)
+
+    def test_is_deterministic(self):
+        self.assertEqual(
+            travel_agent.sanitize_actor_id("kenkitts@amazon.com"),
+            travel_agent.sanitize_actor_id("kenkitts@amazon.com"),
+        )
+
+
+class GetActorIdTests(unittest.TestCase):
+    @staticmethod
+    def _make_context(auth_header):
+        context = MagicMock()
+        context.request_headers = {"Authorization": auth_header} if auth_header else {}
+        return context
+
+    @staticmethod
+    def _make_token(**claims):
+        import jwt as pyjwt
+
+        return pyjwt.encode(claims, "unused-secret", algorithm="HS256")
+
+    def test_extracts_sub_claim_from_bearer_token(self):
+        token = self._make_token(sub="00u1a2b3c4example")
+        context = self._make_context(f"Bearer {token}")
+
+        self.assertEqual(travel_agent.get_actor_id(context), "00u1a2b3c4example")
+
+    def test_accepts_token_without_bearer_prefix(self):
+        token = self._make_token(sub="00u1a2b3c4example")
+        context = self._make_context(token)
+
+        self.assertEqual(travel_agent.get_actor_id(context), "00u1a2b3c4example")
+
+    def test_falls_back_when_no_authorization_header(self):
+        context = self._make_context(None)
+
+        self.assertEqual(travel_agent.get_actor_id(context), travel_agent.DEFAULT_ACTOR_ID)
+
+    def test_falls_back_when_context_is_none(self):
+        self.assertEqual(travel_agent.get_actor_id(None), travel_agent.DEFAULT_ACTOR_ID)
+
+    def test_falls_back_when_token_has_no_sub_claim(self):
+        token = self._make_token(client_id="some-client")
+        context = self._make_context(f"Bearer {token}")
+
+        self.assertEqual(travel_agent.get_actor_id(context), travel_agent.DEFAULT_ACTOR_ID)
+
+    def test_falls_back_when_token_is_malformed(self):
+        context = self._make_context("Bearer not-a-real-jwt")
+
+        self.assertEqual(travel_agent.get_actor_id(context), travel_agent.DEFAULT_ACTOR_ID)
+
+    def test_does_not_verify_signature(self):
+        # Signature verification is intentionally skipped (the Runtime's
+        # JWT authorizer already validated it) — a token signed with an
+        # unknown/arbitrary key must still decode successfully here.
+        token = self._make_token(sub="some-user")
+        context = self._make_context(f"Bearer {token}")
+
+        self.assertEqual(travel_agent.get_actor_id(context), "some-user")
+
+    def test_sanitizes_email_shaped_sub_claim(self):
+        # Regression test: confirmed live against a real deployment — this
+        # Okta org's `sub` is an email address, and AgentCore Memory's
+        # actorId pattern rejects "@"/"." verbatim, causing every
+        # ListEvents/CreateEvent call to fail with ValidationException
+        # until get_actor_id() started sanitizing the claim.
+        token = self._make_token(sub="kenkitts@amazon.com")
+        context = self._make_context(f"Bearer {token}")
+
+        self.assertEqual(travel_agent.get_actor_id(context), "kenkitts-amazon-com")
 
 
 class StreamAgentTurnTests(unittest.TestCase):

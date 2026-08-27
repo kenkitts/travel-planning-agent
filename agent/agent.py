@@ -30,6 +30,17 @@ Configuration is read from environment variables set by RuntimeStack:
   AWS_REGION   - region for the Memory client (falls back to boto3 default)
   MODEL_ID     - Bedrock model ID for Claude Sonnet (has a sane default)
 
+Auth: the Runtime is configured with a custom JWT authorizer (Okta —
+DESIGN.md decisions #26-35), which validates every inbound token's
+signature/expiry/issuer/client before this code ever runs. The Runtime is
+also configured with requestHeaderAllowlist=["Authorization"], so the
+already-validated raw bearer token is forwarded here via
+context.request_headers — get_actor_id() decodes it (signature
+verification skipped; the Runtime already did it) to read the `sub` claim
+and use it as the Memory actor_id, replacing the old
+"<actorId>___<sessionId>" runtime-session-id convention's actor_id half
+(the session_id half is unchanged; see parse_session_id()).
+
 A fresh MCPClient and Agent are built per request (not shared globally),
 following the documented safe pattern for AgentCore Runtime: it avoids
 cross-request state leakage and thread-safety issues if concurrent
@@ -38,9 +49,11 @@ invocations land on the same container.
 import json
 import logging
 import os
+import re
 from datetime import date
 from typing import Any, Optional
 
+import jwt
 from bedrock_agentcore.memory.integrations.strands.config import (
     AgentCoreMemoryConfig,
     RetrievalConfig,
@@ -84,12 +97,97 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
 USER_PREFERENCE_NAMESPACE = "/travel-agent/actor/{actorId}/preferences"
 SUMMARIZATION_NAMESPACE = "/travel-agent/actor/{actorId}/session/{sessionId}/summary"
 
-# Runtime session IDs follow the "<actorId>___<sessionId>" convention used
-# across AgentCore Runtime samples.
+# Runtime session IDs follow the "<placeholder>___<sessionId>" convention
+# used across AgentCore Runtime samples. The placeholder component is no
+# longer the real actor_id (see get_actor_id() below, DESIGN.md decision
+# #31) — it's retained only so runtimeSessionId strings built by the CLI/
+# web UI still satisfy the ">=33 chars" / "<x>___<y>" format they were
+# already producing; splitting it out is purely for the session_id half.
 SESSION_ID_SEPARATOR = "___"
 DEFAULT_ACTOR_ID = "anonymous-traveler"
 
 app = BedrockAgentCoreApp()
+
+
+def get_actor_id(context: Any) -> str:
+    """Derive the actor_id for Memory scoping from the verified JWT's `sub` claim.
+
+    DESIGN.md decision #31: actor_id must come from the Runtime's
+    already-validated JWT (via the Authorization header, forwarded here by
+    requestHeaderAllowlist — see cdk/stacks/runtime_stack.py), not from any
+    client-supplied value, so one user can never read or write another
+    user's long-term Memory by passing a different session ID.
+
+    Signature verification is intentionally skipped: the Runtime's
+    customJWTAuthorizer has already cryptographically verified this token
+    (signature, expiry, issuer, allowed client/audience/scopes) before this
+    code runs at all — decoding again here is purely to read the `sub`
+    claim out of a token already known to be valid, matching AWS's own
+    documented pattern for this exact scenario (Authenticate and authorize
+    with Inbound Auth and Outbound Auth, Step 7.1).
+
+    The raw `sub` claim is sanitized before use as AgentCore Memory's
+    actorId, not used verbatim: `sub` is only required by OIDC to be a
+    unique, stable string — it is NOT guaranteed to satisfy Memory's
+    actorId pattern (`[a-zA-Z0-9][a-zA-Z0-9-_/]*...`, no `@`/`.`/etc.).
+    Confirmed live against a real deployment: this Okta org's `sub` is an
+    email address (e.g. "kenkitts@amazon.com"), and passing it straight
+    through caused every ListEvents/CreateEvent call to fail with
+    ValidationException on actorId. sanitize_actor_id() below maps any
+    disallowed character to "-", which is deterministic and collision-safe
+    enough for this use case (a small, known set of users — see DESIGN.md
+    decision #28) without depending on an Okta-specific claim like `uid`,
+    which would tie this code to one IdP's claim naming rather than the
+    OIDC-standard `sub`.
+
+    Falls back to DEFAULT_ACTOR_ID if the header is missing or the token
+    has no `sub` claim (e.g. local/direct testing without going through the
+    Runtime's authorizer) so the agent still runs, rather than crashing the
+    whole request — but note this means no real long-term memory isolation
+    in that fallback case, which should only ever happen outside a real
+    JWT-authorizer-fronted deployment.
+    """
+    headers = getattr(context, "request_headers", None) or {}
+    auth_header = headers.get("Authorization")
+    if not auth_header:
+        logger.warning("No Authorization header in request context; using default actor")
+        return DEFAULT_ACTOR_ID
+
+    token = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else auth_header
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False})
+    except jwt.InvalidTokenError as e:
+        logger.warning("Failed to decode JWT from Authorization header: %s", e)
+        return DEFAULT_ACTOR_ID
+
+    sub = claims.get("sub")
+    if not sub:
+        logger.warning("JWT has no 'sub' claim; using default actor")
+        return DEFAULT_ACTOR_ID
+    return sanitize_actor_id(sub)
+
+
+# AgentCore Memory's actorId pattern: must start with an alphanumeric, then
+# any run of alphanumerics/-/_/ and optional ":"-separated segments of the
+# same. Confirmed against the real ListEvents API pattern
+# ("[a-zA-Z0-9][a-zA-Z0-9-_/]*(?::[a-zA-Z0-9-_/]+)*[a-zA-Z0-9-_/]*").
+_ACTOR_ID_DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9\-_/:]")
+
+
+def sanitize_actor_id(raw: str) -> str:
+    """Map an arbitrary `sub` claim to a string valid as an AgentCore Memory actorId.
+
+    Replaces every character outside the allowed set with "-", then strips
+    any leading run of non-alphanumeric characters (the pattern requires
+    the first character specifically be alphanumeric). Deterministic: the
+    same `sub` always sanitizes to the same actorId, so Memory scoping
+    stays stable across sessions/logins for a given user — the property
+    that actually matters for decision #31, not preserving the original
+    string's exact shape.
+    """
+    sanitized = _ACTOR_ID_DISALLOWED_CHARS.sub("-", raw)
+    sanitized = sanitized.lstrip("-_/:")
+    return sanitized or DEFAULT_ACTOR_ID
 
 
 def extract_response_text(message: dict) -> str:
@@ -247,26 +345,33 @@ async def stream_agent_turn(agent: Agent, user_message: str):
         yield {"type": "error", "data": {"partial_text": partial_text, "note": note}}
 
 
-def parse_runtime_session_id(runtime_session_id: Optional[str]) -> tuple[str, str]:
-    """Split a Runtime session ID into (actor_id, session_id).
+def parse_session_id(runtime_session_id: Optional[str]) -> str:
+    """Extract the bare session_id component from a Runtime session ID.
 
-    Falls back to a default actor and the raw session id if the expected
+    Runtime session IDs are still formatted as "<placeholder>___<sessionId>"
+    (see SESSION_ID_SEPARATOR) for compatibility with the existing
+    AgentCore Runtime convention and the >=33-character requirement, but
+    only the session_id half is meaningful here now — the actor_id half is
+    derived separately from the verified JWT (see get_actor_id(), DESIGN.md
+    decision #31), not from this string.
+
+    Falls back to the raw session id (or a default) if the expected
     separator isn't present, so a misconfigured caller degrades gracefully
     rather than crashing the whole request.
     """
     if not runtime_session_id:
-        return DEFAULT_ACTOR_ID, "default-session"
+        return "default-session"
 
     if SESSION_ID_SEPARATOR in runtime_session_id:
-        actor_id, session_id = runtime_session_id.split(SESSION_ID_SEPARATOR, 1)
-        return actor_id, session_id
+        _, session_id = runtime_session_id.split(SESSION_ID_SEPARATOR, 1)
+        return session_id
 
     logger.warning(
-        "runtime session id %r missing '%s' separator; using default actor",
+        "runtime session id %r missing '%s' separator; using it as-is",
         runtime_session_id,
         SESSION_ID_SEPARATOR,
     )
-    return DEFAULT_ACTOR_ID, runtime_session_id
+    return runtime_session_id
 
 
 def build_session_manager(actor_id: str, session_id: str) -> Optional[AgentCoreMemorySessionManager]:
@@ -385,7 +490,8 @@ async def invoke(payload: dict, context: Any = None):
         return
 
     runtime_session_id = getattr(context, "session_id", None) if context else None
-    actor_id, session_id = parse_runtime_session_id(runtime_session_id)
+    session_id = parse_session_id(runtime_session_id)
+    actor_id = get_actor_id(context)
 
     session_manager = build_session_manager(actor_id, session_id)
     mcp_client = build_mcp_client()

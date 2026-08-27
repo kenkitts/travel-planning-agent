@@ -38,6 +38,36 @@ integrations are an explicit future extension, not part of this build.
 | 24 | Context growth control | `SummarizingConversationManager` (`proactive_compression=True, pin_first=6`) on the Strands `Agent` | Long-running conversations (many turns, many tool calls) grow context indefinitely under Strands' own default; proactive summarization bounds this instead of only reacting after hitting a context-window error. |
 | 25 | Long-response handling | `max_tokens=8192` explicit on `BedrockModel`, with `MaxTokensReachedException` handled gracefully in `invoke()` | Bedrock Converse's default per-model max output token limit is too low for some multi-day, tool-grounded itineraries — confirmed in production, a 13-tool-call turn hit the limit mid-answer and surfaced as an opaque `InvokeAgentRuntime` 500 error. 8192 gives realistic headroom; the exception handler covers cases that still exceed it. |
 
+## 2a. JWT Authorization (added 2026-08-26, supersedes decision #15)
+
+Status: Approved (interview complete, 2026-08-26)
+
+Decision #15 (IAM auth only) and decision #5's explicit exclusion of
+"Cognito/JWT auth for non-AWS-credentialed clients" are superseded by this
+section. The trigger: a small group of known users (beyond just the
+original author) needs to use the CLI/web UI, and IAM/SigV4 with local AWS
+credentials doesn't scale to "share this with a few people" without also
+sharing AWS credentials — undesirable.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 26 | Auth cutover scope | Full replacement: AgentCore Runtime's authorizer switches from `RuntimeAuthorizerConfiguration.using_iam()` to `.using_jwt(...)` (custom JWT authorizer). No dual IAM+JWT path. | AgentCore Runtime supports one authorizer configuration at a time. Once JWT is configured, IAM/SigV4 calls to `InvokeAgentRuntime` no longer work for anyone — both clients (CLI and web UI) must move to bearer tokens together. |
+| 27 | Token issuer | Okta (existing org) — a **new, dedicated Okta application** registered specifically for the Travel Agent, distinct from the author's pre-existing `okta-claude-code-token-helper` app (used for an unrelated Claude Code LLM gateway). | Reusing the same Okta app/client ID would let a token minted for one system silently authenticate to the other — undesired coupling. A separate app keeps blast radius and scope (audience, allowed scopes) contained to this project. |
+| 28 | Users | Small, known group of individuals, each with their own Okta identity — not a single personal token, not open self-service signup. | Matches the actual near-term need (share access with a few specific people) without taking on a public-facing identity system. |
+| 29 | Clients migrated | Both `cli/chat.py` and `web/server.py` move from IAM/SigV4 (via `boto3`'s default credential chain) to JWT bearer tokens on the `InvokeAgentRuntime` call. Neither client keeps an IAM fallback. | Consistent with decision #26 — IAM stops working for any caller once the Runtime's authorizer is switched, so there is no such thing as "just migrate one client." |
+| 30 | Web UI hosting scope | Unchanged from decision #19: still local-only, single machine per user, binds `127.0.0.1`, no new hosting infrastructure. Each of the small group of users runs their own local copy and logs in with their own Okta identity against the one shared deployed Runtime. | Hosting the web UI somewhere network-reachable (TLS, a domain, cookie/session handling, public exposure) is a materially different and larger project than "add JWT auth" — explicitly deferred as a separate future effort, not bundled into this change. |
+| 31 | Memory scoping / `actor_id` derivation | `actor_id` for AgentCore Memory is derived **server-side**, inside `agent/agent.py`, from the verified JWT's `sub` claim (Okta's stable, immutable per-user identifier) — not from a client-supplied `--actor-id` flag or any other client-controlled value. No override/impersonation escape hatch. | The whole point of adding real per-user auth is that one user's long-term Memory (preferences, conversation history) can't be read or written under another user's identity just by passing a different flag. `sub` (vs. `email`) is used because it's guaranteed stable even if a user's Okta profile email changes later — using `email` as the key would orphan old Memory records on any such change. An override flag "for testing" was explicitly rejected as a foot-gun that reintroduces the same spoofing risk it's meant to close; testing as a different persona means logging into Okta as that user, not passing a flag. |
+| 32 | Token acquisition mechanism | Both clients acquire a bearer token by invoking the author's existing `~/okta-claude-code-token-helper/okta-claude-code-token.py` script as a **subprocess, once per request/turn** (not cached independently by the Travel Agent clients), reusing that script's own caching/silent-refresh/interactive-login/cross-process-locking behavior. Configuration (`OKTA_ISSUER`, `OKTA_CLIENT_ID`, `OKTA_SCOPES`, `OKTA_REDIRECT_PORT`) for the Travel Agent's dedicated Okta app (decision #27) lives in a new `travel-planning-agent/.env` (gitignored; `.env.template` committed) and is passed to the subprocess as real environment variables — not via that script's own `.env` file, which is reserved for the pre-existing Claude Code gateway app and would otherwise force a shared/renamed dotenv file the script doesn't natively support. | Reimplementing OAuth 2.0 Authorization Code + PKCE, token caching, silent refresh, and cross-process locking from scratch for this project would duplicate a script that already does exactly this and is already trusted for a different real use case. Re-invoking per turn (rather than the client caching a token itself) means a multi-hour session keeps working transparently across token expiry without any client-side refresh logic — the helper script already handles "valid → instant," "expired but refreshable → silent refresh," and "neither → interactive login." |
+| 33 | Token cache collision | Accepted: the helper script's token cache path (`~/.cached-credentials/token-cache.json`) is a hardcoded constant, shared regardless of which Okta app's config is passed in via environment variables. Logging into the Travel Agent's Okta app evicts the Claude Code gateway's cached token and vice versa — only one is "logged in" at a time; switching tools forces a fresh interactive login for whichever wasn't used most recently. | Making the cache path configurable would require modifying the shared helper script (adding e.g. an `OKTA_CACHE_PATH` override) — explicitly deferred; the author chose to accept the collision for now rather than take on that (small, but nonzero) maintenance change. |
+| 34 | Claim propagation mechanism | The Runtime is configured with `requestHeaderAllowlist: ["Authorization"]` alongside the `customJwtAuthorizer`. This does **not** happen automatically from JWT authorizer configuration alone — confirmed against AWS's own docs (`inbound-jwt-authorizer.html`, `runtime-header-allowlist.html`): the authorizer validates the token's signature/expiry/issuer/audience/client/scopes at the edge before the agent runs, but claims are not injected into the invocation context as a separate, pre-parsed field. The allowlisted raw `Authorization` header is forwarded to `agent/agent.py` via `context.request_headers`, and the agent code itself is responsible for extracting `sub` from it. | This is a real, small implementation task (decode a JWT payload inside the agent), not a built-in AgentCore feature — worth recording explicitly since it was initially assumed to be automatic during design, and a future reader of `agent.py` should understand why this decoding step exists there rather than being handled by the Runtime. |
+| 35 | JWT decoding in agent code | `PyJWT`, decode-only (`jwt.decode(token, options={"verify_signature": False})`), added to `agent/requirements.txt`. No signature re-verification inside the agent. | The Runtime's `customJwtAuthorizer` has already cryptographically verified the token (signature, expiry, issuer, audience/client/scopes) before the agent process ever runs — decoding again inside the agent is purely to read the `sub` claim out of a token already known to be valid, not a second trust boundary. Hand-rolling base64url + JSON decoding was considered and rejected: it's a small amount of code but has enough real edge cases (padding, encoding) that a well-known, actively maintained library is preferable to reinventing it for no real savings. |
+
+Explicitly still true, carried over from the superseded decisions:
+IAM auth is **removed**, not kept as a parallel option (unlike a typical
+"add an alternative" change) — see decision #26. The web UI's local-only,
+single-user, no-hosting scope (decision #19) is explicitly **not**
+reopened by this change — see decision #30.
+
 ## 3. Architecture Overview
 
 ```
@@ -99,8 +129,13 @@ CDK stack.
 - Structured JSON itinerary output / export (PDF, calendar) — the local web
   UI (decision #19) is a manual-testing/demo surface, not this fast-follow;
   it still only renders the same plain markdown output as the CLI/console.
-- A hosted/multi-user frontend, or any auth system beyond IAM (the local
-  web UI is explicitly single-user and local-only — see decision #19)
-- Cognito/JWT auth for non-AWS-credentialed clients
+- A hosted/multi-user frontend for the web UI (decision #19/#30 — still
+  local-only per user, even after JWT auth (§2a) lets multiple distinct
+  people use it)
 - Integration/end-to-end automated tests
 - Cost budgets/billing alarms
+
+~~Cognito/JWT auth for non-AWS-credentialed clients~~ — **implemented, see
+§2a.** IAM auth (decision #15) has been fully replaced by Okta-issued JWT
+bearer tokens (decisions #26–35), not Cognito as originally anticipated
+here.

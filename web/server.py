@@ -3,12 +3,25 @@
 
 Runs entirely on localhost — no new AWS infrastructure. Serves a small
 static chat UI and a streaming API that invokes the deployed AgentCore
-Runtime agent using the same `agent_client` module `cli/chat.py` uses
-(boto3's `bedrock-agentcore` client, standard AWS credential resolution),
-plus read-only endpoints that list and replay past conversations directly
-from AgentCore Memory (no separate local storage — Memory is the source of
-truth). Not designed for multi-user or public exposure: there is no login,
-and the agent's `actor_id` is fixed per server process via `--actor-id`.
+Runtime agent using the same `agent_client` module `cli/chat.py` uses (an
+Okta-issued JWT bearer token over raw HTTPS — see DESIGN.md decisions
+#26-35, superseding decision #15's IAM-only auth), plus read-only endpoints
+that list and replay past conversations directly from AgentCore Memory (no
+separate local storage — Memory is the source of truth). Not designed for
+multi-user or public exposure: there is no login *page* of its own — this
+process still runs as one local user at a time, authenticated via Okta
+through the same `okta-claude-code-token-helper` subprocess the CLI uses
+(DESIGN.md decision #30, unchanged: still local-only, single machine per
+user).
+
+There is no `--actor-id` flag. The Memory `actor_id` for both the chat
+turns (server-side, in `agent/agent.py`) and this server's own
+conversation-history endpoints (`ListSessions`/`ListEvents`/`CreateEvent`/
+`DeleteEvent`, which are separate Memory-resource IAM-authorized calls, not
+part of `InvokeAgentRuntime`) is derived from the Okta token's `sub` claim
+(DESIGN.md decision #31) — decoded once at server startup from the same
+token `agent_client.get_okta_access_token()` acquires, so the sidebar
+always reflects the same identity as the chat itself.
 
 `POST /api/chat` streams the agent's response as Server-Sent Events —
 every labeled event the Runtime emits (reasoning/text/tool_use/tool_result/
@@ -23,29 +36,33 @@ Memory in one shot, not a re-simulated stream.
 
 Usage:
     python server.py --agent-runtime-arn <arn> --memory-id <id> \\
-        [--actor-id <id>] [--region <region>] [--qualifier <qualifier>] \\
-        [--port <port>]
+        [--region <region>] [--qualifier <qualifier>] [--port <port>]
 
 Then open http://localhost:<port> in a browser.
 
-Auth: standard AWS credential resolution (env vars, profile, IAM role).
-The invoking principal must have `bedrock-agentcore:InvokeAgentRuntime`
-permission on the target agent runtime, and `bedrock-agentcore:ListSessions`,
-`bedrock-agentcore:ListEvents`, `bedrock-agentcore:CreateEvent`, and
-`bedrock-agentcore:DeleteEvent` on the Memory resource for the
-conversation-history endpoints (IAM-only auth, per DESIGN.md decision #15 —
-there is no separate API key or bearer token). Because this server holds
-real AWS credentials and proxies them into agent calls, it must not be
-exposed beyond localhost.
+Auth: Okta login via the okta-claude-code-token-helper script, same as the
+CLI — run it once manually first if this is a fresh login (see that
+script's README). The chat call (`/api/chat`) re-acquires a token per
+request (cheap when cached); the conversation-history endpoints use the
+`actor_id` derived once at server startup, since the Memory calls
+themselves still use this project's existing boto3/IAM credentials (a
+separate, unrelated authorization boundary from the Runtime's JWT
+authorizer — Memory access was never part of decision #15's IAM-only
+Runtime auth and is unaffected by this change). Because this server
+proxies real credentials (both an Okta token and, for Memory, local AWS
+IAM credentials) into agent/Memory calls, it must not be exposed beyond
+localhost.
 """
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import boto3
+import jwt
 import uvicorn
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException
@@ -53,9 +70,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# Reuse the same session-ID + InvokeAgentRuntime logic as cli/chat.py.
+# Reuse the same session-ID + Okta token + invocation logic as cli/chat.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cli"))
-from agent_client import stream_agent_events  # noqa: E402
+from agent_client import get_okta_access_token, stream_agent_events  # noqa: E402
+
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -266,14 +284,79 @@ def _list_all_event_ids(client, memory_id: str, actor_id: str, session_id: str) 
     return event_ids
 
 
+def _actor_id_from_token(access_token: str) -> str:
+    """Derive the actor_id from an Okta access token's `sub` claim.
+
+    Decode-only (no signature re-verification) — this server trusts the
+    token because it was just freshly obtained from the same Okta app the
+    AgentCore Runtime's JWT authorizer validates against; the Runtime
+    itself re-validates the signature server-side on every /api/chat call
+    regardless (DESIGN.md decision #35's rationale applies equally here).
+
+    The raw `sub` claim is sanitized before use as AgentCore Memory's
+    actorId, not used verbatim — see _sanitize_actor_id()'s docstring.
+    This MUST produce the identical actor_id as agent/agent.py's
+    get_actor_id()/sanitize_actor_id() for the same `sub`, or this
+    server's conversation-history sidebar would look up a different
+    actor_id than the one the agent itself writes events under. The two
+    copies aren't shared via a common module (agent/ is a separate
+    deployment unit with its own requirements.txt, matching this
+    project's existing per-component boundary — see agent/agent.py's
+    sanitize_actor_id() for the canonical version); keep them in sync if
+    either changes.
+    """
+    claims = jwt.decode(access_token, options={"verify_signature": False})
+    sub = claims.get("sub")
+    if not sub:
+        raise RuntimeError("Okta access token has no 'sub' claim")
+    return _sanitize_actor_id(sub)
+
+
+# AgentCore Memory's actorId pattern: must start with an alphanumeric, then
+# any run of alphanumerics/-/_// and optional ":"-separated segments of the
+# same. Confirmed against the real ListEvents API pattern
+# ("[a-zA-Z0-9][a-zA-Z0-9-_/]*(?::[a-zA-Z0-9-_/]+)*[a-zA-Z0-9-_/]*") after
+# a live 502 (ValidationException on actorId) surfaced this Okta org's
+# `sub` being an email address, which the pattern rejects verbatim.
+_ACTOR_ID_DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9\-_/:]")
+_DEFAULT_ACTOR_ID = "anonymous-traveler"
+
+
+def _sanitize_actor_id(raw: str) -> str:
+    """Map an arbitrary `sub` claim to a string valid as an AgentCore Memory actorId.
+
+    Replaces every character outside the allowed set with "-", then strips
+    any leading run of non-alphanumeric characters (the pattern requires
+    the first character specifically be alphanumeric). Deterministic: the
+    same `sub` always sanitizes to the same actorId. Mirrors
+    agent/agent.py's sanitize_actor_id() exactly — keep the two in sync.
+    """
+    sanitized = _ACTOR_ID_DISALLOWED_CHARS.sub("-", raw)
+    sanitized = sanitized.lstrip("-_/:")
+    return sanitized or _DEFAULT_ACTOR_ID
+
+
 def create_app(
     agent_runtime_arn: str,
     region: str,
-    actor_id: str,
     qualifier: Optional[str] = None,
     memory_id: Optional[str] = None,
 ) -> FastAPI:
-    """Build the FastAPI app, wiring in the boto3 client and CLI args."""
+    """Build the FastAPI app, wiring in the boto3 Memory client and CLI args.
+
+    Acquires one Okta access token at startup (interactive login if
+    needed) purely to resolve `actor_id` from its `sub` claim for the
+    Memory conversation-history endpoints below — `/api/chat` itself
+    re-acquires a (likely cached) token per request via
+    `agent_client.get_okta_access_token()`, since a long-running server
+    process must not hold onto a token past its expiry.
+    """
+    actor_id = _actor_id_from_token(get_okta_access_token())
+    # Memory access (ListSessions/ListEvents/CreateEvent/DeleteEvent) is a
+    # separate IAM-authorized boto3 call, unrelated to the Runtime's JWT
+    # authorizer — unaffected by the IAM-to-JWT cutover on
+    # InvokeAgentRuntime (DESIGN.md decision #34's scope is Runtime auth
+    # only). This still uses the caller's local AWS credentials.
     client = boto3.client("bedrock-agentcore", region_name=region)
     app = FastAPI(title="Travel Planning Agent — Web UI")
 
@@ -284,7 +367,7 @@ def create_app(
     @app.get("/api/config")
     def config() -> dict:
         # Lets the frontend seed its localStorage session ID with the
-        # actor_id this server process was started with, so long-term
+        # actor_id derived from this server's Okta identity, so long-term
         # memory stays scoped consistently across page reloads. Tells the
         # frontend whether to show the conversation-history sidebar at all.
         return {"actor_id": actor_id, "history_enabled": memory_id is not None}
@@ -297,9 +380,9 @@ def create_app(
         (already validated to have a "type" key) back out as SSE frames —
         the browser's EventSource-equivalent fetch/reader consumes these
         directly; see static/app.js. A validation failure (empty prompt,
-        short session_id) is still a plain 400 JSON response, raised before
-        any streaming starts, since those are checked before the agent is
-        ever invoked.
+        short session_id, or a failed Okta token acquisition) is still a
+        plain 400/502 JSON response, raised before any streaming starts,
+        since those are checked before the agent is ever invoked.
         """
         prompt = request.prompt.strip()
         if not prompt:
@@ -314,14 +397,19 @@ def create_app(
                 "(AgentCore Runtime requirement)",
             )
 
+        try:
+            access_token = get_okta_access_token()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=f"Okta login failed: {e}") from e
+
         def _event_stream():
             try:
                 for event in stream_agent_events(
-                    client, agent_runtime_arn, request.session_id, prompt, qualifier
+                    access_token, agent_runtime_arn, region, request.session_id, prompt, qualifier
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except RuntimeError as e:
-                # A transport-level failure (AWS error, malformed SSE from
+                # A transport-level failure (HTTP error, malformed SSE from
                 # the Runtime) discovered mid-stream — the response has
                 # already started with a 200, so this can't become an
                 # HTTPException; forward it as one more in-band error event
@@ -567,13 +655,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(see the TravelAgentRuntimeStack CloudFormation outputs).",
     )
     parser.add_argument(
-        "--actor-id",
-        default="web-user",
-        help="Identifier for the traveler using this server, used to scope "
-        "long-term memory (default: %(default)s). Sent by the browser as "
-        "part of its persisted session ID, not passed here directly.",
-    )
-    parser.add_argument(
         "--region",
         default="us-east-1",
         help="AWS region the agent is deployed in (default: %(default)s).",
@@ -590,10 +671,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="AgentCore Memory resource ID (see the TravelAgentMemoryStack "
         "CloudFormation outputs). Enables the conversation-history sidebar "
         "(GET /api/conversations); omit to run without it. Requires the "
-        "caller's AWS credentials to have bedrock-agentcore:ListSessions, "
-        "bedrock-agentcore:ListEvents, bedrock-agentcore:CreateEvent (for "
-        "renaming), and bedrock-agentcore:DeleteEvent (for deleting) on "
-        "this Memory resource.",
+        "caller's local AWS credentials to have "
+        "bedrock-agentcore:ListSessions, bedrock-agentcore:ListEvents, "
+        "bedrock-agentcore:CreateEvent (for renaming), and "
+        "bedrock-agentcore:DeleteEvent (for deleting) on this Memory "
+        "resource. (Unrelated to the Okta/JWT auth used for chat itself — "
+        "Memory access is still IAM-authorized, see DESIGN.md decision #34.)",
     )
     parser.add_argument(
         "--host",
@@ -617,7 +700,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     app = create_app(
         agent_runtime_arn=args.agent_runtime_arn,
         region=args.region,
-        actor_id=args.actor_id,
         qualifier=args.qualifier,
         memory_id=args.memory_id,
     )

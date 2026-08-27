@@ -5,7 +5,16 @@ AgentCore Runtime. Bundling pip-installs agent/requirements.txt into the
 asset before upload, matching the standard Lambda-style dependency bundling
 pattern since AgentRuntimeArtifact.from_code_asset does not do this itself.
 
-Auth is IAM-only (design decision #15) via RuntimeAuthorizerConfiguration.using_iam().
+Auth is Okta-issued JWT bearer tokens via RuntimeAuthorizerConfiguration.using_jwt()
+(DESIGN.md decisions #26-35), superseding the original IAM-only auth
+(decision #15). `requestHeaderAllowlist=["Authorization"]` forwards the
+raw bearer token to the agent process via `context.request_headers` —
+confirmed against AWS's own docs (inbound-jwt-authorizer.html,
+runtime-header-allowlist.html): the JWT authorizer alone validates the
+token at the edge but does not automatically inject decoded claims into
+the invocation context, so `agent/agent.py` decodes the forwarded header
+itself (via PyJWT, signature verification skipped since the Runtime
+authorizer already did it) to derive `actor_id` from the `sub` claim.
 
 The agent process reads its Gateway URL and Memory ID from environment
 variables (GATEWAY_URL, MEMORY_ID) — this stack wires those from the
@@ -27,6 +36,7 @@ requirement — it provisions the traces-delivery pipeline that ships
 already-emitted spans to CloudWatch, but does not itself cause any spans
 to be emitted.
 """
+import os
 from pathlib import Path
 
 from aws_cdk import BundlingOptions, Stack
@@ -43,7 +53,7 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-5"
 
 
 class RuntimeStack(Stack):
-    """AgentCore Runtime hosting the travel planning agent, IAM auth only."""
+    """AgentCore Runtime hosting the travel planning agent, Okta JWT auth."""
 
     def __init__(
         self,
@@ -52,6 +62,8 @@ class RuntimeStack(Stack):
         *,
         gateway: agentcore.IGateway,
         memory: agentcore.IMemory,
+        okta_issuer: str,
+        okta_audience: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -90,7 +102,37 @@ class RuntimeStack(Stack):
             runtime_name="travel_planning_agent",
             description="Strands travel planning agent (itinerary builder).",
             agent_runtime_artifact=agent_runtime_artifact,
-            authorizer_configuration=agentcore.RuntimeAuthorizerConfiguration.using_iam(),
+            # Okta-issued JWT bearer tokens (DESIGN.md decisions #26-35),
+            # replacing IAM-only auth (decision #15) entirely — AgentCore
+            # Runtime supports one authorizer configuration at a time, so
+            # this is a full cutover, not an additional option. discoveryUrl
+            # must end with /.well-known/openid-configuration.
+            #
+            # allowed_audience (not allowed_clients) is used deliberately:
+            # Okta access tokens carry the client identifier in a `cid`
+            # claim, not the standard OAuth `client_id` claim AgentCore's
+            # allowedClients check validates against (confirmed against a
+            # real decoded Okta access token during this project's own
+            # deployment — client_id was absent entirely) — allowedClients
+            # would silently reject every real Okta token. allowedAudience
+            # checks the `aud` claim instead, which Okta's authorization
+            # server sets from its own configured Audience field — set to
+            # the static string "api://travel-planning-agent" (Okta Admin
+            # Console: Security > API > Authorization Servers > Settings),
+            # not the Runtime's own ARN, so a Runtime recreation (new
+            # auto-generated ARN suffix) can never invalidate already-
+            # issued/cached tokens.
+            authorizer_configuration=agentcore.RuntimeAuthorizerConfiguration.using_jwt(
+                discovery_url=f"{okta_issuer}/.well-known/openid-configuration",
+                allowed_audience=[okta_audience],
+            ),
+            # Forwards the raw Authorization header to the agent process via
+            # context.request_headers, so agent/agent.py can decode the
+            # already-validated JWT itself to read the `sub` claim (decision
+            # #34) — this is NOT automatic from the JWT authorizer alone.
+            request_header_configuration=agentcore.RequestHeaderConfiguration(
+                allowlisted_headers=["Authorization"],
+            ),
             environment_variables={
                 "GATEWAY_URL": gateway.gateway_url,
                 "MEMORY_ID": memory.memory_id,

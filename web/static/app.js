@@ -72,6 +72,45 @@ function loadOrCreateSession() {
   return fresh;
 }
 
+// The ALB's OIDC listener (OnUnauthenticatedRequest=AUTHENTICATE) responds
+// to *any* request with no/expired session cookie — including this app's
+// own fetch() calls, not just top-level page loads — with an HTTP 302 to
+// the IdP's /authorize endpoint. A real page navigation follows a
+// cross-origin redirect like this with no restriction at all, but a
+// same-origin fetch() cannot: the browser still applies its CORS check to
+// the *final* response in the redirect chain (the IdP's authorize page),
+// which was never meant to be fetched this way and has no
+// Access-Control-Allow-Origin header, so fetch() rejects with a generic
+// network-level TypeError rather than resolving with a 302 or 401.
+// (Confirmed directly against this deployment's ALB: `curl -v` against
+// /api/chat with no cookie returns a 302 to Okta, not a 401 — this ALB
+// does not use OnUnauthenticatedRequest=deny, which is the only mode
+// that would let fetch() observe a clean 401 instead.)
+//
+// There is no way to distinguish that rejection from a genuine network
+// error in JS. The fix either way is to stop relying on fetch() to
+// complete the flow and instead force a real top-level navigation via
+// reload — the browser will then happily follow the ALB's redirect to
+// the IdP with no CORS check involved, login proceeds normally, and the
+// page comes back with a valid session. A capped retry count guards
+// against a reload loop if the backend is genuinely broken rather than
+// just needing reauthentication.
+const AUTH_RELOAD_KEY = "travel-agent-auth-reload-count";
+const MAX_AUTH_RELOADS = 2;
+
+function handleAuthExpired() {
+  const count = Number(sessionStorage.getItem(AUTH_RELOAD_KEY) || "0");
+  if (count >= MAX_AUTH_RELOADS) {
+    appendMessage(
+      "error",
+      "Still not authenticated after reloading. Try closing this tab and opening the app fresh."
+    );
+    return;
+  }
+  sessionStorage.setItem(AUTH_RELOAD_KEY, String(count + 1));
+  window.location.reload();
+}
+
 // --- Minimal markdown renderer -------------------------------------------
 // Covers the subset the agent's system prompt actually produces: headings
 // (#/##/###), bold/italic, unordered/ordered lists, paragraphs. Escapes
@@ -305,6 +344,11 @@ async function sendMessage(prompt) {
       body: JSON.stringify({ prompt, session_id: sessionId }),
     });
 
+    if (res.status === 401) {
+      handleAuthExpired();
+      return;
+    }
+
     if (!res.ok || !res.body) {
       pendingEl.remove();
       const data = await res.json().catch(() => ({}));
@@ -392,7 +436,14 @@ async function sendMessage(prompt) {
     refreshConversationList();
   } catch (err) {
     pendingEl.remove();
-    appendMessage("error", `Could not reach the agent: ${err.message}`);
+    // A fetch() to a same-origin /api/* route can only fail like this for
+    // two reasons: a genuine network error, or the ALB responding with a
+    // cross-origin redirect to the IdP that the browser's CORS check then
+    // blocks (see handleAuthExpired()'s comment above) — there's no way
+    // to tell these apart from here. Reloading is the right response to
+    // both: it's how the redirect case actually gets resolved, and it's a
+    // harmless no-op retry if this was really just a dropped connection.
+    handleAuthExpired();
   } finally {
     sendBtn.disabled = false;
     inputEl.focus();
@@ -556,6 +607,10 @@ async function refreshConversationList() {
   if (!historyEnabled) return;
   try {
     const res = await fetch("/api/conversations");
+    if (res.status === 401) {
+      handleAuthExpired();
+      return;
+    }
     if (!res.ok) return;
     const conversations = await res.json();
     renderConversationList(conversations);
@@ -574,6 +629,10 @@ async function switchConversation(targetSessionId) {
   sendBtn.disabled = true;
   try {
     const res = await fetch(`/api/conversations/${encodeURIComponent(targetSessionId)}`);
+    if (res.status === 401) {
+      handleAuthExpired();
+      return;
+    }
     const data = await res.json();
     if (!res.ok) {
       appendMessage("error", data.detail || "Could not load that conversation.");
@@ -585,7 +644,9 @@ async function switchConversation(targetSessionId) {
     await refreshConversationList();
     setSidebarOpen(false);
   } catch (err) {
-    appendMessage("error", `Could not load that conversation: ${err.message}`);
+    // See the comment in sendMessage()'s catch block — a same-origin
+    // fetch() rejection here is treated the same way.
+    handleAuthExpired();
   } finally {
     sendBtn.disabled = false;
     inputEl.focus();
@@ -635,11 +696,22 @@ async function init() {
 
   try {
     const res = await fetch("/api/config");
+    if (res.status === 401) {
+      handleAuthExpired();
+      return;
+    }
     const config = await res.json();
     historyEnabled = Boolean(config.history_enabled);
+    // Reached a real response from a protected route — this session is
+    // authenticated, so clear the reload-loop guard for next time.
+    sessionStorage.removeItem(AUTH_RELOAD_KEY);
   } catch {
-    // historyEnabled stays false if /api/config is unreachable;
-    // sendMessage will surface the real connectivity error on first send.
+    // See handleAuthExpired()'s comment: a rejection here is most likely
+    // the ALB's redirect-to-IdP being blocked by CORS, and this is the
+    // very first request the page makes, so there's nothing useful to
+    // fall back to — reload rather than silently leaving a broken page.
+    handleAuthExpired();
+    return;
   }
   sessionId = loadOrCreateSession();
 
@@ -649,12 +721,23 @@ async function init() {
     // renders no messages, which is correct for a fresh conversation.
     try {
       const res = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}`);
+      if (res.status === 401) {
+        handleAuthExpired();
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         renderTranscript(data.turns);
       }
     } catch {
-      // Ignore — an empty chat window is a safe fallback.
+      // This fetch() is the first request the page makes after load, so
+      // a rejection here (rather than the /api/config rejection above,
+      // which is treated as a soft failure) is a reliable enough signal
+      // that we hit the ALB-redirect-blocked-by-CORS case (see
+      // handleAuthExpired()'s comment) to be worth a reload — leaving the
+      // user on a page with no transcript and a broken sidebar is worse.
+      handleAuthExpired();
+      return;
     }
     refreshConversationList();
   } else {

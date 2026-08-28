@@ -2,12 +2,11 @@
 
 All calls to the AgentCore Runtime are mocked (via
 agent_client.stream_agent_events) — no live network access, no real AWS
-credentials or Okta login required. `web_server.get_okta_access_token` is
-patched globally (module-level, not per-class) to return a fixed test JWT
-whose `sub` claim decodes to "web-user", matching the actor_id every test
-in this file was already written against — create_app() derives actor_id
-from that token at startup (DESIGN.md decision #31), it's no longer a
-constructor kwarg.
+credentials required. `web_server.actor_id_from_oidc_header` is patched to
+return a fixed "web-user" actor_id for every request in most test classes,
+since exercising the real ES256 signature verification (fetching a public
+key from ALB's public-keys endpoint) is a separate, narrowly-scoped
+concern covered by ActorIdFromOidcHeaderTests instead.
 """
 import importlib.util
 import json
@@ -30,11 +29,10 @@ web_server = importlib.util.module_from_spec(_spec)
 sys.modules["web_server"] = web_server
 _spec.loader.exec_module(web_server)
 
-# A fixed test token whose `sub` claim is "web-user" — every test in this
-# file was written against that actor_id. Signature verification is
-# skipped by _actor_id_from_token() (the Runtime's JWT authorizer already
-# validated the real token this stands in for), so any signing key works.
-_TEST_TOKEN = pyjwt.encode({"sub": "web-user"}, "unused-test-key", algorithm="HS256")
+_TEST_ALB_ARN = (
+    "arn:aws:elasticloadbalancing:us-east-1:123456789012:"
+    "loadbalancer/app/travel-agent-web/1234567890abcdef"
+)
 
 # A syntactically valid 33+ character runtimeSessionId, matching what the
 # frontend generates via build_runtime_session_id()-equivalent JS logic.
@@ -66,10 +64,10 @@ def _parse_sse(body: str) -> list[dict]:
 
 
 class SanitizeActorIdTests(unittest.TestCase):
-    """Regression tests: a real Okta org's `sub` claim was an email address,
-    which caused every ListSessions/ListEvents/CreateEvent call to fail
-    with a 502 (ValidationException on actorId) until sanitization was
-    added — confirmed live against a real deployment."""
+    """Regression tests: an OIDC `sub` claim shaped like an email address
+    caused every ListSessions/ListEvents/CreateEvent call to fail with a
+    502 (ValidationException on actorId) until sanitization was added —
+    confirmed live against a real deployment."""
 
     def test_leaves_already_valid_id_unchanged(self):
         self.assertEqual(web_server._sanitize_actor_id("web-user"), "web-user")
@@ -86,39 +84,161 @@ class SanitizeActorIdTests(unittest.TestCase):
         self.assertEqual(web_server._sanitize_actor_id("@@@"), web_server._DEFAULT_ACTOR_ID)
 
 
-class ActorIdFromTokenTests(unittest.TestCase):
+class ActorIdFromOidcHeaderTests(unittest.TestCase):
+    """Tests for the real ALB OIDC signature-verification path.
+
+    Uses a real EC keypair (generated in-test) to sign a JWT the same way
+    ALB would, then verifies actor_id_from_oidc_header() correctly accepts
+    or rejects it under each failure mode AWS's docs call out as a
+    required check (signer ARN mismatch, missing header, bad signature).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        cls.private_key = ec.generate_private_key(ec.SECP256R1())
+        cls.public_key = cls.private_key.public_key()
+
+    def _make_oidc_token(self, sub="web-user", signer=_TEST_ALB_ARN, kid="test-kid"):
+        return pyjwt.encode(
+            {"sub": sub},
+            self.private_key,
+            algorithm="ES256",
+            headers={"kid": kid, "signer": signer},
+        )
+
+    def _pem_public_key(self) -> bytes:
+        from cryptography.hazmat.primitives import serialization
+
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+    def setUp(self):
+        # Every test in this class calls through _fetch_alb_public_key(),
+        # which does a real HTTP GET to ALB's public-keys endpoint — mock
+        # that transport, not the cryptographic verification itself, so
+        # these tests exercise the real jwt.decode()/signature-checking
+        # code path.
+        web_server._alb_public_key_cache.clear()
+        patcher = patch("web_server.requests.get")
+        self.mock_get = patcher.start()
+        self.addCleanup(patcher.stop)
+        mock_response = MagicMock()
+        mock_response.content = self._pem_public_key()
+        self.mock_get.return_value = mock_response
+
+    def test_accepts_valid_token_with_matching_signer(self):
+        token = self._make_oidc_token()
+
+        actor_id = web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(actor_id, "web-user")
+
     def test_sanitizes_email_shaped_sub_claim(self):
-        token = pyjwt.encode({"sub": "kenkitts@amazon.com"}, "unused-test-key", algorithm="HS256")
+        token = self._make_oidc_token(sub="kenkitts@amazon.com")
 
-        self.assertEqual(web_server._actor_id_from_token(token), "kenkitts-amazon-com")
+        actor_id = web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
 
-    def test_raises_when_no_sub_claim(self):
-        token = pyjwt.encode({"client_id": "abc"}, "unused-test-key", algorithm="HS256")
+        self.assertEqual(actor_id, "kenkitts-amazon-com")
 
-        with self.assertRaises(RuntimeError):
-            web_server._actor_id_from_token(token)
+    def test_raises_401_when_header_missing(self):
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as ctx:
+            web_server.actor_id_from_oidc_header(None, "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_raises_401_when_signer_does_not_match(self):
+        from fastapi import HTTPException
+
+        token = self._make_oidc_token(signer="arn:aws:elasticloadbalancing:us-east-1:999:loadbalancer/app/other/xyz")
+
+        with self.assertRaises(HTTPException) as ctx:
+            web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertIn("signer", ctx.exception.detail)
+
+    def test_raises_401_when_signature_invalid(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from fastapi import HTTPException
+
+        # Sign with a *different* private key than the one whose public
+        # key _fetch_alb_public_key() will return — signature must fail.
+        other_key = ec.generate_private_key(ec.SECP256R1())
+        token = pyjwt.encode(
+            {"sub": "web-user"},
+            other_key,
+            algorithm="ES256",
+            headers={"kid": "test-kid", "signer": _TEST_ALB_ARN},
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_raises_401_when_header_is_malformed(self):
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as ctx:
+            web_server.actor_id_from_oidc_header("not-a-jwt", "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_raises_401_when_no_sub_claim(self):
+        from fastapi import HTTPException
+
+        token = pyjwt.encode(
+            {"name": "no sub here"},
+            self.private_key,
+            algorithm="ES256",
+            headers={"kid": "test-kid", "signer": _TEST_ALB_ARN},
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_caches_public_key_across_calls(self):
+        token = self._make_oidc_token()
+
+        web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+        web_server.actor_id_from_oidc_header(token, "us-east-1", _TEST_ALB_ARN)
+
+        self.mock_get.assert_called_once()
 
 
 class ChatEndpointTests(unittest.TestCase):
     def setUp(self):
         # boto3.client() is created inside create_app(); patch it so no
-        # real AWS client/credentials are needed. get_okta_access_token()
-        # is also called inside create_app() (once, to derive actor_id) and
-        # per-request inside /api/chat — patched globally to the fixed
-        # test token so no real Okta login/subprocess is invoked.
+        # real AWS client/credentials are needed.
         patcher = patch("web_server.boto3.client")
         self.mock_boto_client_factory = patcher.start()
         self.addCleanup(patcher.stop)
         self.mock_client = MagicMock()
         self.mock_boto_client_factory.return_value = self.mock_client
 
-        token_patcher = patch("web_server.get_okta_access_token", return_value=_TEST_TOKEN)
-        token_patcher.start()
-        self.addCleanup(token_patcher.stop)
+        # actor_id_from_oidc_header() does real ES256 verification against
+        # a fetched public key — that mechanism has its own dedicated test
+        # class (ActorIdFromOidcHeaderTests); here it's patched to a fixed
+        # "web-user" so every other endpoint test can focus on its own
+        # behavior without also constructing a signed token.
+        actor_patcher = patch(
+            "web_server.actor_id_from_oidc_header", return_value="web-user"
+        )
+        actor_patcher.start()
+        self.addCleanup(actor_patcher.stop)
 
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
         )
         self.client = TestClient(self.app)
 
@@ -135,6 +255,7 @@ class ChatEndpointTests(unittest.TestCase):
         response = self.client.post(
             "/api/chat",
             json={"prompt": "Plan a trip to Boston", "session_id": VALID_SESSION_ID},
+            headers={"x-amzn-oidc-data": "fake-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -150,12 +271,12 @@ class ChatEndpointTests(unittest.TestCase):
         )
         mock_stream_agent_events.assert_called_once()
         call_args = mock_stream_agent_events.call_args.args
-        # stream_agent_events(access_token, agent_runtime_arn, region, runtime_session_id, prompt, qualifier)
-        self.assertEqual(call_args[0], _TEST_TOKEN)
-        self.assertEqual(call_args[1], "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test")
-        self.assertEqual(call_args[2], "us-east-1")
-        self.assertEqual(call_args[3], VALID_SESSION_ID)
-        self.assertEqual(call_args[4], "Plan a trip to Boston")
+        # stream_agent_events(agent_runtime_arn, region, runtime_session_id, prompt, actor_id, qualifier)
+        self.assertEqual(call_args[0], "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test")
+        self.assertEqual(call_args[1], "us-east-1")
+        self.assertEqual(call_args[2], VALID_SESSION_ID)
+        self.assertEqual(call_args[3], "Plan a trip to Boston")
+        self.assertEqual(call_args[4], "web-user")
 
     @patch("web_server.stream_agent_events")
     def test_chat_strips_whitespace_from_prompt(self, mock_stream_agent_events):
@@ -164,15 +285,17 @@ class ChatEndpointTests(unittest.TestCase):
         self.client.post(
             "/api/chat",
             json={"prompt": "  Plan a trip  ", "session_id": VALID_SESSION_ID},
+            headers={"x-amzn-oidc-data": "fake-token"},
         )
 
         call_args = mock_stream_agent_events.call_args.args
-        self.assertEqual(call_args[4], "Plan a trip")
+        self.assertEqual(call_args[3], "Plan a trip")
 
     def test_chat_rejects_empty_prompt(self):
         response = self.client.post(
             "/api/chat",
             json={"prompt": "   ", "session_id": VALID_SESSION_ID},
+            headers={"x-amzn-oidc-data": "fake-token"},
         )
 
         self.assertEqual(response.status_code, 400)
@@ -182,6 +305,7 @@ class ChatEndpointTests(unittest.TestCase):
         response = self.client.post(
             "/api/chat",
             json={"prompt": "hello", "session_id": "too-short"},
+            headers={"x-amzn-oidc-data": "fake-token"},
         )
 
         self.assertEqual(response.status_code, 400)
@@ -201,6 +325,7 @@ class ChatEndpointTests(unittest.TestCase):
         response = self.client.post(
             "/api/chat",
             json={"prompt": "hello", "session_id": VALID_SESSION_ID},
+            headers={"x-amzn-oidc-data": "fake-token"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -209,13 +334,11 @@ class ChatEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "error")
         self.assertIn("boom", events[-1]["data"]["note"])
 
-    def test_config_endpoint_returns_actor_id(self):
+    def test_config_endpoint_reports_history_disabled_by_default(self):
         response = self.client.get("/api/config")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json(), {"actor_id": "web-user", "history_enabled": False}
-        )
+        self.assertEqual(response.json(), {"history_enabled": False})
 
     def test_index_serves_html(self):
         response = self.client.get("/")
@@ -223,6 +346,90 @@ class ChatEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers["content-type"])
         self.assertIn("Travel Planning Agent", response.text)
+
+
+class WhoamiEndpointTests(unittest.TestCase):
+    """Tests for GET /api/whoami.
+
+    Unlike ChatEndpointTests, this exercises the real ES256 verification
+    path (actor_id_from_oidc_header is not patched here) — the whole point
+    of this endpoint is confirming what a genuine, signature-verified
+    request resolves to, so a test that patched that away would prove
+    nothing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        cls.private_key = ec.generate_private_key(ec.SECP256R1())
+        cls.public_key = cls.private_key.public_key()
+
+    def _make_oidc_token(self, sub="web-user", signer=_TEST_ALB_ARN, kid="test-kid"):
+        return pyjwt.encode(
+            {"sub": sub},
+            self.private_key,
+            algorithm="ES256",
+            headers={"kid": kid, "signer": signer},
+        )
+
+    def setUp(self):
+        web_server._alb_public_key_cache.clear()
+        patcher = patch("web_server.requests.get")
+        self.mock_get = patcher.start()
+        self.addCleanup(patcher.stop)
+        mock_response = MagicMock()
+        from cryptography.hazmat.primitives import serialization
+
+        mock_response.content = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        self.mock_get.return_value = mock_response
+
+        boto_patcher = patch("web_server.boto3.client")
+        boto_patcher.start()
+        self.addCleanup(boto_patcher.stop)
+
+        self.app = web_server.create_app(
+            agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
+            region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
+        )
+        self.client = TestClient(self.app)
+
+    def test_returns_sanitized_actor_id_and_raw_sub_for_plain_sub(self):
+        token = self._make_oidc_token(sub="web-user")
+
+        response = self.client.get("/api/whoami", headers={"x-amzn-oidc-data": token})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"sub": "web-user", "actor_id": "web-user"})
+
+    def test_shows_sanitization_applied_to_email_shaped_sub(self):
+        token = self._make_oidc_token(sub="kenkitts@amazon.com")
+
+        response = self.client.get("/api/whoami", headers={"x-amzn-oidc-data": token})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"sub": "kenkitts@amazon.com", "actor_id": "kenkitts-amazon-com"},
+        )
+
+    def test_returns_401_when_oidc_header_missing(self):
+        response = self.client.get("/api/whoami")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_returns_401_when_signer_does_not_match(self):
+        token = self._make_oidc_token(
+            signer="arn:aws:elasticloadbalancing:us-east-1:999:loadbalancer/app/other/xyz"
+        )
+
+        response = self.client.get("/api/whoami", headers={"x-amzn-oidc-data": token})
+
+        self.assertEqual(response.status_code, 401)
 
 
 def _conversational_event(role: str, text: str, timestamp=None) -> dict:
@@ -267,16 +474,20 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         self.mock_client = MagicMock()
         self.mock_boto_client_factory.return_value = self.mock_client
 
-        token_patcher = patch("web_server.get_okta_access_token", return_value=_TEST_TOKEN)
-        token_patcher.start()
-        self.addCleanup(token_patcher.stop)
+        actor_patcher = patch(
+            "web_server.actor_id_from_oidc_header", return_value="web-user"
+        )
+        actor_patcher.start()
+        self.addCleanup(actor_patcher.stop)
 
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
             memory_id="mem-123",
         )
         self.client = TestClient(self.app)
+        self.headers = {"x-amzn-oidc-data": "fake-token"}
 
     def test_config_reports_history_enabled_when_memory_id_set(self):
         response = self.client.get("/api/config")
@@ -299,7 +510,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         self.assertEqual(response.status_code, 200)
         conversations = response.json()
@@ -328,7 +539,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "ListSessions"
         )
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
@@ -339,7 +550,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         }
         self.mock_client.list_events.return_value = {"events": []}
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
@@ -353,7 +564,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "events": [_conversational_event("USER", long_text)]
         }
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         preview = response.json()[0]["preview"]
         self.assertLessEqual(len(preview), 81)  # PREVIEW_MAX_CHARS + ellipsis
@@ -363,10 +574,11 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
         )
         client = TestClient(app)
 
-        response = client.get("/api/conversations")
+        response = client.get("/api/conversations", headers=self.headers)
 
         self.assertEqual(response.status_code, 404)
 
@@ -379,7 +591,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -419,7 +633,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -437,7 +653,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -448,7 +666,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
     def test_get_conversation_returns_404_for_unknown_session(self):
         self.mock_client.list_events.return_value = {"events": []}
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
 
@@ -457,7 +677,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "ListEvents"
         )
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
 
@@ -465,17 +687,22 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
         )
         client = TestClient(app)
 
-        response = client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
 
     def test_get_conversation_returns_502_on_client_error(self):
         self.mock_client.list_events.side_effect = RuntimeError("boom")
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 502)
         self.assertIn("boom", response.json()["detail"])
@@ -492,7 +719,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         conversations = response.json()
         self.assertEqual(conversations[0]["title"], "Seattle Coffee Trip")
@@ -506,7 +733,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "events": [_conversational_event("USER", "Plan a trip to Seattle")]
         }
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         self.assertIsNone(response.json()[0]["title"])
 
@@ -523,7 +750,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get("/api/conversations")
+        response = self.client.get("/api/conversations", headers=self.headers)
 
         self.assertEqual(response.json()[0]["title"], "Seattle Trip v2")
 
@@ -536,7 +763,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ]
         }
 
-        response = self.client.get(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.get(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(
             response.json()["turns"],
@@ -552,6 +781,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         response = self.client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": "Seattle Coffee Trip"},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 200)
@@ -578,6 +808,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         response = self.client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": "  Seattle   Coffee\nTrip  "},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 200)
@@ -587,6 +818,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         response = self.client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": "   "},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 400)
@@ -599,6 +831,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         response = self.client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": long_title},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 200)
@@ -610,12 +843,14 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
         )
         client = TestClient(app)
 
         response = client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": "New Title"},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 404)
@@ -629,6 +864,7 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         response = self.client.put(
             f"/api/conversations/{VALID_SESSION_ID}/title",
             json={"title": "New Title"},
+            headers=self.headers,
         )
 
         self.assertEqual(response.status_code, 502)
@@ -639,7 +875,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         }
         self.mock_client.delete_event.return_value = {}
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -669,7 +907,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         ]
         self.mock_client.delete_event.return_value = {}
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["deleted_events"], 2)
@@ -689,7 +929,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             ),
         ]
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         # Best-effort: a partial failure is still a 200 with the failure
         # count surfaced, not a 502 — the caller can see what happened and
@@ -703,7 +945,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
     def test_delete_conversation_returns_404_for_empty_session(self):
         self.mock_client.list_events.return_value = {"events": []}
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
         self.mock_client.delete_event.assert_not_called()
@@ -713,7 +957,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "ListEvents"
         )
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
 
@@ -723,7 +969,9 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
             "ListEvents",
         )
 
-        response = self.client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = self.client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 502)
 
@@ -731,10 +979,13 @@ class ConversationHistoryEndpointTests(unittest.TestCase):
         app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
+            alb_arn=_TEST_ALB_ARN,
         )
         client = TestClient(app)
 
-        response = client.delete(f"/api/conversations/{VALID_SESSION_ID}")
+        response = client.delete(
+            f"/api/conversations/{VALID_SESSION_ID}", headers=self.headers
+        )
 
         self.assertEqual(response.status_code, 404)
 

@@ -2,8 +2,8 @@
 //
 // Talks to the local backend (server.py) over /api/chat, /api/config, and
 // /api/conversations[/…]. Session persistence: the AgentCore
-// runtimeSessionId is generated once per browser (per actor_id) and stored
-// in localStorage, so reloading the page continues the same conversation.
+// runtimeSessionId is generated once per browser and stored in
+// localStorage, so reloading the page continues the same conversation.
 // "New conversation" clears it and starts a fresh session, matching how
 // cli/chat.py starts a fresh session each time it's run.
 //
@@ -11,8 +11,22 @@
 // Memory is the source of truth. Switching conversations fetches that
 // session's transcript from the server (GET /api/conversations/{id}),
 // which reads it straight out of Memory via ListEvents.
+//
+// Note on identity: this file has no notion of "who's logged in" — the
+// server derives the real actor_id per-request from the ALB's verified
+// OIDC claims (see actor_id_from_oidc_header() in server.py) and never
+// takes it from the client. An earlier version of this file generated the
+// runtimeSessionId with an actor_id-shaped prefix read from /api/config,
+// but /api/config stopped returning actor_id once it became a per-request
+// (not server-startup) value — that left a stale "web-user___" prefix on
+// every session ID that looked like an actor_id but wasn't one, which is
+// confusing when reading it back out of logs/traces. The prefix carried
+// no real meaning even before that (the server has never read anything
+// out of the runtimeSessionId string), so it's dropped entirely here
+// rather than reconnected to a real value.
 
 const SESSION_STORAGE_KEY = "travel-agent-session-id";
+const SESSION_ID_PREFIX = "web-session";
 const DIAGNOSTIC_STORAGE_KEY = "travel-agent-diagnostics-enabled";
 // AgentCore Runtime requires runtimeSessionId to be 33-256 characters.
 const MIN_SESSION_ID_LENGTH = 33;
@@ -28,7 +42,6 @@ const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
 const sidebarCloseBtn = document.getElementById("sidebar-close-btn");
 const diagnosticToggleInput = document.getElementById("diagnostic-toggle-input");
 
-let actorId = "web-user";
 let sessionId = null;
 let historyEnabled = false;
 let diagnosticsEnabled = false;
@@ -41,8 +54,8 @@ function randomHex(length) {
     .slice(0, length);
 }
 
-function buildSessionId(actor) {
-  let id = `${actor}___${randomHex(32)}`;
+function buildSessionId() {
+  let id = `${SESSION_ID_PREFIX}___${randomHex(32)}`;
   if (id.length < MIN_SESSION_ID_LENGTH) {
     id = id.padEnd(MIN_SESSION_ID_LENGTH, "0");
   }
@@ -51,10 +64,10 @@ function buildSessionId(actor) {
 
 function loadOrCreateSession() {
   const stored = localStorage.getItem(SESSION_STORAGE_KEY);
-  if (stored && stored.startsWith(`${actorId}___`)) {
+  if (stored && stored.startsWith(`${SESSION_ID_PREFIX}___`)) {
     return stored;
   }
-  const fresh = buildSessionId(actorId);
+  const fresh = buildSessionId();
   localStorage.setItem(SESSION_STORAGE_KEY, fresh);
   return fresh;
 }
@@ -469,7 +482,7 @@ async function confirmAndDelete(conv) {
     // to show — start a fresh conversation rather than leaving a stale
     // transcript on screen for a session that no longer exists.
     if (conv.session_id === sessionId) {
-      sessionId = buildSessionId(actorId);
+      sessionId = buildSessionId();
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       messagesEl.innerHTML = "";
     }
@@ -597,7 +610,7 @@ inputEl.addEventListener("keydown", (event) => {
 });
 
 newConversationBtn.addEventListener("click", () => {
-  sessionId = buildSessionId(actorId);
+  sessionId = buildSessionId();
   localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
   messagesEl.innerHTML = "";
   inputEl.focus();
@@ -623,10 +636,9 @@ async function init() {
   try {
     const res = await fetch("/api/config");
     const config = await res.json();
-    actorId = config.actor_id || actorId;
     historyEnabled = Boolean(config.history_enabled);
   } catch {
-    // Fall back to the default actorId if /api/config is unreachable;
+    // historyEnabled stays false if /api/config is unreachable;
     // sendMessage will surface the real connectivity error on first send.
   }
   sessionId = loadOrCreateSession();

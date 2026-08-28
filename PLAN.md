@@ -645,10 +645,211 @@ default — it has to be configured explicitly, one-time, per Gateway.
       with no way to see request/response bodies, target names, or
       trace/span IDs to correlate a failure back to a specific tool call.
 
+## Phase 10 — Hosted Web UI on ECS Fargate (OIDC ALB), Runtime auth reverted to IAM
+
+Requested: host the web UI on AWS (ECS Fargate + autoscaling, an ALB with
+OIDC enabled, an existing TLS certificate) instead of everyone running
+`web/server.py` locally. See DESIGN.md §2b (decisions #37-44) for the full
+design rationale, gathered via a clarifying-questions pass before any code
+was written.
+
+- [x] `cdk/stacks/runtime_stack.py` — reverted `RuntimeAuthorizerConfiguration`
+      from `.using_jwt(...)` back to `.using_iam()`, removed the
+      `okta_issuer`/`okta_audience` constructor kwargs and the
+      `RequestHeaderConfiguration` bearer-token-forwarding config entirely
+      (DESIGN.md decision #37 — once `TravelAgentWebStack`'s ALB became the
+      real human-facing identity boundary, the Runtime's own JWT authorizer
+      was redundant, and had no answer for a non-interactive ECS task
+      authenticating as a specific human anyway).
+- [x] `agent/agent.py` — `get_actor_id()` rewritten to read `actor_id`
+      directly from the invocation payload (`{"prompt": ..., "actor_id":
+      ...}`) instead of decoding a forwarded JWT's `sub` claim; the caller
+      (the web container, from its ALB's verified OIDC claims; the CLI,
+      from a `--actor-id` flag) is trusted to supply the correct value —
+      the same trust boundary every other IAM-authenticated payload field
+      already has. `sanitize_actor_id()`'s character-set logic is
+      unchanged (still needed regardless of where the raw value comes
+      from). Removed the `PyJWT` dependency from `agent/requirements.txt`
+      entirely — the agent no longer decodes any token.
+- [x] `cli/agent_client.py` — full rewrite: dropped `get_okta_access_token()`
+      and the `httpx`-based raw-HTTPS bearer-token streaming transport;
+      `stream_agent_events()` now calls `boto3`'s
+      `bedrock-agentcore.invoke_agent_runtime` (IAM/SigV4) directly, reading
+      the streaming response body (a `botocore.response.StreamingBody`,
+      which — confirmed by inspecting the installed botocore source
+      directly — exposes the same `iter_lines()` interface the previous
+      `httpx` response did, so the SSE-frame-parsing logic itself needed no
+      changes). Added `build_invoke_payload()` to include `actor_id`
+      alongside `prompt`. `cli/requirements.txt` swapped `httpx` back for
+      `boto3`.
+- [x] `cli/chat.py` — brought back a required `--actor-id` flag (there is no
+      more Okta identity to derive one from); `run_repl()`/`_consume_stream()`
+      updated for the new `stream_agent_events()` signature.
+- [x] `web/server.py` — full rewrite of the auth path:
+      - Removed the Okta-login-at-startup model entirely (no more
+        `get_okta_access_token()`/subprocess call, no more single
+        server-wide `actor_id` derived once and shared by every request).
+      - Added `actor_id_from_oidc_header()`: derives `actor_id` fresh on
+        *every* request from the ALB's `x-amzn-oidc-data` header, with real
+        signature verification — decodes the JWT header (unverified) to
+        read `kid`/`signer`, checks `signer` against the deployment's own
+        `--alb-arn`, fetches (and caches, by `kid`) the ES256 public key
+        from ALB's `https://public-keys.auth.elb.<region>.amazonaws.com/<kid>`
+        endpoint, then verifies the full signature before trusting the
+        `sub` claim — per AWS's own documented requirement that this header
+        must be signature-verified, not trusted blindly, before any
+        authorization decision is made on it. Raises 401 on any failure
+        (missing header, signer mismatch, bad signature, malformed token) —
+        unlike `agent/agent.py`'s payload-based `get_actor_id()`, there is
+        no silent fallback to a shared default actor here, since a forged
+        or missing OIDC header means the request didn't come through the
+        ALB's login gate at all.
+      - Every endpoint (`/api/chat`, `/api/conversations`,
+        `/api/conversations/{id}`, the title/delete endpoints) now derives
+        `actor_id` per-request via this function instead of using a
+        startup-cached value — a long-running container correctly serves
+        multiple distinct logged-in people without mixing up whose Memory a
+        request should touch.
+      - `create_app()` gained a required `alb_arn` parameter;
+        `build_arg_parser()` gained `--alb-arn` (required) and changed the
+        `--host` default from `127.0.0.1` to `0.0.0.0` (the ALB reaches the
+        container over the VPC, not localhost).
+      - `web/requirements.txt` gained `requests` (for the public-key fetch)
+        and an explicit `cryptography` pin (previously only a transitive
+        dependency); `PyJWT` stays, now used for ALB-header verification
+        instead of Okta-token decoding.
+- [x] `web/Dockerfile` (new) — `python:3.12-slim`, installs
+      `web/requirements.txt`, copies `web/` and `cli/agent_client.py` (the
+      one file `web/server.py` imports across the sibling `cli/`
+      directory), no baked-in credentials — the ECS task role supplies AWS
+      credentials at runtime via the container's task metadata endpoint.
+- [x] `cdk/stacks/web_stack.py` (new) — `WebStack`:
+      - A dedicated VPC (2 AZs, public + private-with-egress subnets, one
+        NAT Gateway per AZ; DESIGN.md decision #39) — not a pre-existing
+        VPC, matching this project's per-stack-provisions-its-own-resources
+        pattern.
+      - An ECS cluster + Fargate service (0.5 vCPU/1GB, `desired_count=1`,
+        autoscaling 1-3 tasks on CPU 60% via `scale_on_cpu_utilization`;
+        DESIGN.md decision #43), `circuitBreaker(rollback=True)` and
+        `min_healthy_percent=100` (a `desired_count=1` deployment would
+        otherwise be able to drop to zero running tasks mid-rollout, since
+        ECS's own default `min_healthy_percent` is 50%).
+      - Task role scoped to exactly this deployment's Memory/Runtime ARNs
+        via `memory.grant_full_access()`/`runtime.grant_invoke()`
+        (DESIGN.md decision #42) — no wildcard grants.
+      - An internet-facing ALB (DESIGN.md decision #39) with a 180s idle
+        timeout (decision #43) and an `authenticate-oidc` default listener
+        action chained (via its own `next=` parameter, not a fluent
+        method — confirmed by inspecting the installed CDK
+        `aws_elasticloadbalancingv2` module's actual constructor signature
+        rather than guessing) into a `forward` action to the Fargate target
+        group (DESIGN.md decision #38). The container's `--alb-arn` CLI
+        argument is wired from `self.load_balancer.load_balancer_arn`, so
+        `actor_id_from_oidc_header()`'s signer check always matches this
+        exact ALB.
+      - `ecs.ContainerImage.from_asset()` builds/pushes the image as part of
+        `cdk deploy` (DESIGN.md decision #41), pointed at
+        `web/Dockerfile` with the build context set to the repo root
+        (needed since the Dockerfile `COPY`s both `web/` and
+        `cli/agent_client.py`) and explicit `exclude` patterns for
+        `cdk/cdk.out`/`.venv`/`.git`/`__pycache__`.
+      - **Real bug found and fixed during this stack's own development**:
+        omitting those excludes caused a confirmed `ENAMETOOLONG` failure
+        during `cdk synth` — without them, the Docker asset's build-context
+        copy recursively copies `cdk/cdk.out` into itself on every synth
+        (the previous synth's own output directory gets copied into the new
+        one, which then gets copied into the next one, etc.), producing
+        paths that eventually exceed the filesystem's path-length limit.
+        Fixed by excluding `cdk/cdk.out` (and the other large/irrelevant
+        directories) from the asset's Docker build context.
+      - Certificate: `acm.Certificate.from_certificate_arn()` — this stack
+        does not provision or import a certificate itself (DESIGN.md
+        decision #40); the caller supplies an existing ACM certificate ARN.
+      - `CfnOutput`s for the ALB's DNS name and ARN (the latter is also what
+        an operator needs to configure a matching Okta redirect URI).
+- [x] `cdk/app.py` — removed the `OKTA_ISSUER`/`OKTA_AUDIENCE` env-var
+      requirement for `RuntimeStack` entirely (no longer needed after the
+      IAM reversion); added conditional construction of `TravelAgentWebStack`
+      gated on `WEB_CERTIFICATE_ARN` being set, reading the rest of its
+      config (`WEB_OIDC_*`) from the same `.env`-loading mechanism, and
+      failing fast with a clear error if `WEB_CERTIFICATE_ARN` is set but
+      any `WEB_OIDC_*` var is missing. `cdk deploy --all`/`cdk synth --all`
+      still work with zero `.env` configuration at all — they simply skip
+      `TravelAgentWebStack` in that case.
+- [x] `.env.template` — fully rewritten: removed the obsolete
+      `OKTA_ISSUER`/`OKTA_CLIENT_ID`/`OKTA_SCOPES`/`OKTA_REDIRECT_PORT`/
+      `OKTA_AUDIENCE`/`OKTA_TOKEN_HELPER_PATH` vars (no longer used
+      anywhere in this project after the IAM reversion), replaced with
+      `WEB_CERTIFICATE_ARN` and the `WEB_OIDC_*` vars `TravelAgentWebStack`
+      actually needs.
+- [x] Tests updated for the new auth model:
+      - `tests/test_agent.py` — `GetActorIdTests` rewritten for the
+        payload-based `get_actor_id()` (no more JWT construction/decoding
+        in these tests).
+      - `tests/test_agent_client.py` — full rewrite for the boto3-based
+        transport (mocks `boto3.client(...).invoke_agent_runtime`'s
+        response, including a mock `StreamingBody`-shaped `iter_lines()`).
+      - `tests/test_chat.py` — updated for `_consume_stream()`'s new
+        `(agent_runtime_arn, region, session_id, prompt, actor_id,
+        qualifier)` signature.
+      - `web/tests/test_server.py` — full rewrite: new
+        `ActorIdFromOidcHeaderTests` class generates a real EC keypair
+        in-test and signs JWTs with it exactly the way ALB would (ES256,
+        `kid`/`signer` headers), mocking only the HTTP fetch of the public
+        key (`requests.get`) so the actual cryptographic verification code
+        path is genuinely exercised — covering acceptance of a valid
+        token, `sub`-sanitization, and 401 rejection for each documented
+        failure mode (missing header, signer mismatch, bad signature,
+        malformed token, missing `sub`). Every other endpoint test class
+        now passes a real `alb_arn` to `create_app()` and an
+        `x-amzn-oidc-data` request header, with
+        `actor_id_from_oidc_header` patched to a fixed `"web-user"` so
+        those tests can focus on their own endpoint behavior without also
+        constructing a signed token per call.
+      - Full suite: **137/137** passing.
+- [x] Verified via `cdk synth`: the four base stacks synth cleanly with no
+      Okta configuration present at all; `TravelAgentWebStack` synths
+      cleanly on its own and as part of a full `cdk synth --all` when
+      `WEB_CERTIFICATE_ARN`/`WEB_OIDC_*` are set to placeholder values
+      (real values require a real ACM certificate and a real Okta OIDC
+      app registration, neither of which this build session can create —
+      deferred to the user; see below).
+- [x] `README.md` — full rewrite of the "Architecture" diagram,
+      "Authentication" section (back to IAM/`--actor-id`, matching the
+      original decision #15 framing), "Usage"/"Web UI" sections, plus a new
+      "Hosting the Web UI" section documenting `TravelAgentWebStack`'s
+      prerequisites (ACM cert, dedicated Okta OIDC app for the ALB, DNS
+      out of scope), configure/deploy steps, and deployment notes (sizing,
+      idle timeout, task role scope).
+- [x] `DESIGN.md` — added §2b (decisions #37-44) documenting the Runtime-auth
+      reversion and every hosting decision (compute/ALB/auth, networking,
+      TLS/DNS scope, container build mechanism, IAM scope, sizing
+      assumptions, CI/CD scope), each with the rationale gathered from the
+      clarifying-questions pass before implementation began.
+
+### Remaining manual steps (deferred to the user — this build session cannot perform them)
+1. Register a dedicated Okta OIDC web application (confidential client,
+   with a client secret) for the ALB — a *different* app than any used by
+   the CLI (which no longer uses Okta at all after this change).
+2. Obtain the ACM certificate ARN for the ALB's HTTPS listener (already
+   issued/validated in `us-east-1`, per the user's stated prerequisite).
+3. `cp .env.template .env` and fill in `WEB_CERTIFICATE_ARN` and the
+   `WEB_OIDC_*` values from steps 1-2.
+4. `cdk deploy TravelAgentWebStack --require-approval never` — this also
+   needs `TravelAgentRuntimeStack`/`TravelAgentMemoryStack` already
+   deployed (their outputs are consumed via CDK cross-stack references).
+5. After the first deploy, take the `AlbDnsName` output and add
+   `https://<that-dns-name>/oauth2/idpresponse` as an allowed redirect URI
+   on the Okta app from step 1, then redeploy if the app's redirect URI
+   list required an update to take effect.
+6. Point real DNS at the ALB's DNS name if a friendlier URL than the raw
+   ALB hostname is wanted — explicitly out of scope for this stack
+   (DESIGN.md decision #40).
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend
-- A hosted/multi-user web UI deployment (still local-only per user — see
-  DESIGN.md decision #30, unchanged by Phase 8's JWT auth work)
 - Automated integration tests
 - Billing budgets/alarms
+- A CI/CD pipeline for `TravelAgentWebStack` (DESIGN.md decision #44 —
+  plain manual `cdk deploy`, matching every other stack)

@@ -4,4 +4,3 @@ mcp==1.29.0
 mcp-proxy-for-aws==1.6.4
 boto3==1.43.73
 aws-opentelemetry-distro==0.18.0
-PyJWT==2.13.0

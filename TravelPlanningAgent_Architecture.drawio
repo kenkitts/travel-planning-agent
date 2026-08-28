@@ -1,0 +1,216 @@
+<mxfile host="Electron">
+  <diagram name="Architecture" id="0">
+    <mxGraphModel dx="694" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <object label="Amazon Location Service&#xa;(maps / places / geocoding)" stencilType="generic-component" id="location_service">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="90" width="110" x="1440" y="360" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-location_service" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="location_service" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/84a80b5f-5642-4a17-9585-ebfdb65f4bec" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Web Search&#xa;(managed connector target)" stencilType="internet" id="web_search_target">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="90" width="120" x="1090" y="60" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-web_search_target" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="web_search_target" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/84a80b5f-5642-4a17-9585-ebfdb65f4bec" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="AgentCore Gateway&#xa;(MCP, IAM auth)" stencilType="api_gateway" id="agentcore_gateway">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#A166FF;gradientDirection=north;fillColor=#4D27A8;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.api_gateway;" vertex="241">
+            <mxGeometry height="50" width="50" x="880" y="220" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-agentcore_gateway" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="agentcore_gateway" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/d63f502f-325b-4bfa-86fe-56e4d2afcb99" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="AgentCore Memory&#xa;(short-term + long-term)" stencilType="memorydb" id="agentcore_memory">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#4D72F3;gradientDirection=north;fillColor=#3334B9;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.memorydb;" vertex="241">
+            <mxGeometry height="50" width="50" x="760" y="420" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-agentcore_memory" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="agentcore_memory" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/a6899916-74ed-4474-8c20-aa64df95139e" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Lambda: Places Tool&#xa;(Location Service wrapper)" stencilType="lambda" id="places_lambda">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.lambda;" vertex="241">
+            <mxGeometry height="50" width="50" x="1275" y="380" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-places_lambda" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="places_lambda" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/e6211311-da32-4e88-ab21-00d1660b26e0" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Amazon Bedrock&#xa;(Claude Sonnet)" stencilType="bedrock" id="bedrock_model">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#56C0A7;gradientDirection=north;fillColor=#01A88D;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.bedrock;" vertex="241">
+            <mxGeometry height="50" width="50" x="710" y="40" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-bedrock_model" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="bedrock_model" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/6e3d902f-4be1-4efc-a8bb-75bbc8b2455c" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Local Web UI (web/server.py)" stencilType="server" id="web_ui">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="80" width="110" x="280" y="300" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-web_ui" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="web_ui" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/84a80b5f-5642-4a17-9585-ebfdb65f4bec" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="AgentCore Runtime&#xa;(hosts Strands Agent)" stencilType="bedrock_agent" id="agentcore_runtime">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#56C0A7;gradientDirection=north;fillColor=#01A88D;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.bedrock_agent;" vertex="241">
+            <mxGeometry height="50" width="50" x="570" y="220" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-agentcore_runtime" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="agentcore_runtime" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/37599f00-fe94-4b18-b3b0-1c85e295872c" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Lambda: Weather Tool&#xa;(calls Open-Meteo API)" stencilType="lambda" id="weather_lambda">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;fontStyle=0;shape=mxgraph.aws20.resourceIcon;resIcon=mxgraph.aws20.lambda;" vertex="241">
+            <mxGeometry height="50" width="50" x="1275" y="40" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-weather_lambda" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="weather_lambda" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/e6211311-da32-4e88-ab21-00d1660b26e0" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="AgentCore Console Test Chat" stencilType="browser" id="console_client">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="80" width="120" x="280" y="205" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-console_client" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="console_client" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/84a80b5f-5642-4a17-9585-ebfdb65f4bec" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="Open-Meteo API&#xa;(external, no key)" stencilType="external-system" id="open_meteo">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="80" width="100" x="1460" y="25" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-open_meteo" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="open_meteo" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/84a80b5f-5642-4a17-9585-ebfdb65f4bec" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="CLI REPL (cli/chat.py)" stencilType="client" id="cli_client">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="80" width="110" x="280" y="110" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-cli_client" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="cli_client" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/e6d043be-f5dc-4b2c-8b88-c26c76f8c759" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <object label="User" stencilType="actor" id="user_actor">
+          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="241">
+            <mxGeometry height="50" width="50" x="20" y="220" as="geometry" />
+            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-user_actor" serialization-version="v0" as="resourceDescriptor">
+              <SemanticDataContainer serialization-version="v0">
+                <StringLiteral content="user_actor" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/system-modeling/a8c50ddd-aa98-48ce-a1ac-5a95ff514e73" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
+                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
+              </SemanticDataContainer>
+            </ResourceDescriptor>
+          </mxCell>
+        </object>
+        <mxCell id="edge_console_client_agentcore_runtime_1787445145876" edge="1" parent="1" source="console_client" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_runtime" value="IAM-authenticated invoke">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_weather_lambda_open_meteo_1787445146598" edge="1" parent="1" source="weather_lambda" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="open_meteo" value="HTTPS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_user_actor_cli_client_1787445151015" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.15;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="cli_client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_user_actor_web_ui_1787445154301" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.85;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="web_ui">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_user_actor_console_client_1787445157283" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="console_client">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_cli_client_agentcore_runtime_1787445161049" edge="1" parent="1" source="cli_client" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_runtime" value="IAM-authenticated invoke">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_web_ui_agentcore_runtime_1787445164661" edge="1" parent="1" source="web_ui" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_runtime" value="IAM-authenticated invoke">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_agentcore_runtime_bedrock_model_1787445168051" edge="1" parent="1" source="agentcore_runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="bedrock_model" value="inference calls">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="670" y="235" />
+              <mxPoint x="670" y="65" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_agentcore_runtime_agentcore_memory_1787445171601" edge="1" parent="1" source="agentcore_runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=none;startFill=0;endArrow=classic;endFill=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;exitX=1;exitY=0.75;exitDx=0;exitDy=0;exitPerimeter=0;" target="agentcore_memory" value="read/write session + preferences">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="530" y="235" as="sourcePoint" />
+            <mxPoint x="680" y="445" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_agentcore_runtime_agentcore_gateway_1787445175292" edge="1" parent="1" source="agentcore_runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_gateway" value="MCP tool calls">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_agentcore_gateway_web_search_target_1787445178610" edge="1" parent="1" source="agentcore_gateway" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="web_search_target">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_agentcore_gateway_weather_lambda_1787445181738" edge="1" parent="1" source="agentcore_gateway" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="weather_lambda">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_agentcore_gateway_places_lambda_1787445185015" edge="1" parent="1" source="agentcore_gateway" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="places_lambda">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_places_lambda_location_service_1787445188501" edge="1" parent="1" source="places_lambda" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="location_service" value="IAM">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

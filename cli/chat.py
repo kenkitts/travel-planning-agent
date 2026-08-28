@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
 """Local CLI REPL client for the Travel Planning Agent.
 
-Invokes the deployed AgentCore Runtime agent over HTTPS with an Okta-issued
-JWT bearer token (DESIGN.md decisions #26-35), maintaining a single runtime
-session ID across turns so the agent's short-term memory and conversation
-context carry over within one CLI session.
+Invokes the deployed AgentCore Runtime agent over IAM/SigV4
+(`boto3.invoke_agent_runtime`, DESIGN.md decision #37), maintaining a
+single runtime session ID across turns so the agent's short-term memory
+and conversation context carry over within one CLI session.
 
-Session-ID construction, Okta token acquisition, and the actual Runtime
-invocation call live in `agent_client.py`, shared with `web/server.py`. The
-Runtime always streams its response (agent/agent.py's entrypoint is a
-streaming async generator); this CLI has no diagnostic UI, so
-`_consume_stream()` drains the event stream internally and prints only the
-final reply, preserving the CLI's original one-line "agent> <response>" UX.
+Session-ID construction and the actual Runtime invocation call live in
+`agent_client.py`, shared with `web/server.py`. The Runtime always streams
+its response (agent/agent.py's entrypoint is a streaming async
+generator); this CLI has no diagnostic UI, so `_consume_stream()` drains
+the event stream internally and prints only the final reply, preserving
+the CLI's original one-line "agent> <response>" UX.
 
 Usage:
-    python chat.py --agent-runtime-arn <arn> [--region <region>]
+    python chat.py --agent-runtime-arn <arn> --actor-id <id> [--region <region>]
 
-Auth: Okta login via the okta-claude-code-token-helper script (run once
-manually the first time — see that script's README — so a browser login
-can complete before this CLI's own non-interactive re-invocations of it).
-There is no --actor-id flag: long-term memory is scoped server-side to
-whichever Okta identity's token is presented, derived from the JWT's `sub`
-claim (DESIGN.md decision #31) — not a client-supplied value.
+Auth: your local AWS credentials (the default boto3 credential chain —
+e.g. `aws sso login` or an equivalent credential process), same as every
+other AWS CLI/SDK call in this project. `--actor-id` scopes long-term
+memory to whichever value you supply — pick something stable per person
+(e.g. your own name or username) if multiple people share this CLI.
 """
 import argparse
 import sys
 from typing import Optional
 
-from agent_client import build_runtime_session_id, get_okta_access_token, stream_agent_events
-
-# Session IDs are still formatted as "<placeholder>___<uuid>" for
-# compatibility with the existing convention (see
-# agent_client.build_runtime_session_id's docstring) — this placeholder is
-# purely cosmetic now; the Runtime derives the real actor_id from the JWT.
-_SESSION_ID_PLACEHOLDER = "cli-user"
+from agent_client import build_runtime_session_id, stream_agent_events
 
 
-def _consume_stream(access_token, agent_runtime_arn, region, runtime_session_id, user_input, qualifier):
+def _consume_stream(agent_runtime_arn, region, runtime_session_id, user_input, actor_id, qualifier):
     """Drain one turn's event stream and return the final reply text.
 
     Only the web UI needs live/diagnostic streaming (reasoning, tool_use,
@@ -48,7 +41,7 @@ def _consume_stream(access_token, agent_runtime_arn, region, runtime_session_id,
     """
     text_parts: list[str] = []
     for event in stream_agent_events(
-        access_token, agent_runtime_arn, region, runtime_session_id, user_input, qualifier
+        agent_runtime_arn, region, runtime_session_id, user_input, actor_id, qualifier
     ):
         event_type = event.get("type")
         if event_type == "text":
@@ -72,13 +65,15 @@ def _consume_stream(access_token, agent_runtime_arn, region, runtime_session_id,
 def run_repl(
     agent_runtime_arn: str,
     region: str,
+    actor_id: str,
     qualifier: Optional[str] = None,
 ) -> None:
     """Run the interactive chat loop until the user exits."""
-    runtime_session_id = build_runtime_session_id(_SESSION_ID_PLACEHOLDER)
+    runtime_session_id = build_runtime_session_id()
 
     print("Travel Planning Agent — CLI chat")
     print(f"Session: {runtime_session_id}")
+    print(f"Actor: {actor_id}")
     print("Type your message and press Enter. Type 'exit' or 'quit' to leave.\n")
 
     while True:
@@ -95,9 +90,8 @@ def run_repl(
             return
 
         try:
-            access_token = get_okta_access_token()
             response_text = _consume_stream(
-                access_token, agent_runtime_arn, region, runtime_session_id, user_input, qualifier
+                agent_runtime_arn, region, runtime_session_id, user_input, actor_id, qualifier
             )
         except RuntimeError as e:
             print(f"[error] {e}\n")
@@ -116,6 +110,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Full ARN of the deployed AgentCore Runtime agent "
         "(see the TravelAgentRuntimeStack CloudFormation outputs).",
+    )
+    parser.add_argument(
+        "--actor-id",
+        required=True,
+        help="Identifier scoping this session's long-term AgentCore Memory "
+        "(preferences, cross-session recall). Pick something stable per "
+        "person if multiple people share this CLI.",
     )
     parser.add_argument(
         "--region",
@@ -138,6 +139,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     run_repl(
         agent_runtime_arn=args.agent_runtime_arn,
         region=args.region,
+        actor_id=args.actor_id,
         qualifier=args.qualifier,
     )
     return 0

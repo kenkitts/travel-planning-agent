@@ -9,20 +9,21 @@ Stack wiring:
                   independent of the other two stacks
   RuntimeStack -> hosts the Strands agent on AgentCore Runtime, depends on
                   both GatewayStack (for the Gateway URL) and MemoryStack
-                  (for the Memory ID). Its Okta JWT authorizer config
-                  (DESIGN.md decisions #26-35) comes from OKTA_ISSUER and
-                  OKTA_AUDIENCE environment variables — the same .env this
-                  project's own cli/agent_client.py reads (see
-                  .env.template) — rather than being hardcoded here, so the
-                  same repo works against any Okta org/app without a code
-                  change. OKTA_AUDIENCE (not OKTA_CLIENT_ID) is what the
-                  Runtime authorizer actually validates against — see
-                  runtime_stack.py's authorizer_configuration comment for
-                  why allowedAudience is used instead of allowedClients for
-                  Okta-issued tokens.
+                  (for the Memory ID). Uses IAM/SigV4 auth (DESIGN.md
+                  decision #37) — no Okta configuration needed here
+                  anymore.
+  WebStack     -> hosts the web UI on ECS Fargate behind an OIDC-
+                  authenticated ALB (DESIGN.md decision #37, PLAN.md
+                  Phase 10), depends on RuntimeStack (for the Runtime ARN)
+                  and MemoryStack (for the Memory ID). Its own OIDC/ALB
+                  configuration comes from WEB_* environment variables
+                  (see .env.template), loaded from a .env file at the repo
+                  root by _load_dotenv() below — the ALB's OIDC login is a
+                  separate Okta app/config from anything the CLI uses,
+                  since the CLI has no ALB in front of it (and no longer
+                  uses Okta at all after decision #37's IAM reversion).
 """
 import os
-import sys
 from pathlib import Path
 
 import aws_cdk as cdk
@@ -31,26 +32,42 @@ from stacks.gateway_stack import GatewayStack
 from stacks.memory_stack import MemoryStack
 from stacks.runtime_stack import RuntimeStack
 from stacks.tools_stack import ToolsStack
+from stacks.web_stack import WebStack
 
-# Reuse cli/agent_client.py's tiny .env loader instead of duplicating it,
-# so `cdk deploy` picks up the same OKTA_ISSUER/OKTA_CLIENT_ID as the CLI/
-# web UI clients from one shared .env at the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cli"))
-from agent_client import load_dotenv  # noqa: E402
 
-load_dotenv()
+def _load_dotenv(path: Path = None) -> None:
+    """Load simple KEY=VALUE lines from a .env file into os.environ.
+
+    Small standalone copy of the loader `cli/agent_client.py` used to
+    carry (removed from there along with the rest of its Okta-specific
+    plumbing per DESIGN.md decision #37 — the CLI no longer needs any
+    `.env` config at all). Only `TravelAgentWebStack`'s config
+    (`WEB_CERTIFICATE_ARN`/`WEB_OIDC_*`) still needs a `.env` file, so this
+    lives directly in the CDK app rather than as a dependency of an
+    unrelated module. Real environment variables already set are never
+    overwritten.
+    """
+    dotenv_path = path or Path(__file__).resolve().parent.parent / ".env"
+    if not dotenv_path.is_file():
+        return
+    for line in dotenv_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 app = cdk.App()
 
 env = cdk.Environment(region="us-east-1")
-
-okta_issuer = os.environ.get("OKTA_ISSUER")
-okta_audience = os.environ.get("OKTA_AUDIENCE")
-if not okta_issuer or not okta_audience:
-    raise RuntimeError(
-        "OKTA_ISSUER and OKTA_AUDIENCE must be set (see .env.template) to deploy "
-        "TravelAgentRuntimeStack's JWT authorizer configuration."
-    )
 
 tools_stack = ToolsStack(app, "TravelAgentToolsStack", env=env)
 
@@ -71,13 +88,52 @@ runtime_stack = RuntimeStack(
     env=env,
     gateway=gateway_stack.gateway,
     memory=memory_stack.memory,
-    okta_issuer=okta_issuer,
-    okta_audience=okta_audience,
 )
 runtime_stack.add_dependency(gateway_stack)
 runtime_stack.add_dependency(memory_stack)
 
-# Applied to every taggable resource across all four stacks.
+# WebStack is optional: it needs a real ACM certificate and a real Okta
+# OIDC app registered for the ALB (DESIGN.md decision #37, PLAN.md
+# Phase 10 — neither of which this CDK app can create itself), so it's
+# only constructed if that configuration is actually present. Running
+# `cdk deploy --all` (or synth) without WEB_CERTIFICATE_ARN set still
+# deploys/synths the other four stacks normally.
+web_certificate_arn = os.environ.get("WEB_CERTIFICATE_ARN")
+if web_certificate_arn:
+    required_web_vars = {
+        "WEB_OIDC_ISSUER": os.environ.get("WEB_OIDC_ISSUER"),
+        "WEB_OIDC_AUTHORIZATION_ENDPOINT": os.environ.get("WEB_OIDC_AUTHORIZATION_ENDPOINT"),
+        "WEB_OIDC_TOKEN_ENDPOINT": os.environ.get("WEB_OIDC_TOKEN_ENDPOINT"),
+        "WEB_OIDC_USER_INFO_ENDPOINT": os.environ.get("WEB_OIDC_USER_INFO_ENDPOINT"),
+        "WEB_OIDC_CLIENT_ID": os.environ.get("WEB_OIDC_CLIENT_ID"),
+        "WEB_OIDC_CLIENT_SECRET": os.environ.get("WEB_OIDC_CLIENT_SECRET"),
+    }
+    missing = [name for name, value in required_web_vars.items() if not value]
+    if missing:
+        raise RuntimeError(
+            f"WEB_CERTIFICATE_ARN is set, but missing: {', '.join(missing)} "
+            "(see .env.template) — all WEB_* vars are required together to "
+            "deploy TravelAgentWebStack."
+        )
+
+    web_stack = WebStack(
+        app,
+        "TravelAgentWebStack",
+        env=env,
+        runtime=runtime_stack.runtime,
+        memory=memory_stack.memory,
+        certificate_arn=web_certificate_arn,
+        oidc_issuer=required_web_vars["WEB_OIDC_ISSUER"],
+        oidc_authorization_endpoint=required_web_vars["WEB_OIDC_AUTHORIZATION_ENDPOINT"],
+        oidc_token_endpoint=required_web_vars["WEB_OIDC_TOKEN_ENDPOINT"],
+        oidc_user_info_endpoint=required_web_vars["WEB_OIDC_USER_INFO_ENDPOINT"],
+        oidc_client_id=required_web_vars["WEB_OIDC_CLIENT_ID"],
+        oidc_client_secret=required_web_vars["WEB_OIDC_CLIENT_SECRET"],
+    )
+    web_stack.add_dependency(runtime_stack)
+    web_stack.add_dependency(memory_stack)
+
+# Applied to every taggable resource across all deployed stacks.
 cdk.Tags.of(app).add("auto-delete", "no")
 cdk.Tags.of(app).add("project", "travel-planning-agent")
 

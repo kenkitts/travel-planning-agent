@@ -1,7 +1,7 @@
 """Unit tests for cli/chat.py's _consume_stream() helper.
 
 Mocks agent_client.stream_agent_events() (imported into chat's namespace)
-so no real AWS/Okta calls or network access are needed.
+so no real AWS calls or network access are needed.
 """
 import sys
 import unittest
@@ -20,7 +20,7 @@ class ConsumeStreamTests(unittest.TestCase):
             [{"type": "text", "data": "Here's "}, {"type": "text", "data": "your plan."}]
         )
 
-        result = chat._consume_stream("tok", "arn:...", "us-east-1", "session-id", "hi", None)
+        result = chat._consume_stream("arn:...", "us-east-1", "session-id", "hi", "ken", None)
 
         self.assertEqual(result, "Here's your plan.")
 
@@ -33,7 +33,7 @@ class ConsumeStreamTests(unittest.TestCase):
             ]
         )
 
-        result = chat._consume_stream("tok", "arn:...", "us-east-1", "session-id", "hi", None)
+        result = chat._consume_stream("arn:...", "us-east-1", "session-id", "hi", "ken", None)
 
         self.assertEqual(result, "Here's your complete plan.")
 
@@ -52,7 +52,7 @@ class ConsumeStreamTests(unittest.TestCase):
             ]
         )
 
-        result = chat._consume_stream("tok", "arn:...", "us-east-1", "session-id", "hi", None)
+        result = chat._consume_stream("arn:...", "us-east-1", "session-id", "hi", "ken", None)
 
         self.assertIn("Here's your partial itinerary...", result)
         self.assertIn("cut off", result)
@@ -63,7 +63,7 @@ class ConsumeStreamTests(unittest.TestCase):
             [{"type": "error", "data": "'prompt' is required"}]
         )
 
-        result = chat._consume_stream("tok", "arn:...", "us-east-1", "session-id", "", None)
+        result = chat._consume_stream("arn:...", "us-east-1", "session-id", "", "ken", None)
 
         self.assertEqual(result, "'prompt' is required")
 
@@ -79,9 +79,20 @@ class ConsumeStreamTests(unittest.TestCase):
             ]
         )
 
-        result = chat._consume_stream("tok", "arn:...", "us-east-1", "session-id", "weather?", None)
+        result = chat._consume_stream(
+            "arn:...", "us-east-1", "session-id", "weather?", "ken", None
+        )
 
         self.assertEqual(result, "It'll be warm.")
+
+    @patch("chat.stream_agent_events")
+    def test_passes_actor_id_through_to_stream_agent_events(self, mock_stream):
+        mock_stream.return_value = iter([{"type": "done", "data": "ok"}])
+
+        chat._consume_stream("arn:...", "us-east-1", "session-id", "hi", "ken", None)
+
+        call_args = mock_stream.call_args.args
+        self.assertIn("ken", call_args)
 
 
 if __name__ == "__main__":

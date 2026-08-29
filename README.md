@@ -6,15 +6,17 @@ grounded in live web search, weather forecasts, and points-of-interest
 lookups. It does not book anything — see `DESIGN.md` for the full set of
 design decisions and rationale, and `PLAN.md` for the phased build plan.
 
+The hosted web UI (below) is the only supported way to use this agent —
+there is no CLI or other standalone client.
+
 ## Architecture
 
 ```
-CLI (cli/chat.py) ──────────────┐
-                                 │  IAM/SigV4 InvokeAgentRuntime
-Web UI (web/server.py), hosted ─┘  (via cli/agent_client.py, shared by both clients)
-on ECS Fargate behind an OIDC-       actor_id passed explicitly in the payload
-authenticated ALB
-   │
+Web UI (web/server.py), hosted on ECS Fargate behind a plain ALB —
+the server itself runs the OIDC login flow against Okta and issues
+its own KMS-encrypted session cookie
+   │  IAM/SigV4 InvokeAgentRuntime (via web/agent_client.py)
+   │  actor_id passed explicitly in the payload
    ▼
 AgentCore Runtime (IAM auth)  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
    │                                   │
@@ -34,10 +36,10 @@ Five CDK stacks (deployed in this order):
 - `TravelAgentGatewayStack` — the AgentCore Gateway and its three targets
 - `TravelAgentMemoryStack` — the AgentCore Memory resource
 - `TravelAgentRuntimeStack` — the AgentCore Runtime hosting the agent
-- `TravelAgentWebStack` *(optional)* — hosts the web UI on ECS Fargate
-  behind an OIDC-authenticated ALB, for a shared/always-on deployment
-  instead of running `web/server.py` on your own machine. See "Hosting
-  the Web UI" below.
+- `TravelAgentWebStack` — hosts the web UI on ECS Fargate behind a plain
+  ALB (TLS termination/routing only — no auth logic of its own; see
+  "Authentication" below). Required — this is the only supported way to
+  use the agent. See "Hosting the Web UI" below.
 
 ## Repo layout
 
@@ -49,8 +51,8 @@ travel-planning-agent/
 ├── cdk/                   # CDK app (Python) — 5 stacks, see cdk/stacks/
 ├── lambdas/                # weather + places tool Lambdas, with tests
 ├── tests/                  # unit tests for the Lambda handlers + agent helpers
-├── cli/                    # local REPL client (chat.py) + shared agent_client.py
-└── web/                    # web UI (server.py + static/ + Dockerfile), see below
+└── web/                    # the only client: server.py + agent_client.py +
+                             # static/ + Dockerfile, see below
 ```
 
 ## Prerequisites
@@ -63,28 +65,32 @@ travel-planning-agent/
     console under **Model access**)
   - CDK bootstrapped in the target region (`cdk bootstrap`)
 - AWS credentials for that account active in your shell (e.g. via `aws sso
-  login` or an equivalent credential process) — used both for `cdk deploy`
-  itself and, at runtime, for every InvokeAgentRuntime call the CLI or web
-  UI makes (see "Authentication" below).
+  login` or an equivalent credential process) — used for `cdk deploy`
+  itself; at runtime, the deployed ECS task uses its own IAM role instead
+  (see "Authentication" below).
 
 ## Authentication
 
-The CLI and web UI both authenticate to the deployed Runtime with plain
-AWS IAM credentials (SigV4-signed `InvokeAgentRuntime` calls via boto3) —
-there is no separate identity provider or bearer-token flow for the
-Runtime itself. Long-term AgentCore Memory (preferences, conversation
-history) is scoped by an explicit `actor_id` that the caller supplies:
+The web UI has no auth of its own and cannot run standalone —
+`web/server.py` runs the entire OAuth 2.0 Authorization Code + PKCE flow
+against a dedicated Okta application itself, storing the resulting tokens
+in a single, KMS-envelope-encrypted session cookie. An unauthenticated
+top-level page load is redirected straight to Okta; an unauthenticated
+`fetch()`/API call gets a clean `401`. If your access token expires, the
+server transparently refreshes it (using the stored refresh token)
+in-line with the next request — no login interruption unless the refresh
+token itself has also expired, in which case you're sent back through the
+Okta login. `actor_id` (scoping long-term AgentCore Memory — preferences,
+conversation history) is derived automatically from each logged-in
+person's verified Okta identity (`sub` claim). There is no supported way
+to run `web/server.py` directly on your own machine as a standalone
+single-user tool without its own real Okta app configuration — see
+"Hosting the Web UI" below.
 
-- **CLI**: pass `--actor-id <your-id>` — any stable string you choose
-  (e.g. your name or username). If multiple people share the CLI, each
-  should use a different value.
-- **Web UI**: if you're running `web/server.py` directly on your own
-  machine (see "Web UI" below), there's no login of its own either — it's
-  a single-user local tool, same as the CLI. If it's deployed via
-  `TravelAgentWebStack` (see "Hosting the Web UI" below), the ALB in
-  front of it handles real per-user login via OIDC, and `actor_id` is
-  derived automatically from each logged-in person's verified identity —
-  no flag needed in that case.
+The Runtime itself is IAM/SigV4-authenticated (`InvokeAgentRuntime`, via
+boto3) — there is no separate identity provider or bearer-token flow for
+the Runtime. `TravelAgentWebStack`'s ECS task calls it with its own IAM
+role; there is no other caller.
 
 ## Setup
 
@@ -115,7 +121,8 @@ two the first time.
 
 `TravelAgentWebStack` is deployed only if `WEB_CERTIFICATE_ARN` (and the
 other `WEB_*` variables) are set — see "Hosting the Web UI" below. Without
-them, `cdk deploy --all`/`cdk synth --all` simply skip it.
+them, `cdk deploy --all`/`cdk synth --all` simply skip it, but the agent
+is not usable at all until it's deployed (there is no other client).
 
 To update just the agent after a code change:
 
@@ -134,48 +141,35 @@ Memory, Runtime, and — if deployed — the VPC/ALB/ECS resources from
 `TravelAgentWebStack`). It does **not** delete the CDK bootstrap stack
 (`CDKToolkit`) or its S3 asset bucket.
 
-## Usage
-
-Get the deployed Runtime's ARN from the `TravelAgentRuntimeStack` stack
-(e.g. via `aws bedrock-agentcore-control list-agent-runtimes` or the
-CloudFormation console), then start a chat session:
-
-```bash
-pip install -r cli/requirements.txt
-python cli/chat.py --agent-runtime-arn <runtime-arn> --actor-id <your-id>
-```
-
-Type messages at the `you>` prompt; type `exit` or `quit` to leave. The CLI
-keeps one runtime session ID for the whole conversation, so the agent's
-short-term memory carries across turns. Long-term preferences (e.g. "I
-always prefer walking tours") persist across separate CLI runs that use
-the same `--actor-id`.
-
-You can also test directly from the **AgentCore console's test chat** for
-the deployed Runtime.
-
 ## Web UI
 
-A single-user web chat UI is available as an alternative to the CLI, and
-can be run either locally on your own machine or hosted on AWS (see
-"Hosting the Web UI" below) for a shared, always-on deployment.
+The hosted web UI is the only supported way to use this agent. There is
+no supported way to use it without AWS infrastructure — see "Hosting the
+Web UI" below to deploy `TravelAgentWebStack`, which is required before
+this UI is usable at all.
 
-To run it locally:
+`web/server.py` requires a real, dedicated Okta app registration (see
+"Hosting the Web UI" below) and rejects every `/api/chat` and
+`/api/conversations*` request with a `401` (or, for a top-level page
+load, redirects it straight to Okta) unless it carries a valid, KMS-
+decryptable session cookie the server itself issued after a real Okta
+login (see "Authentication" above) — running it "locally" without a real
+Okta app and a KMS key it has access to is not a usable end-user mode, so
+this is primarily a development/testing aid for the hosted deployment
+itself rather than a way to use the chat UI without AWS infrastructure.
+
+To run it against a real deployment's configuration (see "Hosting the
+Web UI" below for how to obtain each value):
 
 ```bash
 pip install -r web/requirements.txt
-python web/server.py --agent-runtime-arn <runtime-arn> --alb-arn <alb-arn> \
-    --memory-id <memory-id> --host 127.0.0.1
+python web/server.py --agent-runtime-arn <runtime-arn> --memory-id <memory-id> \
+    --oidc-issuer <issuer> \
+    --oidc-authorization-endpoint <url> --oidc-token-endpoint <url> \
+    --oidc-client-id <id> --oidc-client-secret-arn <secrets-manager-arn> \
+    --oidc-redirect-uri <url> --session-cookie-kms-key-id <key-id> \
+    --host 127.0.0.1
 ```
-
-`--alb-arn` is only meaningful for the hosted deployment (it's used to
-verify the ALB's signed OIDC claims header — see "Hosting the Web UI"
-below); running locally without an ALB in front of it means every request
-will fail actor identification, so local, non-hosted use of `web/server.py`
-is now primarily a development/testing aid for the hosted deployment
-rather than a supported end-user mode on its own. If you want a
-single-user local tool without standing up any AWS infrastructure, the
-CLI (above) is the better fit.
 
 Then open `http://127.0.0.1:8420` in a browser. Your conversation's
 runtime session ID is stored in the browser's `localStorage`, so reloading
@@ -205,9 +199,7 @@ permission on the relevant Runtime/Memory resources.
 Scope/non-goals for the web UI:
 - Live token-by-token streaming, with an optional diagnostic panel (off by
   default) showing every event the agent emits — reasoning, tool calls,
-  full raw tool results, and the final answer — in a collapsible view. The
-  CLI does not stream visibly; it consumes the same event stream
-  internally and prints the final reply, matching its original UX.
+  full raw tool results, and the final answer — in a collapsible view.
 - No structured itinerary rendering — agent responses are rendered as
   plain markdown (headings, bold/italic, lists) in the chat bubble.
 - Conversation history is scoped per `actor_id` — no search or history
@@ -215,41 +207,55 @@ Scope/non-goals for the web UI:
   permanent (there is no undo, and no confirmation beyond the browser's
   own confirm prompt).
 
+You can also test the deployed Runtime directly from the **AgentCore
+console's test chat**, bypassing the web UI (and its OIDC-derived
+`actor_id`) entirely — useful for a quick sanity check that the Runtime
+itself is healthy.
+
 ## Hosting the Web UI
 
-`TravelAgentWebStack` deploys the web UI on ECS Fargate behind an
-internet-facing, OIDC-authenticated Application Load Balancer, for a
-shared, always-on instance instead of everyone running `web/server.py`
-locally. See `DESIGN.md` decision #37 and `PLAN.md` Phase 10 for the full
+`TravelAgentWebStack` deploys the web UI on ECS Fargate behind a plain,
+internet-facing Application Load Balancer, for a shared, always-on
+instance instead of everyone running `web/server.py` locally. See
+`DESIGN.md` §2e (decisions #50-60) and `PLAN.md` Phase 12 for the full
 design rationale.
 
-How it authenticates users: the ALB's `authenticate-oidc` listener rule
-handles the entire login flow against Okta before a request ever reaches
-the container — there is no login page inside the app itself. The ALB
-forwards each authenticated user's verified identity as a signed
-`x-amzn-oidc-data` header; the container verifies that signature itself
-(ES256, against ALB's own public-keys endpoint) before trusting it, and
-derives that person's `actor_id` from it — so every logged-in person gets
-their own conversation history and long-term memory, without needing a
-`--actor-id` flag.
+How it authenticates users: `web/server.py` itself runs the entire OAuth
+2.0 Authorization Code + PKCE flow against a dedicated Okta application —
+there is no auth logic in the ALB at all. An unauthenticated top-level
+page load is redirected straight to Okta; an unauthenticated `fetch()`/API
+call gets a clean `401`. On successful login, the server issues a single,
+KMS-envelope-encrypted session cookie carrying the Okta access/refresh
+tokens, and derives that person's `actor_id` from the verified `sub`
+claim — so every logged-in person gets their own conversation history and
+long-term memory, without needing a `--actor-id` flag. If the access
+token expires while a session is active, the server transparently
+refreshes it inline using the stored refresh token — no login
+interruption unless the refresh token itself has also expired.
+
+`GET /api/whoami` returns the identity the server actually resolved for
+the calling request (`{"sub": ..., "actor_id": ...}`), behind the same
+auth as every other endpoint — useful for confirming who you're
+authenticated as without digging through logs.
 
 ### Prerequisites for hosting
 
-- **An ACM certificate**, already issued and validated in `us-east-1`, for
-  the ALB's HTTPS listener. This project does not provision or import one
-  for you.
+- **A domain you control**, already pointed (CNAME/A record) at the
+  ALB's DNS name — DNS is entirely out of scope for this stack; it does
+  not create a Route 53 record or use the ALB's raw generated DNS name
+  for anything Okta-facing. Set this as `WEB_HOSTNAME` in `.env` — it
+  must exactly match what you register as the Okta app's redirect URI
+  below, or every login attempt fails with a `redirect_uri` mismatch.
+- **An ACM certificate**, already issued and validated in `us-east-1` for
+  `WEB_HOSTNAME` above, for the ALB's HTTPS listener. This project does
+  not provision or import one for you.
 - **A dedicated Okta OIDC web application** (confidential client, with a
-  client secret) registered for the ALB — this is a *different* Okta
-  app/config than anything the CLI uses (the CLI has no ALB in front of
-  it and authenticates to AWS directly with IAM credentials instead).
-  Configure the ALB's own `https://<alb-dns-name>/oauth2/idpresponse` as
-  an allowed redirect URI once you know the ALB's DNS name (available
-  after the first deploy, from the stack's `AlbDnsName` output — you may
-  need to deploy once, update the Okta app's redirect URI, then continue).
-- **DNS is out of scope for this stack.** Point your own domain at the
-  ALB's DNS name (from the `AlbDnsName` stack output) yourself if you
-  want a friendlier URL than the raw ALB hostname — this project does not
-  create a Route 53 record for you.
+  client secret), configured for the `openid offline_access` scopes and
+  PKCE (S256). Configure the app to keep issuing the *same*, non-rotating
+  refresh token on every refresh (not Okta's rotate-on-use alternative) —
+  this project's silent-refresh logic assumes a fixed refresh token.
+  Register `https://<WEB_HOSTNAME>/oauth2/callback` as an allowed
+  redirect URI.
 
 ### Configure and deploy
 
@@ -263,13 +269,26 @@ cdk deploy TravelAgentWebStack --require-approval never
 `cdk/app.py` reads `WEB_CERTIFICATE_ARN`/`WEB_OIDC_*` from `.env` and only
 constructs `TravelAgentWebStack` if they're all present — `cdk deploy
 --all`/`cdk synth --all` work fine without this file at all if you only
-want the four base stacks.
+want the four base stacks. The stack also provisions its own KMS key (for
+session-cookie encryption) and a Secrets Manager secret (for the Okta
+client secret) — no manual setup needed for either beyond providing the
+Okta app's own client ID/secret in `.env`.
 
 The stack provisions its own dedicated VPC (2 AZs, public + private
 subnets, one NAT Gateway per AZ), an ECS cluster, a Fargate service (0.5
 vCPU / 1GB per task, autoscaling 1–3 tasks on CPU utilization), and builds
 the container image directly from `web/Dockerfile` as part of `cdk
 deploy` (no separate manual Docker build/push step).
+
+If you're deploying from an Apple Silicon (arm64) machine: the Fargate
+task definition's `runtime_platform` is set to `ARM64` (see
+`cdk/stacks/web_stack.py`) to match a native `arm64` Docker build.
+Building for Fargate's `X86_64` default from an `arm64` dev machine
+requires cross-architecture emulation, which was found in practice to
+hang indefinitely pushing the built image to ECR — building/running
+natively as `arm64` avoids that emulation path entirely. If you deploy
+from an `x86_64` machine instead, change `runtime_platform` back to
+`X86_64` in `web_stack.py`.
 
 ### Notes on this deployment
 
@@ -289,9 +308,9 @@ deploy` (no separate manual Docker build/push step).
 Unit tests cover the two Lambda tool handlers (mocked, no live network or
 AWS calls), the agent's response-extraction/session-parsing helpers, and
 the web UI's `/api/chat` and `/api/conversations` endpoints (mocked agent
-invocation, mocked AgentCore Memory client, and — for the OIDC header
-verification specifically — a real EC keypair used to sign test tokens the
-same way the ALB would):
+invocation, mocked AgentCore Memory client, and — for the OIDC login flow
+specifically — a fake KMS client backing a real AES-GCM encrypt/decrypt
+round trip, and mocked calls to Okta's token endpoint):
 
 ```bash
 python -m pytest tests/ web/tests/

@@ -1,25 +1,24 @@
 """WebStack: hosts the Travel Planning Agent's web UI on ECS Fargate,
-behind an internet-facing, OIDC-authenticated Application Load Balancer.
+behind an internet-facing Application Load Balancer.
 
 Replaces the previous "run web/server.py on your own machine" model
 (DESIGN.md decisions #19/#28/#30) for anyone who wants a shared, always-on,
-remotely-reachable instance instead of a local dev tool. See DESIGN.md
-decision #37 and PLAN.md Phase 10 for the full rationale and the auth
-model this stack depends on:
+remotely-reachable instance instead of a local dev tool. See DESIGN.md's
+Phase 1 auth rearchitecture decision (supersedes decisions #37/#38's
+ALB-OIDC framing) for the full rationale behind the auth model this stack
+now sets up:
 
-  - The ALB's `authenticate-oidc` listener rule is the entire human-facing
-    login gate — every request is authenticated against Okta before it
-    ever reaches the Fargate task. There is no login page inside the
-    container itself.
-  - The ALB forwards the verified identity to the container per-request as
-    a signed `x-amzn-oidc-data` header; `web/server.py`'s
-    `actor_id_from_oidc_header()` verifies that signature itself (ES256,
-    against ALB's own public-keys endpoint) rather than trusting it
-    blindly — see that function's docstring for why.
-  - The AgentCore Runtime's own authorizer was reverted from JWT back to
-    IAM (RuntimeStack, decision #37) — this stack's Fargate task calls
-    InvokeAgentRuntime with its own IAM role (SigV4), the same way the CLI
-    already does. The ALB is the identity boundary now, not the Runtime.
+  - The ALB is a plain TLS-terminating load balancer with no identity
+    logic of its own — it forwards every request straight to the Fargate
+    target group. There is no `authenticate-oidc` listener action.
+  - `web/server.py` runs the entire OAuth 2.0 Authorization Code + PKCE
+    flow against Okta itself (see `web/auth.py`), storing the resulting
+    tokens in a single, KMS-envelope-encrypted cookie. This keeps the
+    Fargate tasks stateless — any task can serve any request, since
+    nothing about a session lives server-side.
+  - The AgentCore Runtime's own authorizer remains IAM/SigV4 (RuntimeStack,
+    decision #37, unchanged by this phase) — this stack's Fargate task
+    still calls InvokeAgentRuntime with its own IAM role.
 
 Networking: a dedicated VPC (2 AZs, public + private-with-egress subnets,
 one NAT Gateway per AZ) — self-contained rather than depending on any
@@ -30,19 +29,27 @@ from the ALB's security group.
 
 TLS: the caller supplies an existing ACM certificate ARN (see
 `certificate_arn` below) — this stack does not provision or import a
-certificate itself, and does not configure Route 53/DNS; the ALB's own
-generated DNS name is used as-is, and pointing a real domain at it is left
-to the caller (DESIGN.md-equivalent decision, recorded in PLAN.md Phase 10).
+certificate itself, and does not configure Route 53/DNS; a real domain
+pointed at the ALB is left entirely to the caller (DESIGN.md decision
+#40). `web_hostname` (see below) must be that same domain — it is used
+to build the OIDC `redirect_uri` (DESIGN.md decision #62), so it must
+exactly match both what the caller has pointed at this ALB and what is
+registered as the redirect URI on the Okta app (decision #50). This
+stack cannot verify that DNS record exists or resolves correctly — a
+wrong or unset `web_hostname` fails at login time (a `redirect_uri`
+mismatch from Okta), not at deploy time.
 """
 from pathlib import Path
 
-from aws_cdk import CfnOutput, Duration, SecretValue, Stack
+from aws_cdk import CfnOutput, Duration, RemovalPolicy, SecretValue, Stack
 from aws_cdk import aws_bedrockagentcore as agentcore
 from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_kms as kms
+from aws_cdk import aws_secretsmanager as secretsmanager
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,7 +74,7 @@ CONTAINER_PORT = 8420
 
 
 class WebStack(Stack):
-    """ECS Fargate + OIDC ALB hosting for the web UI."""
+    """ECS Fargate + plain ALB hosting for the web UI (app-level OIDC auth)."""
 
     def __init__(
         self,
@@ -77,10 +84,10 @@ class WebStack(Stack):
         runtime: agentcore.Runtime,
         memory: agentcore.IMemory,
         certificate_arn: str,
+        web_hostname: str,
         oidc_issuer: str,
         oidc_authorization_endpoint: str,
         oidc_token_endpoint: str,
-        oidc_user_info_endpoint: str,
         oidc_client_id: str,
         oidc_client_secret: str,
         **kwargs,
@@ -123,6 +130,45 @@ class WebStack(Stack):
         )
         memory.grant_full_access(task_role)
         runtime.grant_invoke(task_role)
+
+        # Envelope-encryption key for the session cookie (web/auth.py's
+        # SessionCookieCodec) — replaces the ALB's own signing keypair now
+        # that this container runs the OIDC flow and owns the session
+        # cookie itself. A dedicated key, not shared with anything else in
+        # this project (no other stack currently uses KMS at all),
+        # matching this project's existing per-stack-owns-its-own-resources
+        # convention. Automatic annual rotation is on by default for a
+        # customer-managed key; old key material stays available for
+        # Decrypt regardless, and this cookie's own envelope design (a
+        # fresh data key per GenerateDataKey call, stored encrypted
+        # alongside the ciphertext in the cookie) makes this doubly moot —
+        # a cookie is self-contained and never depends on which specific
+        # key version encrypted its data key.
+        session_cookie_key = kms.Key(
+            self,
+            "SessionCookieKey",
+            description="Encrypts/decrypts the web UI's session cookie (envelope encryption)",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        session_cookie_key.grant_encrypt_decrypt(task_role)
+
+        # The Okta app's client secret is a real bearer credential now
+        # that this container (not the ALB) performs the token exchange —
+        # stored in Secrets Manager rather than passed as a plain
+        # environment variable, unlike the ALB's authenticate-oidc action
+        # (which held it as a listener-rule property, not visible to the
+        # container at all). SecretValue.unsafe_plain_text() here mirrors
+        # this stack's pre-existing handling of the same value (previously
+        # passed directly to authenticate_oidc's client_secret prop) — it
+        # still ultimately comes from a real secret store (.env, loaded by
+        # cdk/app.py), not a hardcoded literal.
+        oidc_client_secret_resource = secretsmanager.Secret(
+            self,
+            "OidcClientSecret",
+            secret_string_value=SecretValue.unsafe_plain_text(oidc_client_secret),
+        )
+        oidc_client_secret_resource.grant_read(task_role)
 
         task_definition = ecs.FargateTaskDefinition(
             self,
@@ -177,15 +223,19 @@ class WebStack(Stack):
             idle_timeout=ALB_IDLE_TIMEOUT,
         )
 
-        # Placeholder ARN for web/server.py's --alb-arn signature
-        # verification (actor_id_from_oidc_header() checks the JWT
-        # header's "signer" field against exactly this ARN) — passed into
-        # the container's environment below.
-        alb_arn = self.load_balancer.load_balancer_arn
+        # The OIDC redirect_uri points at web_hostname (a caller-supplied
+        # friendly domain the caller has separately pointed at this ALB —
+        # DNS is explicitly out of scope for this stack, decision #40),
+        # not the ALB's own raw DNS name. This must exactly match the
+        # redirect URI registered on the Okta app — the caller registers
+        # this domain, not the ALB's generated DNS name, since Okta must
+        # redirect the user's browser back to whatever hostname they
+        # actually logged in from.
+        redirect_uri = f"https://{web_hostname}/oauth2/callback"
 
         container_image = ecs.ContainerImage.from_asset(
-            str(REPO_ROOT),
-            file="web/Dockerfile",
+            str(REPO_ROOT / "web"),
+            file="Dockerfile",
             # Built natively for the host architecture (no explicit
             # `platform=`) — WebTaskDefinition's runtime_platform is set
             # to match (ARM64) above, so the image and the Fargate runtime
@@ -200,27 +250,11 @@ class WebStack(Stack):
             # timeout with zero progress). Matching the runtime platform
             # to the image's native build architecture instead avoids
             # emulation on either side.
-            # The Dockerfile only COPYs web/ and cli/agent_client.py, but
-            # from_asset's build context is the whole directory passed in
-            # (needed so the Dockerfile's COPY paths can reach both
-            # sibling directories at once) — exclude everything else,
-            # especially cdk.out and .venv, which are large and (for
-            # cdk.out) self-referential: without this exclude, `cdk synth`
-            # recursively copies its own previous output into the new
-            # asset staging directory, which both wastes time and can
-            # produce paths long enough to fail outright (confirmed via a
-            # real ENAMETOOLONG error during this stack's own development).
-            exclude=[
-                "cdk/cdk.out",
-                "cdk/cdk.out/**",
-                ".venv",
-                ".venv/**",
-                ".git",
-                ".git/**",
-                "**/__pycache__",
-                "**/__pycache__/**",
-                "**/*.pyc",
-            ],
+            # The build context is just web/ itself — the Dockerfile only
+            # COPYs files from this directory (the CLI removal dropped the
+            # earlier COPY of the sibling cli/agent_client.py, which is
+            # what previously forced the build context to be the whole
+            # repo root plus a long exclude list for cdk.out/.venv/.git).
         )
         task_definition.add_container(
             "WebContainer",
@@ -230,8 +264,6 @@ class WebStack(Stack):
             command=[
                 "--agent-runtime-arn",
                 runtime.agent_runtime_arn,
-                "--alb-arn",
-                alb_arn,
                 "--region",
                 self.region,
                 "--memory-id",
@@ -240,6 +272,20 @@ class WebStack(Stack):
                 "0.0.0.0",
                 "--port",
                 str(CONTAINER_PORT),
+                "--oidc-issuer",
+                oidc_issuer,
+                "--oidc-authorization-endpoint",
+                oidc_authorization_endpoint,
+                "--oidc-token-endpoint",
+                oidc_token_endpoint,
+                "--oidc-client-id",
+                oidc_client_id,
+                "--oidc-client-secret-arn",
+                oidc_client_secret_resource.secret_arn,
+                "--oidc-redirect-uri",
+                redirect_uri,
+                "--session-cookie-kms-key-id",
+                session_cookie_key.key_id,
             ],
         )
 
@@ -287,17 +333,7 @@ class WebStack(Stack):
             port=443,
             protocol=elbv2.ApplicationProtocol.HTTPS,
             certificates=[certificate],
-            default_action=elbv2.ListenerAction.authenticate_oidc(
-                authorization_endpoint=oidc_authorization_endpoint,
-                token_endpoint=oidc_token_endpoint,
-                user_info_endpoint=oidc_user_info_endpoint,
-                issuer=oidc_issuer,
-                client_id=oidc_client_id,
-                client_secret=SecretValue.unsafe_plain_text(oidc_client_secret),
-                scope="openid",
-                on_unauthenticated_request=elbv2.UnauthenticatedAction.AUTHENTICATE,
-                next=elbv2.ListenerAction.forward([target_group]),
-            ),
+            default_action=elbv2.ListenerAction.forward([target_group]),
         )
 
         scaling = fargate_service.auto_scale_task_count(
@@ -308,4 +344,4 @@ class WebStack(Stack):
         )
 
         CfnOutput(self, "AlbDnsName", value=self.load_balancer.load_balancer_dns_name)
-        CfnOutput(self, "AlbArn", value=alb_arn)
+        CfnOutput(self, "AlbArn", value=self.load_balancer.load_balancer_arn)

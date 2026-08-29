@@ -12,16 +12,16 @@ Stack wiring:
                   (for the Memory ID). Uses IAM/SigV4 auth (DESIGN.md
                   decision #37) — no Okta configuration needed here
                   anymore.
-  WebStack     -> hosts the web UI on ECS Fargate behind an OIDC-
-                  authenticated ALB (DESIGN.md decision #37, PLAN.md
-                  Phase 10), depends on RuntimeStack (for the Runtime ARN)
-                  and MemoryStack (for the Memory ID). Its own OIDC/ALB
-                  configuration comes from WEB_* environment variables
-                  (see .env.template), loaded from a .env file at the repo
-                  root by _load_dotenv() below — the ALB's OIDC login is a
-                  separate Okta app/config from anything the CLI uses,
-                  since the CLI has no ALB in front of it (and no longer
-                  uses Okta at all after decision #37's IAM reversion).
+  WebStack     -> hosts the web UI on ECS Fargate behind a plain
+                  (non-OIDC) ALB (see DESIGN.md's Phase 1 auth
+                  rearchitecture decision, superseding decision #37/#38's
+                  ALB-OIDC framing; PLAN.md Phase 10/11), depends on
+                  RuntimeStack (for the Runtime ARN) and MemoryStack (for
+                  the Memory ID). The web server itself now runs the OIDC
+                  flow against Okta directly — its Okta app configuration
+                  comes from WEB_* environment variables (see
+                  .env.template), loaded from a .env file at the repo
+                  root by _load_dotenv() below.
 """
 import os
 from pathlib import Path
@@ -38,13 +38,13 @@ from stacks.web_stack import WebStack
 def _load_dotenv(path: Path = None) -> None:
     """Load simple KEY=VALUE lines from a .env file into os.environ.
 
-    Small standalone copy of the loader `cli/agent_client.py` used to
-    carry (removed from there along with the rest of its Okta-specific
-    plumbing per DESIGN.md decision #37 — the CLI no longer needs any
-    `.env` config at all). Only `TravelAgentWebStack`'s config
-    (`WEB_CERTIFICATE_ARN`/`WEB_OIDC_*`) still needs a `.env` file, so this
-    lives directly in the CDK app rather than as a dependency of an
-    unrelated module. Real environment variables already set are never
+    Small standalone copy of a loader that once lived in the CLI's
+    `agent_client.py` (removed along with the rest of that project's
+    Okta-specific plumbing per DESIGN.md decision #37, and later removed
+    entirely along with the CLI itself). Only `TravelAgentWebStack`'s
+    config (`WEB_CERTIFICATE_ARN`/`WEB_OIDC_*`) still needs a `.env` file,
+    so this lives directly in the CDK app rather than as a dependency of
+    an unrelated module. Real environment variables already set are never
     overwritten.
     """
     dotenv_path = path or Path(__file__).resolve().parent.parent / ".env"
@@ -93,18 +93,19 @@ runtime_stack.add_dependency(gateway_stack)
 runtime_stack.add_dependency(memory_stack)
 
 # WebStack is optional: it needs a real ACM certificate and a real Okta
-# OIDC app registered for the ALB (DESIGN.md decision #37, PLAN.md
-# Phase 10 — neither of which this CDK app can create itself), so it's
-# only constructed if that configuration is actually present. Running
-# `cdk deploy --all` (or synth) without WEB_CERTIFICATE_ARN set still
-# deploys/synths the other four stacks normally.
+# OIDC app registered for this web server (DESIGN.md's Phase 1 auth
+# rearchitecture decision — neither of which this CDK app can create
+# itself), so it's only constructed if that configuration is actually
+# present. Running `cdk deploy --all` (or synth) without
+# WEB_CERTIFICATE_ARN set still deploys/synths the other four stacks
+# normally.
 web_certificate_arn = os.environ.get("WEB_CERTIFICATE_ARN")
 if web_certificate_arn:
     required_web_vars = {
+        "WEB_HOSTNAME": os.environ.get("WEB_HOSTNAME"),
         "WEB_OIDC_ISSUER": os.environ.get("WEB_OIDC_ISSUER"),
         "WEB_OIDC_AUTHORIZATION_ENDPOINT": os.environ.get("WEB_OIDC_AUTHORIZATION_ENDPOINT"),
         "WEB_OIDC_TOKEN_ENDPOINT": os.environ.get("WEB_OIDC_TOKEN_ENDPOINT"),
-        "WEB_OIDC_USER_INFO_ENDPOINT": os.environ.get("WEB_OIDC_USER_INFO_ENDPOINT"),
         "WEB_OIDC_CLIENT_ID": os.environ.get("WEB_OIDC_CLIENT_ID"),
         "WEB_OIDC_CLIENT_SECRET": os.environ.get("WEB_OIDC_CLIENT_SECRET"),
     }
@@ -123,10 +124,10 @@ if web_certificate_arn:
         runtime=runtime_stack.runtime,
         memory=memory_stack.memory,
         certificate_arn=web_certificate_arn,
+        web_hostname=required_web_vars["WEB_HOSTNAME"],
         oidc_issuer=required_web_vars["WEB_OIDC_ISSUER"],
         oidc_authorization_endpoint=required_web_vars["WEB_OIDC_AUTHORIZATION_ENDPOINT"],
         oidc_token_endpoint=required_web_vars["WEB_OIDC_TOKEN_ENDPOINT"],
-        oidc_user_info_endpoint=required_web_vars["WEB_OIDC_USER_INFO_ENDPOINT"],
         oidc_client_id=required_web_vars["WEB_OIDC_CLIENT_ID"],
         oidc_client_secret=required_web_vars["WEB_OIDC_CLIENT_SECRET"],
     )

@@ -827,6 +827,83 @@ was written.
       assumptions, CI/CD scope), each with the rationale gathered from the
       clarifying-questions pass before implementation began.
 
+## Phase 11 — CLI removal (added 2026-08-28)
+
+Requested: remove the local CLI REPL client entirely — the hosted web UI
+(Phase 10) becomes the only supported way to use the agent. See
+DESIGN.md §2d (decisions #48-49) for the full rationale.
+
+- [x] Relocated `cli/agent_client.py` → `web/agent_client.py` (pure move,
+      docstrings updated to drop CLI references) — `web/server.py`
+      depends on this module for session-ID construction and the actual
+      `InvokeAgentRuntime` call, so it could not simply be deleted with
+      the rest of `cli/`.
+- [x] `web/server.py` — import changed from a `sys.path.insert()` hack
+      reaching into a sibling `cli/` directory to a plain same-directory
+      `from agent_client import ...`; docstring/comments updated.
+- [x] `web/Dockerfile` — simplified to `COPY . .` from a `web/`-only build
+      context (previously `COPY web/ ./web/` plus a separate
+      `COPY cli/agent_client.py ./cli/agent_client.py`); `ENTRYPOINT`
+      updated from `web/server.py` to `server.py` to match.
+- [x] `cdk/stacks/web_stack.py` — `ecs.ContainerImage.from_asset()`'s
+      build context narrowed from the whole repo root to `web/` alone
+      (`str(REPO_ROOT / "web")`, `file="Dockerfile"`); the `exclude` list
+      for `cdk/cdk.out`/`.venv`/`.git` (needed only because the previous
+      repo-root build context could otherwise recursively copy `cdk.out`
+      into itself — DESIGN.md decision #41's `ENAMETOOLONG` bug) is
+      removed entirely, since `web/` never contained any of those
+      directories.
+- [x] Deleted `cli/` entirely (`chat.py`, `agent_client.py`,
+      `requirements.txt`).
+- [x] Deleted `tests/test_chat.py` outright (tested `_consume_stream()`,
+      CLI-only non-streaming-text-joining logic with no web-UI
+      equivalent — the web UI streams SSE directly to the browser and
+      never needs a joined final string). Moved `tests/test_agent_client.py`
+      to `web/tests/test_agent_client.py` unchanged in content (none of
+      its coverage was CLI-specific — it tests `build_runtime_session_id()`,
+      `build_invoke_payload()`, and `stream_agent_events()` against mocked
+      boto3 calls), only its `sys.path` setup updated for the new location.
+      `web/tests/test_server.py`'s own `sys.path` insert (previously
+      pointing at a `_CLI_DIR`) updated to point at `web/` instead.
+- [x] Fixed CLI references in code comments/docstrings across
+      `agent/agent.py` (module docstring, `SESSION_ID_SEPARATOR` comment,
+      `get_actor_id()` and `invoke()` docstrings), `cdk/stacks/runtime_stack.py`
+      (module docstring, `authorizer_configuration` inline comment — the
+      unrelated `agentcore` AWS CLI tool reference elsewhere in this file
+      was left alone, since that's a different tool), and `cdk/app.py`
+      (`WebStack` docstring, `_load_dotenv()` docstring).
+- [x] `README.md` — removed the "Usage" (CLI) section entirely; rewrote
+      "Architecture" (single Web UI path), "Repo layout" (no `cli/`
+      entry), "Authentication" (no CLI mention), and "Web UI" (no longer
+      framed as "an alternative to the CLI") to reflect the web UI as the
+      only client; fixed the "Hosting the Web UI" prerequisites section's
+      stale CLI/Okta comparison.
+- [x] `DESIGN.md` — added §2d (decisions #48-49); fixed the §3 architecture
+      diagram and its following paragraph (previously described three
+      different clients sharing `cli/agent_client.py`); fixed §5's "Out of
+      Scope" section, which — independent of this change — was already
+      stale before this session (it claimed the hosted web UI was still a
+      future fast-follow, contradicting §2b, which had already shipped
+      it); did not edit any historical decision-table row (#10, #15, #19,
+      #20, #26, #27, #29, #31, #32, #34, #35, #37, #39, #41, #42) — these
+      correctly record what was true at each point in time, per this
+      document's own established convention of superseding rather than
+      rewriting history.
+- [x] Full test suite: **135/135** passing (141 from before this change,
+      minus the 6 deleted `test_chat.py` tests — no other regressions).
+- [x] Verified via `cdk synth`: `TravelAgentWebStack` still synthesizes
+      cleanly with the narrowed Docker build context.
+- [x] Verified the new `web/Dockerfile`'s `COPY . .` layout resolves
+      correctly via a filesystem simulation (copied `web/`'s contents into
+      a simulated `/app`, confirmed `agent_client.py`/`server.py`/`static/`
+      land as siblings, and confirmed `from agent_client import
+      build_runtime_session_id, stream_agent_events` actually imports and
+      runs) — a real `docker build` could not be run in this environment
+      (Docker Desktop requires an org sign-in unavailable here), so this
+      simulation is the closest available substitute; the next real `cdk
+      deploy` will perform the actual build and surface anything this
+      simulation missed.
+
 ### Remaining manual steps (deferred to the user — this build session cannot perform them)
 1. Register a dedicated Okta OIDC web application (confidential client,
    with a client secret) for the ALB — a *different* app than any used by
@@ -845,6 +922,191 @@ was written.
 6. Point real DNS at the ALB's DNS name if a friendlier URL than the raw
    ALB hostname is wanted — explicitly out of scope for this stack
    (DESIGN.md decision #40).
+
+## Phase 12 — Auth rearchitecture Phase 1: app-level OIDC replaces the ALB (added 2026-08-28)
+
+Removes the ALB's `authenticate-oidc` listener action; `web/server.py`
+now runs the entire OAuth 2.0 Authorization Code + PKCE flow against a
+new, dedicated Okta app itself, storing the result in a single,
+KMS-envelope-encrypted session cookie. See DESIGN.md §2e (decisions
+#50-60) for the full rationale — motivated by a later, not-yet-built
+phase's need for a live, forwardable/exchangeable signed JWT to
+eventually give the AgentCore Gateway real per-user identity for its
+Policy Engine/rate-limiting features, which the ALB's fully-decoded,
+discarded `x-amzn-oidc-data` header couldn't provide.
+
+- [x] Designed and wrote `web/auth.py`: PKCE (S256, stdlib `hashlib`/
+      `base64`, no new dependency) and `state` (stdlib `secrets`)
+      generation; `build_authorization_url()`; `exchange_code_for_tokens()`
+      and `refresh_access_token()` (both call Okta's token endpoint
+      directly via `requests`); `SessionCookieCodec` (KMS
+      `GenerateDataKey`/`Decrypt` envelope encryption, AES-256-GCM for the
+      actual payload cipher via `cryptography.hazmat.primitives.ciphers.
+      aead.AESGCM`); `is_browser_navigation()` (the 401-vs-redirect split,
+      via `Sec-Fetch-Mode`/`Accept` header inspection); `get_or_refresh_session()`
+      (the synchronous refresh-on-expiry logic); `redirect_to_login()`
+      (builds the pending-login cookie + Okta redirect together).
+- [x] `cdk/stacks/web_stack.py`: removed `authenticate_oidc` listener
+      action and all `oidc_*` constructor params that only served it
+      (`oidc_authorization_endpoint`/`oidc_token_endpoint` kept — the app
+      itself needs them now — `oidc_user_info_endpoint` removed, unused
+      by the new flow); listener's `default_action` is now a plain
+      `ListenerAction.forward([target_group])`. Added a new customer-managed
+      KMS key (`SessionCookieKey`, automatic annual rotation enabled,
+      `RemovalPolicy.DESTROY`) with `grant_encrypt_decrypt()` to the task
+      role. Added a new Secrets Manager secret (`OidcClientSecret`) for
+      the Okta app's client secret, with `grant_read()` to the task role —
+      unlike the ALB's own `authenticate-oidc` client_secret prop (never
+      exposed to the container), this secret is now used directly by
+      `web/server.py` on every login/refresh. Container command args
+      updated: `--alb-arn` removed, `--oidc-issuer`/
+      `--oidc-authorization-endpoint`/`--oidc-token-endpoint`/
+      `--oidc-client-id`/`--oidc-client-secret-arn`/`--oidc-redirect-uri`/
+      `--session-cookie-kms-key-id` added. `redirect_uri` is built from
+      `self.load_balancer.load_balancer_dns_name` (a CDK token resolved at
+      deploy time), same "deploy once, register the callback URL with
+      Okta" chicken-and-egg as Phase 10's original ALB-OIDC redirect URI.
+- [x] `cdk/app.py`: `WebStack` docstring updated; `WEB_OIDC_USER_INFO_ENDPOINT`
+      removed from the required-vars list (no longer read anywhere).
+- [x] `web/server.py`: removed `actor_id_from_oidc_header()`,
+      `_verified_oidc_sub()`, `_fetch_alb_public_key()`, and the ALB
+      public-key URL template/cache — all ALB-signature-verification
+      machinery is gone. `_sanitize_actor_id()` (and its regex/default
+      constant) kept as-is, now standalone rather than only reachable
+      through the removed ALB-header path. Added `GET /oauth2/callback`
+      (validates `state`, exchanges the code, sets the session cookie,
+      redirects to the originally-requested page). Added a shared
+      `_resolve_auth()`/`_actor_id()` helper pair used by every protected
+      route (`/api/chat`, `/api/whoami`, `/api/conversations*`) — `_actor_id()`
+      also applies a refreshed cookie's `Set-Cookie` onto the response if
+      `get_or_refresh_session()` had to refresh. `/api/chat`'s
+      `StreamingResponse` explicitly copies the dependency-injected
+      `Response` object's headers onto itself, since FastAPI's automatic
+      header-merging only applies when a route returns that same object
+      directly — a `StreamingResponse` built inside the route needed this
+      spelled out explicitly, confirmed by testing (a naive first version
+      silently dropped a refreshed `Set-Cookie` on this endpoint only).
+      `/api/config` deliberately left unauthenticated (unchanged from
+      before — it's a static feature flag, not identity-scoped data).
+      `build_arg_parser()`/`main()` updated for the new CLI args;
+      `main()` fetches the Okta client secret from Secrets Manager once
+      at startup (`_fetch_secret_value()`), not per-request.
+- [x] `web/requirements.txt`: no changes — `boto3` (KMS/Secrets Manager),
+      `requests` (Okta token endpoint calls), `cryptography` (AES-GCM),
+      and `PyJWT` (decoding the access token's `sub` claim) were all
+      already present; PKCE itself needs only the standard library.
+- [x] `web/static/app.js`: removed `handleAuthExpired()`'s
+      `AUTH_RELOAD_KEY`/capped-retry reload-loop-guard machinery (no
+      longer needed — see DESIGN.md decision #56) and simplified it to a
+      one-line `window.location.reload()`, only ever called from an
+      actual, confirmed `res.status === 401` check (already present in
+      every relevant call site from before this change, but previously
+      dead code under the ALB's always-302 behavior). Every generic
+      `catch` block that previously treated *any* fetch rejection as a
+      possible auth failure now surfaces a real error message instead,
+      since a rejection reaching those blocks is now reliably a genuine
+      network/transport error, not an ambiguous CORS-blocked-redirect
+      case. `init()`'s `/api/config` fetch no longer checks for a 401 (it
+      can never return one — see server.py note above); the
+      conversation-history transcript fetch became this page's first
+      real auth check instead.
+- [x] `web/tests/test_server.py`: fully rewritten. New `FakeKmsClient`
+      (a real AES-256 data key, genuine envelope-encryption round trip,
+      just without a network call to AWS) backs a shared `_AppTestCase`
+      base class and `_authed_client()` helper that pre-loads a valid,
+      encrypted session cookie for tests that just need "a logged-in
+      user." Replaced the old `ActorIdFromOidcHeaderTests` class with
+      `SessionCookieCodecTests` (encrypt/decrypt round trip, tamper
+      rejection), `OAuthFlowTests` (401-vs-redirect split, full
+      redirect→callback→authenticated-request round trip, `state`
+      mismatch, Okta `error` param, token-exchange failure), and
+      `SessionRefreshTests` (silent refresh on an expired access token
+      with no refresh-token rotation, refresh failure surfacing as a 401,
+      no refresh attempted when the access token is still valid).
+      Every other existing test class's auth injection switched from
+      patching `actor_id_from_oidc_header` to using `_authed_client()`.
+      **Non-obvious fix required**: `TestClient` must be constructed with
+      `base_url="https://testserver"` for these tests to work at all —
+      `httpx`'s cookie jar silently drops `Secure`-flagged cookies under
+      the default plain-`http://testserver` base URL, which looks
+      identical to a genuine missing-session-cookie/401 failure and cost
+      real debugging time to isolate as a test-harness artifact rather
+      than an app bug.
+- [x] Full test suite: **142/142** passing (136 from before this change;
+      net +6 — `SessionCookieCodecTests` (3) + `OAuthFlowTests` (7) +
+      `SessionRefreshTests` (3), minus the removed `ActorIdFromOidcHeaderTests`
+      (8) covering the deleted ALB-signature-verification path).
+- [x] Verified via `cdk synth TravelAgentWebStack` (with placeholder Okta
+      config values) — synthesizes cleanly: KMS key, Secrets Manager
+      secret, plain `forward`-only ALB listener, and the new container
+      command args all present as expected in the synthesized template.
+- [x] Verified the full OIDC round trip end-to-end via a manual
+      `TestClient` script (not part of the automated suite, but run
+      directly against the real `create_app()`/`auth.py` code, with only
+      `requests.post` and the KMS client mocked): unauthenticated →
+      redirect to Okta with real `state`/`code_challenge` params →
+      simulated `/oauth2/callback` → session cookie set and decryptable →
+      authenticated request succeeds → manually expiring the cookie's
+      access-token timestamp and re-requesting triggers a real inline
+      refresh call and a rewritten `Set-Cookie`, all with the confirmed
+      no-refresh-token-rotation behavior (same refresh token used both
+      times).
+
+### Open verification item (not resolved by this build session)
+### Open verification item — RESOLVED (2026-08-29)
+`auth.py`'s `_sub_from_access_token()` decodes Okta's returned access
+token as a JWT (unverified — safe here, see DESIGN.md decision #58) to
+extract `sub`. **Confirmed against the real, registered Okta app (decision
+#50): this org's access tokens are JWT-shaped and carry a `sub` claim** —
+the assumption this decode step relies on holds. No code change needed.
+
+### Remaining manual steps (deferred to the user — this build session cannot perform them)
+1. ~~Register a new, dedicated Okta OIDC application~~ — **done**: a
+   dedicated confidential-client Okta app has been registered for this
+   web server (DESIGN.md decision #50), configured for `openid
+   offline_access` scopes and PKCE (S256).
+2. ~~Confirm this Okta app's refresh-token behavior~~ — **done**: this
+   Okta app is configured to keep issuing the same, non-rotating refresh
+   token (DESIGN.md decision #52).
+3. ~~Resolve the open verification item above~~ — **done**, see above.
+4. ~~Update `.env`'s `WEB_OIDC_*` values~~ — **done**, real values
+   confirmed present (no placeholder text remaining) before deploy.
+5. ~~`cdk deploy TravelAgentWebStack`~~ — **done**, twice: an initial
+   deploy (`UPDATE_COMPLETE`, new task healthy, old task drained,
+   confirmed via `describe-stacks`/`describe-target-health`), then a
+   second deploy after a real bug was caught via live `curl` checks
+   immediately after the first one (see DESIGN.md decision #61 — `GET /`
+   had no auth check at all) — also `UPDATE_COMPLETE`, re-verified live.
+6. ~~Register `https://<AlbDnsName output>/oauth2/callback`~~ — **superseded, see DESIGN.md decision #62**: the user's real Okta app was already
+   registered with a friendly custom domain
+   (`https://travel-agent.kenkitts.people.aws.dev/oauth2/idpresponse`),
+   not the raw ALB DNS name this session's first deploy actually used —
+   confirmed via a live `curl` against `/`'s `/authorize` redirect, which
+   would have failed every real login attempt with a `redirect_uri`
+   mismatch. Fixed by adding a new required `web_hostname` stack
+   parameter (`WEB_HOSTNAME` env var, added to `.env`/`.env.template`)
+   so `redirect_uri` is built from the caller's real domain instead of
+   `load_balancer_dns_name` — confirmed via `cdk synth` that
+   `--oidc-redirect-uri` now resolves to
+   `https://travel-agent.kenkitts.people.aws.dev/oauth2/callback`. **Still
+   required, deferred to the user**: update the Okta app's registered
+   redirect URI from `/oauth2/idpresponse` (the ALB's old native-OIDC
+   path, no longer served by anything) to `/oauth2/callback` (this
+   server's actual route) — the domain now matches, but the path does
+   not, and this codebase cannot update Okta's own app configuration
+   itself.
+
+### Live post-deploy verification (2026-08-29)
+Confirmed via direct `curl` against the real deployed ALB (not just unit
+tests) after both deploys:
+- `GET /api/config` (no session) → `200` — correctly unauthenticated.
+- `GET /` with `Sec-Fetch-Mode: navigate` and no session → `302` to Okta,
+  with real `state`/`code_challenge`/`scope=openid+offline_access`
+  params in the redirect URL — confirmed **only after the second deploy**;
+  the first deploy incorrectly returned `200` here (DESIGN.md decision #61).
+- `GET /` and `GET /api/whoami` with `Sec-Fetch-Mode: cors` and no
+  session → `401` in both cases — the fetch()-vs-navigation split (decision
+  #56) working as designed against real traffic, not just the test suite.
 
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations

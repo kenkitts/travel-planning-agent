@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """Hosted web UI backend for the Travel Planning Agent.
 
-Runs on ECS Fargate behind an internet-facing Application Load Balancer
-configured with OIDC authentication (`TravelAgentWebStack`, see
-DESIGN.md decision #37 and PLAN.md Phase 10). The ALB authenticates every
-browser session against Okta and forwards the verified identity to this
-container per-request via the signed `x-amzn-oidc-data` header — this
-server verifies that header's signature itself (see
-`actor_id_from_oidc_header()`) rather than trusting it blindly, since a
-misconfigured security group or a direct-to-target request could
-otherwise let an unauthenticated caller spoof the header.
+Runs on ECS Fargate behind a plain (non-OIDC) internet-facing Application
+Load Balancer (`TravelAgentWebStack`, see DESIGN.md's Phase 1 auth
+rearchitecture decision, superseding decisions #37/#38's ALB-OIDC
+framing; PLAN.md Phase 10/11). This process now runs the entire OAuth 2.0
+Authorization Code + PKCE flow against Okta itself (see `auth.py`) —
+there is no `x-amzn-oidc-data` header to trust; the session is instead a
+single, KMS-envelope-encrypted cookie this server issues, reads, and
+transparently refreshes.
 
 Serves a small chat UI and a streaming API that invokes the deployed
-AgentCore Runtime agent via IAM/SigV4 (`cli/agent_client.py`, shared with
-the CLI — DESIGN.md decision #37, reverting the Okta-JWT-bearer-token
-Runtime auth used before this stack existed), plus read-only endpoints
-that list and replay past conversations directly from AgentCore Memory (no
-separate local storage — Memory is the source of truth).
+AgentCore Runtime agent via IAM/SigV4 (`agent_client.py`, in this same
+directory — DESIGN.md decision #37, unchanged by this phase), plus
+read-only endpoints that list and replay past conversations directly from
+AgentCore Memory (no separate local storage — Memory is the source of
+truth).
 
 Every logged-in person gets their own `actor_id` (and therefore their own
-conversation history / long-term memory), derived per-request from the
-ALB's verified OIDC claims — not from a single server-wide identity like
-the old local-only version of this file. There is no login *page* of its
-own: the ALB's `authenticate-oidc` listener rule handles the entire login
-flow before a request ever reaches this process.
+conversation history / long-term memory), derived per-request from this
+server's own verified Okta session — not from a single server-wide
+identity like the old local-only version of this file, and not from an
+ALB-forwarded header like the version of this file that existed between
+those two.
 
 `POST /api/chat` streams the agent's response as Server-Sent Events —
 every labeled event the Runtime emits (reasoning/text/tool_use/tool_result/
@@ -38,38 +37,51 @@ Memory in one shot, not a re-simulated stream.
 
 Usage:
     python server.py --agent-runtime-arn <arn> --memory-id <id> \\
-        --alb-arn <alb-arn> [--region <region>] [--qualifier <qualifier>] \\
-        [--port <port>]
+        --oidc-issuer <issuer> \\
+        --oidc-authorization-endpoint <url> --oidc-token-endpoint <url> \\
+        --oidc-client-id <id> --oidc-client-secret-arn <secrets-manager-arn> \\
+        --oidc-redirect-uri <url> --session-cookie-kms-key-id <key-id> \\
+        [--region <region>] [--qualifier <qualifier>] [--port <port>]
 
-Auth: the ALB's OIDC listener rule gates every request before it reaches
-this process — see `actor_id_from_oidc_header()` for the signature
-verification this server performs on the forwarded claims. AWS
-credentials for Memory access and Runtime invocation come from this
+Auth: see auth.py for the full OIDC flow, session-cookie encryption, and
+refresh logic. AWS credentials for Memory access, Runtime invocation, and
+the session cookie's KMS/Secrets Manager calls all come from this
 process's own IAM role (the ECS task role in the hosted deployment; your
-local credentials if run outside ECS for testing) — a separate,
-unrelated authorization boundary from the ALB's human-facing login.
+local credentials if run outside ECS for testing).
 """
 import argparse
 import json
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import boto3
-import jwt
-import requests
-import uvicorn
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import uvicorn
 
-# Reuse the same session-ID + invocation logic as cli/chat.py.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cli"))
-from agent_client import build_runtime_session_id, stream_agent_events  # noqa: E402
+import re
+
+from agent_client import build_runtime_session_id, stream_agent_events
+from auth import (
+    AuthContext,
+    AuthError,
+    OktaConfig,
+    SessionCookieCodec,
+    apply_refreshed_cookie_if_needed,
+    clear_pending_login_cookie,
+    clear_session_cookie,
+    decode_pending_login,
+    exchange_code_for_tokens,
+    get_or_refresh_session,
+    is_browser_navigation,
+    redirect_to_login,
+    set_session_cookie,
+)
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -77,7 +89,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Longest prompt fragment shown as a conversation's preview in the sidebar.
 PREVIEW_MAX_CHARS = 80
 
-# Matches cli/agent_client.py's SESSION_ID_SEPARATOR: a runtimeSessionId is
+# Matches agent_client.py's SESSION_ID_SEPARATOR: a runtimeSessionId is
 # "<placeholder>___<sessionId>", but AgentCore Memory's ListSessions/
 # ListEvents APIs are already actor-scoped and only ever return/accept the
 # bare <sessionId> component (confirmed live: ListSessions returned
@@ -99,18 +111,6 @@ RUNTIME_SESSION_ID_SEPARATOR = "___"
 # events entirely so a rename never shows up as a fake chat turn.
 TITLE_METADATA_KEY = "conversationTitle"
 MAX_TITLE_CHARS = 80
-
-# ALB signs x-amzn-oidc-data with ES256, keyed by region (DESIGN.md decision
-# #37 / PLAN.md Phase 10 — see the AWS docs on "User claims encoding and
-# signature verification" for Application Load Balancers). GovCloud uses a
-# different (S3-backed) endpoint shape and is intentionally not supported
-# here — this project only targets standard AWS partitions.
-_ALB_PUBLIC_KEY_URL_TEMPLATE = "https://public-keys.auth.elb.{region}.amazonaws.com/{kid}"
-
-# Small in-process cache of ALB signing keys, keyed by kid — ALB rotates
-# these infrequently, and re-fetching one from the public-keys endpoint on
-# every single request would add needless latency to every chat turn.
-_alb_public_key_cache: dict[str, "cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePublicKey"] = {}
 
 
 class ChatRequest(BaseModel):
@@ -293,116 +293,6 @@ def _list_all_event_ids(client, memory_id: str, actor_id: str, session_id: str) 
     return event_ids
 
 
-def _fetch_alb_public_key(region: str, kid: str):
-    """Fetch (and cache) the ALB signing public key for a given kid.
-
-    Per AWS's documented signature-verification flow for ALB OIDC/JWT
-    claims: the key ID comes from the JWT header's "kid" field, and the
-    corresponding EC public key is published, unauthenticated, at a
-    per-region well-known endpoint — not a JWKS document, just the raw PEM
-    key body for that one kid. Cached in-process since ALB rotates these
-    keys infrequently and every chat turn would otherwise pay this extra
-    HTTP round-trip.
-    """
-    if kid in _alb_public_key_cache:
-        return _alb_public_key_cache[kid]
-
-    url = _ALB_PUBLIC_KEY_URL_TEMPLATE.format(region=region, kid=kid)
-    response = requests.get(url, timeout=5.0)
-    response.raise_for_status()
-    from cryptography.hazmat.primitives import serialization
-
-    public_key = serialization.load_pem_public_key(response.content)
-    _alb_public_key_cache[kid] = public_key
-    return public_key
-
-
-def _verified_oidc_sub(
-    oidc_data_header: Optional[str], region: str, alb_arn: str
-) -> str:
-    """Verify the ALB's signed OIDC claims header and return the raw `sub` claim.
-
-    See actor_id_from_oidc_header() for the full verification rationale and
-    the step-by-step flow this implements. Split out so /api/whoami can
-    show the raw `sub` claim alongside its sanitized actor_id, while
-    /api/chat and friends only ever need the sanitized form.
-    """
-    if not oidc_data_header:
-        raise HTTPException(
-            status_code=401, detail="Missing x-amzn-oidc-data header (request did not "
-            "pass through the ALB's OIDC authentication)"
-        )
-
-    try:
-        unverified_header = jwt.get_unverified_header(oidc_data_header)
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Malformed OIDC claims header: {e}") from e
-
-    signer = unverified_header.get("signer")
-    if signer != alb_arn:
-        raise HTTPException(
-            status_code=401,
-            detail=f"OIDC claims signer {signer!r} does not match the expected ALB ARN",
-        )
-
-    kid = unverified_header.get("kid")
-    if not kid:
-        raise HTTPException(status_code=401, detail="OIDC claims header missing 'kid'")
-
-    try:
-        public_key = _fetch_alb_public_key(region, kid)
-        claims = jwt.decode(oidc_data_header, key=public_key, algorithms=["ES256"])
-    except (jwt.InvalidTokenError, requests.RequestException) as e:
-        raise HTTPException(status_code=401, detail=f"OIDC claims verification failed: {e}") from e
-
-    sub = claims.get("sub")
-    if not sub:
-        raise HTTPException(status_code=401, detail="OIDC claims have no 'sub'")
-    return sub
-
-
-def actor_id_from_oidc_header(
-    oidc_data_header: Optional[str], region: str, alb_arn: str
-) -> str:
-    """Derive and sanitize the actor_id from the ALB's signed OIDC claims.
-
-    The ALB forwards the authenticated user's claims as a JWT in the
-    x-amzn-oidc-data header — but per AWS's own documentation, this header
-    MUST be signature-verified before anything in it is trusted: "you must
-    verify the signature of x-amzn-oidc-data and confirm that the signer
-    field in the JWT header matches your Application Load Balancer's ARN."
-    Without this check, a request that reached this container directly
-    (bypassing the ALB — e.g. a misconfigured security group, or a bug
-    that let something other than the ALB reach the target group) could
-    forge an arbitrary actor_id/sub claim and read or write another user's
-    long-term Memory.
-
-    Verification, per AWS's documented flow (implemented in
-    _verified_oidc_sub(), which this wraps):
-      1. Decode the JWT header (without verifying yet) to read "kid" and
-         "signer".
-      2. Confirm "signer" matches this deployment's actual ALB ARN — a
-         token signed by a different load balancer (even one legitimately
-         signed by AWS) must not be accepted here.
-      3. Fetch (or reuse a cached) EC public key for that kid from ALB's
-         public-keys endpoint.
-      4. Verify the JWT's ES256 signature against that key, and decode the
-         payload for real this time.
-      5. Extract the "sub" claim and sanitize it (see _sanitize_actor_id())
-         before use as AgentCore Memory's actorId, since sub is only
-         OIDC-guaranteed to be a stable unique string, not one that
-         satisfies Memory's actorId character-set restrictions (real-world
-         case: an email-address-shaped sub).
-
-    Raises HTTPException(401) if the header is missing, malformed, signed
-    by an unexpected ALB, or fails signature verification — callers should
-    never fall back to a shared/default actor for this header, unlike
-    agent/agent.py's get_actor_id() fallback for its own (differently
-    trusted) payload-based actor_id — a forged or missing OIDC header here
-    means the request didn't come through the ALB's login gate at all.
-    """
-    sub = _verified_oidc_sub(oidc_data_header, region, alb_arn)
-    return _sanitize_actor_id(sub)
 
 
 # AgentCore Memory's actorId pattern: must start with an alphanumeric, then
@@ -429,18 +319,29 @@ def _sanitize_actor_id(raw: str) -> str:
     return sanitized or _DEFAULT_ACTOR_ID
 
 
+class _RedirectToLogin(Exception):
+    """Internal signal: this request needs a real page-navigation redirect
+    to Okta, not a 401 — raised for top-level page loads only (see
+    is_browser_navigation()), caught by create_app()'s exception handler,
+    which builds the actual redirect + pending-login cookie."""
+
+    def __init__(self, return_to: str) -> None:
+        super().__init__(return_to)
+        self.return_to = return_to
+
+
 def create_app(
     agent_runtime_arn: str,
     region: str,
-    alb_arn: str,
+    okta_config: OktaConfig,
+    session_codec: SessionCookieCodec,
     qualifier: Optional[str] = None,
     memory_id: Optional[str] = None,
 ) -> FastAPI:
     """Build the FastAPI app, wiring in the boto3 clients and CLI args.
 
-    `alb_arn` is required for OIDC header signature verification (see
-    actor_id_from_oidc_header()) — every request must present a
-    x-amzn-oidc-data header signed by exactly this load balancer.
+    `okta_config`/`session_codec` back every protected route's identity
+    resolution — see auth.py for the full OIDC + session-cookie design.
     """
     # Memory access (ListSessions/ListEvents/CreateEvent/DeleteEvent) and
     # Runtime invocation both use this process's own IAM role — the ECS
@@ -450,48 +351,129 @@ def create_app(
     client = boto3.client("bedrock-agentcore", region_name=region)
     app = FastAPI(title="Travel Planning Agent — Web UI")
 
+    def _resolve_auth(request: Request) -> AuthContext:
+        """Resolve the caller's session or raise HTTPException.
+
+        Every protected route calls this first. On success, returns an
+        AuthContext (sub + tokens + whether a refresh just happened) —
+        callers that mutate state successfully should call
+        _finish_auth(response, context) before returning so a refreshed
+        cookie actually reaches the browser.
+
+        On failure, the response differs by request type (see
+        is_browser_navigation()): a top-level page load gets redirected
+        straight to Okta (a real browser navigation can follow this
+        transparently); a fetch()/XHR call to /api/* gets a clean 401 so
+        the frontend's own res.status check can react to it directly,
+        instead of the ALB-era CORS-blocked-redirect workaround this
+        replaces (DESIGN.md's Phase 1 auth rearchitecture decision).
+        """
+        try:
+            return get_or_refresh_session(request, session_codec, okta_config)
+        except AuthError as e:
+            if is_browser_navigation(request):
+                # A full page load can be sent straight into the OIDC
+                # dance — return_to preserves where the user was headed.
+                raise _RedirectToLogin(str(request.url.path)) from e
+            raise HTTPException(status_code=401, detail=f"Not authenticated: {e}") from e
+
+    def _actor_id(request: Request, response) -> str:
+        """Convenience wrapper: resolve auth, apply any refreshed cookie,
+        and return the sanitized actor_id — the common case for every
+        route below that doesn't need the raw AuthContext itself."""
+        context = _resolve_auth(request)
+        apply_refreshed_cookie_if_needed(response, context, session_codec)
+        return _sanitize_actor_id(context.sub)
+
+    @app.exception_handler(_RedirectToLogin)
+    def _handle_redirect_to_login(request: Request, exc: "_RedirectToLogin") -> RedirectResponse:
+        return redirect_to_login(okta_config, exc.return_to)
+
+    @app.get("/oauth2/callback")
+    def oauth2_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+        """Completes the OIDC dance: exchanges the code, sets the session
+        cookie, and redirects the browser to wherever it originally asked
+        to go (see redirect_to_login()'s return_to)."""
+        pending_cookie = request.cookies.get("travel_agent_pending_login")
+        if not pending_cookie:
+            raise HTTPException(status_code=400, detail="No pending login found for this callback")
+
+        pending = decode_pending_login(pending_cookie)
+        if error:
+            raise HTTPException(status_code=400, detail=f"Okta returned an error: {error}")
+        if not code or not state:
+            raise HTTPException(status_code=400, detail="Callback missing 'code' or 'state'")
+        if state != pending.get("state"):
+            raise HTTPException(status_code=400, detail="State mismatch — possible CSRF")
+
+        try:
+            tokens = exchange_code_for_tokens(okta_config, code, pending["code_verifier"])
+        except AuthError as e:
+            raise HTTPException(status_code=400, detail=f"Login failed: {e}") from e
+
+        return_to = pending.get("return_to") or "/"
+        redirect = RedirectResponse(url=return_to, status_code=302)
+        clear_pending_login_cookie(redirect)
+        set_session_cookie(redirect, session_codec.encode(tokens))
+        return redirect
+
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    def index(request: Request) -> FileResponse:
+        # Must resolve auth here — unlike under the old ALB model, this
+        # container no longer sits behind a network-edge gate that checks
+        # every request before it arrives; this route (like every other
+        # protected one) has to check for itself. A missing/expired
+        # session sends a real page load straight into the OIDC redirect
+        # (see _resolve_auth()/is_browser_navigation()), matching decision
+        # #56's intent — this bug (the route originally had no auth check
+        # at all) was caught by a live curl check immediately after the
+        # first Phase 1 deploy, not by the automated test suite.
+        context = _resolve_auth(request)
+        file_response = FileResponse(STATIC_DIR / "index.html")
+        apply_refreshed_cookie_if_needed(file_response, context, session_codec)
+        return file_response
+
+    @app.get("/favicon.ico")
+    def favicon() -> FileResponse:
+        # Browsers request this path directly (independent of index.html's
+        # own <link rel="icon">) before a page's markup is even parsed.
+        return FileResponse(STATIC_DIR / "favicon.ico")
 
     @app.get("/api/config")
     def config() -> dict:
         # Tells the frontend whether to show the conversation-history
         # sidebar at all. No actor_id here — unlike the old local-only
         # version, actor_id now varies per-request (derived from each
-        # request's own OIDC header), not fixed at server startup.
+        # request's own verified session cookie), not fixed at server
+        # startup.
         return {"history_enabled": memory_id is not None}
 
     @app.get("/api/whoami")
-    def whoami(request: Request) -> dict:
+    def whoami(request: Request, response: Response) -> dict:
         """Debug endpoint: show the actor_id derived from this request's own
-        verified OIDC claims, and the raw `sub` claim it was sanitized from.
+        verified session, and the raw `sub` claim it was sanitized from.
 
-        Reuses actor_id_from_oidc_header() exactly as /api/chat does, so
-        this reflects the real, signature-verified identity for whoever is
-        currently logged in — not a guess or a log-scraping exercise. Not
-        linked from the UI; intended for manually confirming which actor_id
-        a given login session maps to (e.g. via curl or a browser visit
-        while logged in).
+        Not linked from the UI; intended for manually confirming which
+        actor_id a given login session maps to (e.g. via curl or a
+        browser visit while logged in).
         """
-        sub = _verified_oidc_sub(request.headers.get("x-amzn-oidc-data"), region, alb_arn)
-        return {"sub": sub, "actor_id": _sanitize_actor_id(sub)}
+        context = _resolve_auth(request)
+        apply_refreshed_cookie_if_needed(response, context, session_codec)
+        return {"sub": context.sub, "actor_id": _sanitize_actor_id(context.sub)}
 
     @app.post("/api/chat")
-    def chat(request: Request, body: ChatRequest) -> StreamingResponse:
+    def chat(request: Request, response: Response, body: ChatRequest) -> StreamingResponse:
         """Stream one turn's labeled events to the browser as SSE.
 
         Forwards agent_client.stream_agent_events()'s parsed event dicts
         (already validated to have a "type" key) back out as SSE frames —
         the browser's EventSource-equivalent fetch/reader consumes these
         directly; see static/app.js. actor_id is derived from this
-        request's own verified OIDC header (not cached from startup), so a
-        long-running container correctly serves multiple distinct users
-        without mixing up whose Memory a turn should read/write.
+        request's own verified session cookie (not cached from startup),
+        so a long-running container correctly serves multiple distinct
+        users without mixing up whose Memory a turn should read/write.
         """
-        actor_id = actor_id_from_oidc_header(
-            request.headers.get("x-amzn-oidc-data"), region, alb_arn
-        )
+        actor_id = _actor_id(request, response)
 
         prompt = body.prompt.strip()
         if not prompt:
@@ -521,23 +503,29 @@ def create_app(
                 # agent-raised error event.
                 yield f"data: {json.dumps({'type': 'error', 'data': {'note': str(e)}})}\n\n"
 
-        return StreamingResponse(
+        # response's headers (including any Set-Cookie from a just-
+        # performed refresh, see _actor_id() above) are carried onto this
+        # StreamingResponse — FastAPI merges a dependency-injected
+        # Response's headers onto whatever the route actually returns.
+        streaming_response = StreamingResponse(
             _event_stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
+        for key, value in response.headers.items():
+            streaming_response.headers.append(key, value)
+        return streaming_response
+
 
     @app.get("/api/conversations", response_model=list[ConversationSummary])
-    def list_conversations(request: Request) -> list[ConversationSummary]:
+    def list_conversations(request: Request, response: Response) -> list[ConversationSummary]:
         if memory_id is None:
             raise HTTPException(
                 status_code=404,
                 detail="Conversation history is unavailable: server was started "
                 "without --memory-id",
             )
-        actor_id = actor_id_from_oidc_header(
-            request.headers.get("x-amzn-oidc-data"), region, alb_arn
-        )
+        actor_id = _actor_id(request, response)
 
         try:
             sessions_response = client.list_sessions(
@@ -596,16 +584,14 @@ def create_app(
     @app.get(
         "/api/conversations/{session_id}", response_model=ConversationDetail
     )
-    def get_conversation(session_id: str, request: Request) -> ConversationDetail:
+    def get_conversation(session_id: str, request: Request, response: Response) -> ConversationDetail:
         if memory_id is None:
             raise HTTPException(
                 status_code=404,
                 detail="Conversation history is unavailable: server was started "
                 "without --memory-id",
             )
-        actor_id = actor_id_from_oidc_header(
-            request.headers.get("x-amzn-oidc-data"), region, alb_arn
-        )
+        actor_id = _actor_id(request, response)
 
         # session_id here is the full runtimeSessionId ("<actorId>___<id>"),
         # matching what /api/chat takes and what the frontend stores — but
@@ -645,16 +631,14 @@ def create_app(
         return ConversationDetail(session_id=session_id, turns=turns)
 
     @app.put("/api/conversations/{session_id}/title")
-    def set_conversation_title(session_id: str, body: SetTitleRequest, request: Request) -> dict:
+    def set_conversation_title(session_id: str, body: SetTitleRequest, request: Request, response: Response) -> dict:
         if memory_id is None:
             raise HTTPException(
                 status_code=404,
                 detail="Conversation history is unavailable: server was started "
                 "without --memory-id",
             )
-        actor_id = actor_id_from_oidc_header(
-            request.headers.get("x-amzn-oidc-data"), region, alb_arn
-        )
+        actor_id = _actor_id(request, response)
 
         title = " ".join(body.title.split())
         if not title:
@@ -706,16 +690,14 @@ def create_app(
     @app.delete(
         "/api/conversations/{session_id}", response_model=DeleteConversationResponse
     )
-    def delete_conversation(session_id: str, request: Request) -> DeleteConversationResponse:
+    def delete_conversation(session_id: str, request: Request, response: Response) -> DeleteConversationResponse:
         if memory_id is None:
             raise HTTPException(
                 status_code=404,
                 detail="Conversation history is unavailable: server was started "
                 "without --memory-id",
             )
-        actor_id = actor_id_from_oidc_header(
-            request.headers.get("x-amzn-oidc-data"), region, alb_arn
-        )
+        actor_id = _actor_id(request, response)
 
         bare_session_id = session_id.split(RUNTIME_SESSION_ID_SEPARATOR, 1)[-1]
 
@@ -773,18 +755,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(see the TravelAgentRuntimeStack CloudFormation outputs).",
     )
     parser.add_argument(
-        "--alb-arn",
+        "--oidc-issuer",
         required=True,
-        help="ARN of the Application Load Balancer fronting this server "
-        "with OIDC authentication (see TravelAgentWebStack's outputs). "
-        "Required to verify the 'signer' field of every request's "
-        "x-amzn-oidc-data header.",
+        help="Okta authorization server issuer URL for this app's dedicated "
+        "Okta application (see DESIGN.md's Phase 1 auth rearchitecture "
+        "decision — a separate app from any other Okta app used elsewhere "
+        "in this project).",
+    )
+    parser.add_argument(
+        "--oidc-authorization-endpoint",
+        required=True,
+        help="Okta's /authorize endpoint for this app.",
+    )
+    parser.add_argument(
+        "--oidc-token-endpoint",
+        required=True,
+        help="Okta's /token endpoint for this app.",
+    )
+    parser.add_argument(
+        "--oidc-client-id",
+        required=True,
+        help="This app's Okta client ID.",
+    )
+    parser.add_argument(
+        "--oidc-client-secret-arn",
+        required=True,
+        help="Secrets Manager ARN of this app's Okta client secret (see "
+        "cdk/stacks/web_stack.py's OidcClientSecret resource) — the raw "
+        "secret is never passed as a plain CLI argument or environment "
+        "variable.",
+    )
+    parser.add_argument(
+        "--oidc-redirect-uri",
+        required=True,
+        help="The exact redirect_uri registered with Okta for this app "
+        "(must match https://<this ALB's DNS name>/oauth2/callback).",
+    )
+    parser.add_argument(
+        "--session-cookie-kms-key-id",
+        required=True,
+        help="KMS key ID (or ARN) used to envelope-encrypt the session "
+        "cookie (see web/auth.py's SessionCookieCodec and "
+        "cdk/stacks/web_stack.py's SessionCookieKey resource).",
     )
     parser.add_argument(
         "--region",
         default="us-east-1",
-        help="AWS region the agent (and this server's own ALB) is deployed "
-        "in (default: %(default)s).",
+        help="AWS region the agent (and this server's own KMS key/Secrets "
+        "Manager secret) is deployed in (default: %(default)s).",
     )
     parser.add_argument(
         "--qualifier",
@@ -820,14 +838,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _fetch_secret_value(secret_arn: str, region: str) -> str:
+    """Resolve a Secrets Manager secret's plaintext string value.
+
+    Called once at process startup (not per-request) — the Okta client
+    secret doesn't change without a redeploy, so there's no need to
+    re-fetch it on every token exchange/refresh call.
+    """
+    client = boto3.client("secretsmanager", region_name=region)
+    response = client.get_secret_value(SecretId=secret_arn)
+    return response["SecretString"]
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    okta_client_secret = _fetch_secret_value(args.oidc_client_secret_arn, args.region)
+    okta_config = OktaConfig(
+        issuer=args.oidc_issuer,
+        authorization_endpoint=args.oidc_authorization_endpoint,
+        token_endpoint=args.oidc_token_endpoint,
+        client_id=args.oidc_client_id,
+        client_secret=okta_client_secret,
+        redirect_uri=args.oidc_redirect_uri,
+    )
+    session_codec = SessionCookieCodec(kms_key_id=args.session_cookie_kms_key_id)
+
     app = create_app(
         agent_runtime_arn=args.agent_runtime_arn,
         region=args.region,
-        alb_arn=args.alb_arn,
+        okta_config=okta_config,
+        session_codec=session_codec,
         qualifier=args.qualifier,
         memory_id=args.memory_id,
     )

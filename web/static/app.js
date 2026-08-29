@@ -4,8 +4,7 @@
 // /api/conversations[/…]. Session persistence: the AgentCore
 // runtimeSessionId is generated once per browser and stored in
 // localStorage, so reloading the page continues the same conversation.
-// "New conversation" clears it and starts a fresh session, matching how
-// cli/chat.py starts a fresh session each time it's run.
+// "New conversation" clears it and starts a fresh session.
 //
 // Conversation history (the sidebar) is not stored locally — AgentCore
 // Memory is the source of truth. Switching conversations fetches that
@@ -13,12 +12,12 @@
 // which reads it straight out of Memory via ListEvents.
 //
 // Note on identity: this file has no notion of "who's logged in" — the
-// server derives the real actor_id per-request from the ALB's verified
-// OIDC claims (see actor_id_from_oidc_header() in server.py) and never
-// takes it from the client. An earlier version of this file generated the
-// runtimeSessionId with an actor_id-shaped prefix read from /api/config,
-// but /api/config stopped returning actor_id once it became a per-request
-// (not server-startup) value — that left a stale "web-user___" prefix on
+// server derives the real actor_id per-request from its own verified
+// Okta session cookie (see web/auth.py) and never takes it from the
+// client. An earlier version of this file generated the runtimeSessionId
+// with an actor_id-shaped prefix read from /api/config, but /api/config
+// stopped returning actor_id once it became a per-request (not
+// server-startup) value — that left a stale "web-user___" prefix on
 // every session ID that looked like an actor_id but wasn't one, which is
 // confusing when reading it back out of logs/traces. The prefix carried
 // no real meaning even before that (the server has never read anything
@@ -72,42 +71,19 @@ function loadOrCreateSession() {
   return fresh;
 }
 
-// The ALB's OIDC listener (OnUnauthenticatedRequest=AUTHENTICATE) responds
-// to *any* request with no/expired session cookie — including this app's
-// own fetch() calls, not just top-level page loads — with an HTTP 302 to
-// the IdP's /authorize endpoint. A real page navigation follows a
-// cross-origin redirect like this with no restriction at all, but a
-// same-origin fetch() cannot: the browser still applies its CORS check to
-// the *final* response in the redirect chain (the IdP's authorize page),
-// which was never meant to be fetched this way and has no
-// Access-Control-Allow-Origin header, so fetch() rejects with a generic
-// network-level TypeError rather than resolving with a 302 or 401.
-// (Confirmed directly against this deployment's ALB: `curl -v` against
-// /api/chat with no cookie returns a 302 to Okta, not a 401 — this ALB
-// does not use OnUnauthenticatedRequest=deny, which is the only mode
-// that would let fetch() observe a clean 401 instead.)
-//
-// There is no way to distinguish that rejection from a genuine network
-// error in JS. The fix either way is to stop relying on fetch() to
-// complete the flow and instead force a real top-level navigation via
-// reload — the browser will then happily follow the ALB's redirect to
-// the IdP with no CORS check involved, login proceeds normally, and the
-// page comes back with a valid session. A capped retry count guards
-// against a reload loop if the backend is genuinely broken rather than
-// just needing reauthentication.
-const AUTH_RELOAD_KEY = "travel-agent-auth-reload-count";
-const MAX_AUTH_RELOADS = 2;
-
+// The server now runs the entire OIDC flow itself (see DESIGN.md's Phase
+// 1 auth rearchitecture decision, superseding decision #47's ALB-specific
+// workaround) and returns a real, clean 401 for any unauthenticated/
+// expired-session request to /api/* — there's no CORS-blocked-redirect
+// ambiguity to guess around anymore (that was specifically a consequence
+// of the old ALB's authenticate-oidc listener always redirecting rather
+// than ever returning 401 to a fetch() call; this server's own routes
+// don't have that constraint, see server.py's is_browser_navigation()).
+// A 401 means "this session isn't valid" — the fix is a real, top-level
+// page navigation (not a fetch()) to any page, which the server will
+// redirect straight to Okta for; reload() is the simplest way to trigger
+// that from here.
 function handleAuthExpired() {
-  const count = Number(sessionStorage.getItem(AUTH_RELOAD_KEY) || "0");
-  if (count >= MAX_AUTH_RELOADS) {
-    appendMessage(
-      "error",
-      "Still not authenticated after reloading. Try closing this tab and opening the app fresh."
-    );
-    return;
-  }
-  sessionStorage.setItem(AUTH_RELOAD_KEY, String(count + 1));
   window.location.reload();
 }
 
@@ -436,14 +412,11 @@ async function sendMessage(prompt) {
     refreshConversationList();
   } catch (err) {
     pendingEl.remove();
-    // A fetch() to a same-origin /api/* route can only fail like this for
-    // two reasons: a genuine network error, or the ALB responding with a
-    // cross-origin redirect to the IdP that the browser's CORS check then
-    // blocks (see handleAuthExpired()'s comment above) — there's no way
-    // to tell these apart from here. Reloading is the right response to
-    // both: it's how the redirect case actually gets resolved, and it's a
-    // harmless no-op retry if this was really just a dropped connection.
-    handleAuthExpired();
+    // res.status === 401 (checked above) is now the reliable signal for
+    // an expired/missing session — a rejection reaching this catch block
+    // means a genuine network/transport error instead, so it's surfaced
+    // as a normal error message rather than assumed to be an auth issue.
+    appendMessage("error", `Request failed: ${err.message}`);
   } finally {
     sendBtn.disabled = false;
     inputEl.focus();
@@ -644,9 +617,10 @@ async function switchConversation(targetSessionId) {
     await refreshConversationList();
     setSidebarOpen(false);
   } catch (err) {
-    // See the comment in sendMessage()'s catch block — a same-origin
-    // fetch() rejection here is treated the same way.
-    handleAuthExpired();
+    // res.status === 401 (checked above) is the reliable auth-expiry
+    // signal now — a rejection reaching this catch block is a genuine
+    // network/transport error.
+    appendMessage("error", `Could not load that conversation: ${err.message}`);
   } finally {
     sendBtn.disabled = false;
     inputEl.focus();
@@ -694,23 +668,16 @@ async function init() {
   diagnosticsEnabled = localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) === "1";
   diagnosticToggleInput.checked = diagnosticsEnabled;
 
+  // /api/config is intentionally unauthenticated (it's a static feature
+  // flag, not identity-scoped data — see server.py) and so can never
+  // 401; the conversation-history fetch below is this page's first real
+  // auth check, once historyEnabled is known.
   try {
     const res = await fetch("/api/config");
-    if (res.status === 401) {
-      handleAuthExpired();
-      return;
-    }
     const config = await res.json();
     historyEnabled = Boolean(config.history_enabled);
-    // Reached a real response from a protected route — this session is
-    // authenticated, so clear the reload-loop guard for next time.
-    sessionStorage.removeItem(AUTH_RELOAD_KEY);
-  } catch {
-    // See handleAuthExpired()'s comment: a rejection here is most likely
-    // the ALB's redirect-to-IdP being blocked by CORS, and this is the
-    // very first request the page makes, so there's nothing useful to
-    // fall back to — reload rather than silently leaving a broken page.
-    handleAuthExpired();
+  } catch (err) {
+    appendMessage("error", `Could not load app config: ${err.message}`);
     return;
   }
   sessionId = loadOrCreateSession();
@@ -719,6 +686,9 @@ async function init() {
     // Try to load this session's existing transcript from AgentCore
     // Memory (e.g. after a page reload); an empty/new session just
     // renders no messages, which is correct for a fresh conversation.
+    // This is also this page's first real auth check — a 401 here means
+    // there's no valid session at all, so a real page navigation (via
+    // reload) is needed to trigger the server's redirect-to-Okta flow.
     try {
       const res = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}`);
       if (res.status === 401) {
@@ -729,14 +699,11 @@ async function init() {
         const data = await res.json();
         renderTranscript(data.turns);
       }
-    } catch {
-      // This fetch() is the first request the page makes after load, so
-      // a rejection here (rather than the /api/config rejection above,
-      // which is treated as a soft failure) is a reliable enough signal
-      // that we hit the ALB-redirect-blocked-by-CORS case (see
-      // handleAuthExpired()'s comment) to be worth a reload — leaving the
-      // user on a page with no transcript and a broken sidebar is worse.
-      handleAuthExpired();
+    } catch (err) {
+      // res.status === 401 (checked above) is the reliable auth-expiry
+      // signal now — a rejection reaching this catch block is a genuine
+      // network/transport error.
+      appendMessage("error", `Could not load conversation history: ${err.message}`);
       return;
     }
     refreshConversationList();

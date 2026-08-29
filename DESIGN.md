@@ -102,14 +102,88 @@ IAM auth is **removed**, not kept as a parallel option (unlike a typical
 single-user, no-hosting scope (decision #19) is explicitly **not**
 reopened by this change — see decision #30.
 
+## 2c. Post-deploy hardening (added 2026-08-27/28)
+
+Three fixes made after `TravelAgentWebStack` was first deployed and
+exercised against real traffic — each found by actually using the live
+deployment, not anticipated during §2b's design pass.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 45 | Fargate CPU architecture | `runtime_platform=ecs.RuntimePlatform(cpu_architecture=ecs.CpuArchitecture.ARM64, ...)` set explicitly on the Fargate task definition, matching a native-`arm64` Docker build. | Building for Fargate's default (`X86_64`) from an Apple Silicon (`arm64`) development machine requires cross-architecture emulation (Docker's QEMU-based `buildx`), which was confirmed in practice to hang indefinitely pushing the built image to ECR under this environment's emulation layer — never completing, not just slow. Building and running natively as `arm64` end-to-end (Fargate does support `arm64` tasks) sidesteps the emulation path entirely. Not a general-purpose fix for x86-only dev machines — this is specifically for building on Apple Silicon. |
+| 46 | Debug endpoint for identity verification | `GET /api/whoami` added to `web/server.py`, returning `{"sub": ..., "actor_id": ...}` from the same `actor_id_from_oidc_header()` path every other endpoint uses, protected by the same ALB OIDC gate (no separate/weaker auth). | Diagnosing an X-Ray trace that appeared to show the wrong `actor_id` (traced to a stale client-side `session.id` prefix, not an actual identity bug — see decision #47) required a fast way to confirm "what does the server actually resolve my identity to, right now" without reasoning through code paths or grepping logs. A tiny, always-available endpoint answers that directly than re-deriving it manually each time. |
+| 47 | Client-side auth-expiry handling | `web/static/app.js` treats any `fetch()` rejection (and, defensively, an explicit 401) on a call to a protected `/api/*` route as "session expired," and responds with `window.location.reload()` rather than showing a generic error — capped at 2 reload attempts per browser session (`sessionStorage`) to avoid a reload loop if the backend is genuinely broken rather than just needing reauthentication. | The ALB's `authenticate-oidc` listener (`OnUnauthenticatedRequest=AUTHENTICATE`, decision #38) responds to *any* request with a missing/expired session cookie — including this app's own `fetch()` calls, not just top-level page loads — with an HTTP 302 to Okta. A real page navigation follows that redirect with no restriction, but `fetch()` cannot: the browser still applies its CORS check to the final response in the redirect chain (Okta's `/authorize` page, which has no `Access-Control-Allow-Origin` header), so the request rejects with a generic error instead of ever exposing a 302 or a 401 to the caller. Confirmed directly against the deployed ALB with `curl`: a request with zero cookies returns 302, not 401 — ruling out `OnUnauthenticatedRequest=deny`'s documented "clean 401 for AJAX" behavior, which does not apply to this ALB's configuration. A first attempt assumed the 401 case applied and only checked `res.status`; it had no effect, since this ALB's redirect-always mode never produces an observable 401 for `fetch()` to check. The working fix instead reacts to the rejection itself, since a same-origin `/api/*` fetch can only fail this way for a genuine network error or this redirect-blocked-by-CORS case, and reload is the correct response to either. `on_unauthenticated_request` was deliberately left as `AUTHENTICATE` rather than switched to `deny` — `deny` would also change behavior for a plain top-level page load with no cookie (returning a raw 401 instead of redirecting to Okta), breaking the primary "just open the site and get sent to log in" flow that decision #38 relies on. |
+
+## 2d. CLI removal (added 2026-08-28)
+
+The local CLI REPL client (`cli/chat.py`, plus its shared transport module
+`cli/agent_client.py`) is removed entirely. The hosted web UI
+(`TravelAgentWebStack`, §2b) is now the only supported way to use this
+agent — there is no other client, local or otherwise.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 48 | CLI removal scope | Full removal: `cli/` deleted entirely (`chat.py`, `agent_client.py`, `requirements.txt`), along with its dedicated tests (`tests/test_chat.py` deleted outright; `tests/test_agent_client.py`'s coverage — none of which was CLI-specific — moved to `web/tests/test_agent_client.py` against the relocated module). `agent_client.py` itself is not deleted, since `web/server.py` depends on it for session-ID construction and the actual `InvokeAgentRuntime` call — it moves to `web/agent_client.py`, becoming a same-directory sibling instead of a cross-directory import via a `sys.path` hack. | Once the hosted web UI (§2b) existed and worked, the CLI stopped serving any purpose decision #10's original "testing/invocation clients" rationale needed — it was already redundant with the AgentCore console's test chat for a quick Runtime sanity check, and with the web UI for actual end-user conversations. Keeping it around meant maintaining a second, less-capable client (no streaming visibly rendered, no diagnostics panel, no conversation history) with its own auth story (a raw `--actor-id` flag, decision #15/#37) that diverged from the real identity model (§2b's ALB-derived `actor_id`) every other caller now uses. Removing it outright — rather than leaving it as a "power user" escape hatch — was a deliberate simplification: a second supported client is an ongoing maintenance cost (keeping it in sync with `agent_client.py`'s interface, its own test suite, its own docs) for a capability (local IAM-credentialed access) nothing in this project's actual usage needed once the web UI existed. |
+| 49 | Docker build context simplification | `web/Dockerfile` now `COPY`s only from `web/` itself (`COPY . .`, `ENTRYPOINT ["python", "server.py"]`) instead of `web/` plus a sibling `cli/agent_client.py`. `cdk/stacks/web_stack.py`'s `ecs.ContainerImage.from_asset()` build context narrows from the whole repo root to `web/` alone, and its `exclude` list (previously needed to keep `cdk/cdk.out`/`.venv`/`.git` out of a repo-root build context) is removed entirely, since `web/` never contained any of those directories in the first place. | This was a real, independent simplification unlocked by the CLI removal, not just incidental cleanup: the *only* reason the Docker build context was ever the whole repo root was to let the Dockerfile reach across to the sibling `cli/agent_client.py` file (see decision #41's original rationale) — with `agent_client.py` now living inside `web/`, that cross-directory reach no longer exists, so there's no reason for the build context to be anything wider than `web/` itself. A narrower build context is strictly better: smaller build context to hash/upload, no risk of ever needing the `cdk.out` self-referential-copy workaround again (decision #41's `ENAMETOOLONG` bug can't recur if `cdk.out` is never in the context to begin with). |
+
+## 2e. Phase 1 auth rearchitecture: app-level OIDC replaces the ALB (added 2026-08-28)
+
+Removes the ALB's `authenticate-oidc` listener action (decision #38) —
+the ALB reverts to a plain TLS-terminating, non-authenticating load
+balancer — and moves the entire OIDC login flow into `web/server.py`
+itself (new `web/auth.py` module). The motivating requirement (recorded
+in discussion, not yet implemented — a future phase): giving the
+AgentCore Gateway an inbound JWT with a real, cryptographically-signed
+`sub` claim, so its Policy Engine and rate-limiting features can key
+authorization/throttling decisions on genuine per-user identity rather
+than the Gateway's current single IAM-role caller identity. That requires
+a live, forwardable/exchangeable signed token somewhere in the request
+path — the ALB's `x-amzn-oidc-data` header is fully decoded and discarded
+by `web/server.py` today (only a plain string, `actor_id`, survives past
+it), so there is no live token left to propagate. Running the OIDC flow
+in the app itself, rather than the ALB, means a real Okta-issued token
+exists in this process for as long as a session is active, available for
+a later phase's Runtime→Gateway (or Server→Runtime) on-behalf-of token
+exchange.
+
+This section is scoped to *only* the ALB→app-level auth migration.
+Propagating a JWT to the Gateway, adding the Gateway's Policy Engine, and
+any OBO/token-exchange work are explicitly out of scope here — later
+phases, not yet designed in detail.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 50 | Okta app | A new, dedicated Okta application (confidential client, its own client ID/secret) — separate from the ALB's former app (decision #38) and from the CLI-era `okta-claude-code-token-helper` app (decision #27, both now unused/removed). | Matches this project's established convention (decisions #27, #38) of never sharing an Okta app registration across trust boundaries — a token minted for one system must not silently authenticate to another. |
+| 51 | Token scopes | `openid offline_access`. No `profile`/`email`, no group/role claims requested yet. | `offline_access` is required to get a refresh token back from this Okta org's authorization server at all — silent refresh (decision #55) has nothing to work with otherwise. Group/role claims are deferred: they'd only matter for a future Gateway-policy phase, and shaping this Okta app around an undesigned future requirement was rejected — scopes are cheap to add later without touching this phase's design. |
+| 52 | Refresh token rotation | This Okta app is configured to return the *same*, non-rotating refresh token on every refresh (not Okta's alternative rotate-on-use behavior). | Avoids an entire class of concurrency bug: a rotating refresh token invalidates itself the instant it's used, so two requests racing to refresh with the same (now-stale) token would otherwise need server-side coordination (a lock/mutex) to avoid one of them failing — directly working against this project's explicit goal of keeping the Fargate tasks stateless. With a fixed refresh token, no such coordination is needed; any task can refresh independently at any time. |
+| 53 | Session cookie: confidentiality | KMS envelope encryption (`GenerateDataKey`/`Decrypt`, AES-256-GCM for the actual payload cipher) — not a signed-but-plaintext cookie like the ALB's original `x-amzn-oidc-data`. A single cookie holds the AES-GCM nonce, ciphertext, and the KMS-*encrypted* data key together; the raw AES key is only ever held in process memory for the duration of one encrypt/decrypt call, never persisted. | The cookie now carries real bearer credentials (an Okta access token and refresh token) rather than just identity claims — a signed-but-readable cookie would let anyone with browser access to it (devtools, a malicious extension, a leaked log line) read the raw tokens directly. Envelope encryption via KMS (rather than a self-managed static symmetric key) shifts key custody, rotation, and access-auditing entirely to AWS, via the same IAM-role-authorizes-the-call pattern already used elsewhere in this project (e.g. `bedrock-agentcore:InvokeAgentRuntime`) — no raw key material to generate, store, or rotate ourselves. |
+| 54 | KMS key rotation strategy | Automatic annual rotation enabled on the KMS key, combined with per-session data keys (decision #53) — each cookie carries its own encrypted data key, so it never depends on which KMS key *version* encrypted it. | Makes key rotation a non-event for already-issued sessions: rotating (or even fully replacing) the KMS key only affects newly-generated data keys going forward, and AWS's own key-rotation guarantee keeps old key material available for `Decrypt` regardless. No session is ever forcibly invalidated by a rotation. |
+| 55 | Refresh timing | Synchronous, inline refresh: a request arriving with an expired access token triggers an immediate call to Okta's token endpoint as part of handling that same request, and the resulting new access token is written back into the session cookie on that same response (`Set-Cookie`) before the caller ever sees a failure. | The alternative (deferred/best-effort cookie rewrite, tolerating a stale cookie until some later request) has no real benefit here — refreshing has to happen synchronously in-request regardless (the current request needs a valid token to actually call the Runtime), so writing the resulting cookie on the same response is free; deferring it would only guarantee a second, wasted refresh call on the very next request. |
+| 56 | 401 vs. redirect split | `web/auth.py`'s `is_browser_navigation()` inspects the `Sec-Fetch-Mode` header (falling back to `Accept: text/html` for older/unusual clients) to distinguish a top-level page load from a `fetch()`/XHR call. A top-level load with no valid session gets redirected straight to Okta (302); a `fetch()` call gets a clean, real `401`. | This is a genuine improvement over decision #47's ALB-era workaround, not just a side effect: the ALB's `authenticate-oidc` action, once configured for `OnUnauthenticatedRequest=AUTHENTICATE`, had no mode that returned a real 401 to an AJAX call — it always 302'd, which a same-origin `fetch()` cannot follow (the browser's CORS check blocks the final response in that redirect chain). That forced `web/static/app.js` to treat *any* fetch rejection as a possible auth failure and blindly retry via a full-page reload, capped at a small retry count to avoid a loop. Now that this server's own code decides the response, returning a real 401 for `fetch()` calls removes that entire class of ambiguity — `app.js`'s `res.status === 401` checks (already present, previously dead code under the ALB) are now the sole, reliable auth-expiry signal, and the reload-loop-guard machinery (`AUTH_RELOAD_KEY`, capped retries) is removed as no longer needed. |
+| 57 | CSRF/PKCE protections | A short-lived (10-minute), separate `travel_agent_pending_login` cookie carries the OAuth `state` value and the PKCE code verifier across the redirect round-trip to Okta and back; deleted as soon as `/oauth2/callback` consumes it. PKCE (S256) is used even though this is a confidential client with a client secret. | `state` verification is the standard CSRF defense for OAuth redirect flows — without it, an attacker could trick a victim's browser into completing an attacker-initiated login. PKCE is not solely a public-client mitigation: current OAuth security guidance (RFC 9700) recommends it universally, including for confidential clients, since it independently defends against authorization-code interception/injection regardless of whether the client can hold a secret — a small amount of extra code for a real, no-downside hardening. This pending-login cookie itself is deliberately *not* encrypted (only the session cookie, decision #53, is) — nothing in it is a bearer credential; its security property comes from `state`'s unpredictability and exact match, not from the cookie's own confidentiality. |
+| 58 | `sub` extraction from the access token | `web/auth.py` decodes Okta's returned access token as a JWT, without verifying its signature, to read the `sub` claim. | Safe specifically because this token was just obtained directly from Okta's own token endpoint over TLS, by this server's own code (the authorization_code or refresh_token grant) — never supplied by an untrusted caller — so there is no scenario where an attacker-controlled token reaches this decode step. This is a materially different trust context than the old ALB header verification (decision #38's `actor_id_from_oidc_header()`), which had to defend against a forged/replayed header reaching the container from an unverified source; that entire signature-verification mechanism (ES256 against ALB's public-keys endpoint) is removed along with the ALB's OIDC responsibility. **Verified 2026-08-29** against the real, registered Okta app (decision #50): this org's access tokens are JWT-shaped and carry a `sub` claim, confirming the assumption this decode step relies on. |
+| 59 | ALB/CDK scope of this change | The ALB's `authenticate-oidc` listener action, `on_unauthenticated_request`, and every `oidc_*`/`WEB_OIDC_USER_INFO_ENDPOINT` construct prop tied to it are removed from `cdk/stacks/web_stack.py`; the listener's `default_action` becomes a plain `ListenerAction.forward([target_group])`. A new `SessionCookieKey` (KMS) and `OidcClientSecret` (Secrets Manager) resource are added, both scoped via IAM grants to only this stack's own `WebTaskRole`. The ALB itself (TLS termination, health checks, the 180s idle timeout of decision #43, autoscaling target-group routing) is unchanged — only its identity-checking responsibility moves into the container. | The ALB remains the right tool for TLS/routing/health-checks regardless of who handles auth — replacing the ALB itself was never the goal, only its `authenticate-oidc` action. Storing the Okta client secret in Secrets Manager (rather than passing it as a plain environment variable, as the ALB's own listener-rule property implicitly did before) reflects that this container, not the ALB, now holds and uses this secret directly on every login/refresh — a materially different exposure than a value the ALB used internally and never exposed to the container at all. |
+| 60 | Logout | No `/logout` route added in this phase. | Not a regression: neither the ALB's `authenticate-oidc` action nor any prior version of this app ever exposed an explicit logout affordance — this phase's scope is replacing the ALB's OIDC mechanics with an equivalent, not adding new capability. A real logout (clearing the local session and optionally ending the Okta-side session) is a reasonable future enhancement, deliberately deferred rather than folded into this already-large change. |
+
+### Post-deploy fix (found 2026-08-29, same day as first deploy)
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 61 | `GET /` had no auth check at all | Added `_resolve_auth(request)` (with `apply_refreshed_cookie_if_needed()`) to the `/` route, matching every other protected route. | Real bug, caught by a live `curl` check against the deployed ALB immediately after the first Phase 1 deploy — `GET /` with `Sec-Fetch-Mode: navigate` and no session cookie returned `200` (serving `index.html` unconditionally) instead of the expected `302` to Okta. Root cause: under the old ALB model, `/` never needed its own auth check because the ALB gated every request at the network edge before any of them reached the container at all; that assumption silently carried over into this phase's `create_app()`, where `index()` was never updated to call `_resolve_auth()` like `/api/whoami` and the others. Not caught by the automated test suite before this session's redeploy, since no test asserted on `/`'s auth behavior at all (the pre-existing `test_index_serves_html` used an already-authenticated test client, which passed regardless of whether the route itself checked anything) — `test_index_route_requires_auth`/`test_index_route_returns_401_for_fetch_style_call_with_no_session` were added as regression coverage after this fix. `/favicon.ico` was checked and correctly left unauthenticated — a non-sensitive static asset browsers request unconditionally before any login state is known, unlike `/`'s real page content. |
+| 62 | `redirect_uri` uses a caller-supplied hostname, not the ALB's own DNS name | Added a new required `web_hostname` constructor parameter to `WebStack` (env var `WEB_HOSTNAME`), used to build `redirect_uri` (`https://{web_hostname}/oauth2/callback`) instead of `self.load_balancer.load_balancer_dns_name`. | Found immediately after the first live deploy: the user's actual Okta app was registered with a friendly custom domain (`travel-agent.kenkitts.people.aws.dev`, already pointed at this ALB per decision #40's "DNS is the caller's responsibility" — confirmed via a real ACM wildcard certificate, `*.kenkitts.people.aws.dev`, already `InUse: true` on this exact ALB) — but the code as originally written computed `redirect_uri` from the ALB's own raw generated DNS name, which a live `curl` against `/` confirmed in the actual `/authorize` URL. Registering a domain in Okta that the running code never actually sends as `redirect_uri` is a guaranteed `redirect_uri mismatch` failure at every login attempt, not a cosmetic mismatch — this stack has no way to detect that mismatch itself (it doesn't validate DNS or call out to Okta at synth/deploy time), so it fails silently until a real login is attempted. `web_hostname` is deliberately a new, explicit, caller-supplied stack input (not derived from the ACM certificate's domain name, which could be a wildcard covering many possible hostnames, or from any AWS resource) — this project has consistently treated real-domain/DNS decisions as the caller's exclusive responsibility (decision #40) rather than something CDK should infer or guess. |
+
 ## 3. Architecture Overview
 
 ```
 User
   │
-  ├─ CLI REPL (cli/chat.py) ──────────┐
-  ├─ Local web UI (web/server.py) ────┤  boto3 bedrock-agentcore
-  └─ AgentCore console test chat      │  InvokeAgentRuntime (IAM/SigV4),
+  └─ Web UI (web/server.py), hosted on ECS Fargate behind a plain
+     (non-authenticating) ALB — the server itself runs the OIDC login
+     flow against Okta and issues its own KMS-encrypted session cookie
+     (or the AgentCore console's test chat, for a Runtime-only sanity check)
+                                       │
+                                       │  boto3 bedrock-agentcore
+                                       │  InvokeAgentRuntime (IAM/SigV4),
                                        │  streamed as SSE
                                        ▼
                           AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
@@ -127,16 +201,16 @@ User
                                        │                                  connector)                           Service wrapper)
                                        ▼
                        Streamed events: reasoning / text / tool_use /
-                       tool_result / done / error — CLI prints only the
-                       final markdown text; the web UI renders text live
-                       and (optionally) all events in a diagnostic panel.
+                       tool_result / done / error — the web UI renders text
+                       live and (optionally) all events in a diagnostic panel.
 ```
 
-The CLI and web UI share one client module (`cli/agent_client.py`) for
-building runtime session IDs and consuming the SSE stream, so both clients
-see identical event data — they only differ in how much of it they render.
-The web UI is a local-only process (see decision #19); it is not a fifth
-CDK stack.
+The web UI is the only client, using `agent_client.py` (`web/agent_client.py`
+as of the CLI removal, decision #48) for building runtime session IDs and
+consuming the SSE stream. `actor_id` reaches the invocation payload from
+`web/server.py`'s own verified Okta session (decision #58's `sub` claim,
+sanitized) — there is no other way to supply it now that the CLI (and its
+`--actor-id` flag) is gone.
 
 
 ## 4. Conversation Flow (v1)
@@ -160,16 +234,23 @@ CDK stack.
 ## 5. Out of Scope (v1) — Explicit Fast-Follows
 
 - Booking/payment integrations (flights, hotels, activities)
-- Structured JSON itinerary output / export (PDF, calendar) — the local web
-  UI (decision #19) is a manual-testing/demo surface, not this fast-follow;
-  it still only renders the same plain markdown output as the CLI/console.
-- A hosted/multi-user frontend for the web UI (decision #19/#30 — still
-  local-only per user, even after JWT auth (§2a) lets multiple distinct
-  people use it)
+- Structured JSON itinerary output / export (PDF, calendar) — the web UI
+  is a chat interface, not this fast-follow; it still only renders the
+  same plain markdown output the agent produces.
 - Integration/end-to-end automated tests
 - Cost budgets/billing alarms
 
-~~Cognito/JWT auth for non-AWS-credentialed clients~~ — **implemented, see
-§2a.** IAM auth (decision #15) has been fully replaced by Okta-issued JWT
-bearer tokens (decisions #26–35), not Cognito as originally anticipated
-here.
+~~Cognito/JWT auth for non-AWS-credentialed clients~~ — attempted, see
+§2a, then **reverted, see §2b decision #37.** IAM auth (decision #15) was
+replaced by Okta-issued JWT bearer tokens (decisions #26–35), then
+reverted back to IAM once `TravelAgentWebStack`'s OIDC-authenticated ALB
+became the real human-facing identity boundary, making the Runtime's own
+JWT authorizer redundant.
+
+~~A hosted/multi-user frontend for the web UI~~ — **implemented, see §2b.**
+`TravelAgentWebStack` hosts the web UI on ECS Fargate; it is now the only
+supported client (§2d — the local CLI REPL that existed alongside the
+local-only web UI, decision #19, has been removed entirely). Originally
+fronted by an OIDC-authenticated ALB (§2b decision #38); as of §2e, the
+ALB is a plain (non-authenticating) load balancer and the OIDC login flow
+runs inside `web/server.py` itself.

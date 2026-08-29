@@ -76,7 +76,7 @@
             </ResourceDescriptor>
           </mxCell>
         </object>
-        <object label="Local Web UI (web/server.py)" stencilType="server" id="web_ui">
+        <object label="Web UI (web/server.py), hosted on ECS Fargate&#xa;behind a plain ALB, runs its own Okta OIDC login" stencilType="server" id="web_ui">
           <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="241">
             <mxGeometry height="80" width="110" x="280" y="300" as="geometry" />
             <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-web_ui" serialization-version="v0" as="resourceDescriptor">
@@ -136,18 +136,6 @@
             </ResourceDescriptor>
           </mxCell>
         </object>
-        <object label="CLI REPL (cli/chat.py)" stencilType="client" id="cli_client">
-          <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="241">
-            <mxGeometry height="80" width="110" x="280" y="110" as="geometry" />
-            <ResourceDescriptor resource="urn:x-design-inspector:v1:genid-01MT52L7GD-cli_client" serialization-version="v0" as="resourceDescriptor">
-              <SemanticDataContainer serialization-version="v0">
-                <StringLiteral content="cli_client" property="https://ontology.security.amazon.dev/foundation/diagram-visualization/a2255956-c3df-4c2c-b489-c307f68abc97" />
-                <IRI resource="https://ontology.security.amazon.dev/design-inspector/components/e6d043be-f5dc-4b2c-8b88-c26c76f8c759" property="https://ontology.security.amazon.dev/foundation/system-modeling/04539597-4283-4f65-8090-ae67f9d3e949" />
-                <IRI resource="https://ontology.security.amazon.dev/foundation/graph-structure/0b4eeac8-04e5-4e85-869c-bd56fb947b7b" property="http://www.w3.org/1999/02/22-rdf-syntax-ns#type" />
-              </SemanticDataContainer>
-            </ResourceDescriptor>
-          </mxCell>
-        </object>
         <object label="User" stencilType="actor" id="user_actor">
           <mxCell assetTypeVersion="3" parent="1" rdfUpgraded="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="241">
             <mxGeometry height="50" width="50" x="20" y="220" as="geometry" />
@@ -166,16 +154,10 @@
         <mxCell id="edge_weather_lambda_open_meteo_1787445146598" edge="1" parent="1" source="weather_lambda" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="open_meteo" value="HTTPS">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="edge_user_actor_cli_client_1787445151015" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.15;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="cli_client">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
         <mxCell id="edge_user_actor_web_ui_1787445154301" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.85;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="web_ui">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="edge_user_actor_console_client_1787445157283" edge="1" parent="1" source="user_actor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;exitX=1;exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="console_client">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="edge_cli_client_agentcore_runtime_1787445161049" edge="1" parent="1" source="cli_client" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_runtime" value="IAM-authenticated invoke">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="edge_web_ui_agentcore_runtime_1787445164661" edge="1" parent="1" source="web_ui" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;" target="agentcore_runtime" value="IAM-authenticated invoke">

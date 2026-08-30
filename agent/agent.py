@@ -34,13 +34,12 @@ Auth: the Runtime is configured with IAM/SigV4 auth (DESIGN.md decision
 #37, reverting the Okta-JWT cutover of decisions #26-35) — every caller
 signs its own request with its own AWS credentials, and there is no bearer
 token to decode here. actor_id is instead read directly from the
-invocation payload (see get_actor_id() below) — the caller (the web
-container, deriving it from its ALB's verified OIDC claims; or the CLI,
-from a --actor-id flag) is trusted to supply the right value, the same way
-any other AgentCore Runtime IAM-authenticated caller is trusted with the
-payload it sends. This replaces the old "<actorId>___<sessionId>"
-runtime-session-id convention's actor_id half (the session_id half is
-unchanged; see parse_session_id()).
+invocation payload (see get_actor_id() below) — the caller (the hosted web
+UI's ECS task, deriving it from its ALB's verified OIDC claims) is trusted
+to supply the right value, the same way any other AgentCore Runtime
+IAM-authenticated caller is trusted with the payload it sends. This
+replaces the old "<actorId>___<sessionId>" runtime-session-id convention's
+actor_id half (the session_id half is unchanged; see parse_session_id()).
 
 A fresh MCPClient and Agent are built per request (not shared globally),
 following the documented safe pattern for AgentCore Runtime: it avoids
@@ -99,9 +98,9 @@ SUMMARIZATION_NAMESPACE = "/travel-agent/actor/{actorId}/session/{sessionId}/sum
 
 # Runtime session IDs follow the "<placeholder>___<sessionId>" convention
 # used across AgentCore Runtime samples. The placeholder component is
-# purely cosmetic (kept only so runtimeSessionId strings built by the CLI/
-# web UI still satisfy the ">=33 chars" / "<x>___<y>" format they were
-# already producing) — the real actor_id now comes from the payload (see
+# purely cosmetic (kept only so runtimeSessionId strings built by the web
+# UI still satisfy the ">=33 chars" / "<x>___<y>" format they were already
+# producing) — the real actor_id now comes from the payload (see
 # get_actor_id() below), not from this string.
 SESSION_ID_SEPARATOR = "___"
 DEFAULT_ACTOR_ID = "anonymous-traveler"
@@ -113,20 +112,18 @@ def get_actor_id(payload: dict) -> str:
     """Derive the actor_id for Memory scoping from the invocation payload.
 
     DESIGN.md decision #37: with IAM/SigV4 auth, the Runtime has no bearer
-    token to decode a `sub` claim from — the caller (the web container,
-    deriving this from its ALB's verified OIDC claims; the CLI, from a
-    --actor-id flag) is trusted to supply the correct actor_id directly in
-    the payload, the same way any IAM-authenticated caller's payload is
-    already trusted. This is a real trust shift from decision #31's
-    "derive server-side from a cryptographically verified token, never
-    from client input" stance — accepted because the callers that can
-    reach this Runtime at all are now either (a) this project's own web
-    container, sitting behind an OIDC-authenticated ALB that already did
-    real identity verification before the container ever sees the request,
-    or (b) a local CLI user invoking with their own AWS credentials, who
-    was already trusted with full IAM access to this Runtime to begin
-    with. There is no untrusted public path that can supply an arbitrary
-    actor_id — see DESIGN.md decision #37 for the full rationale.
+    token to decode a `sub` claim from — the caller (the hosted web UI's
+    ECS task, deriving this from its ALB's verified OIDC claims) is
+    trusted to supply the correct actor_id directly in the payload, the
+    same way any IAM-authenticated caller's payload is already trusted.
+    This is a real trust shift from decision #31's "derive server-side
+    from a cryptographically verified token, never from client input"
+    stance — accepted because the only caller that can reach this Runtime
+    at all is this project's own web UI's ECS task, sitting behind an
+    OIDC-authenticated ALB that already did real identity verification
+    before the container ever sees the request. There is no untrusted
+    public path that can supply an arbitrary actor_id — see DESIGN.md
+    decision #37 for the full rationale.
 
     The raw actor_id is sanitized before use as AgentCore Memory's
     actorId, not used verbatim — see sanitize_actor_id()'s docstring.
@@ -451,9 +448,9 @@ async def invoke(payload: dict, context: Any = None):
 
     Payload: {"prompt": "<user message>", "actor_id": "<caller-supplied id>"}
     "actor_id" is optional (falls back to DEFAULT_ACTOR_ID — see
-    get_actor_id()) but should always be supplied by a real caller: the web
-    container derives it from its ALB's verified OIDC claims, and the CLI
-    takes it from a --actor-id flag (DESIGN.md decision #37).
+    get_actor_id()) but should always be supplied by a real caller: the
+    hosted web UI's ECS task derives it from its ALB's verified OIDC claims
+    (DESIGN.md decision #37).
 
     Streams labeled diagnostic events as an SSE response — BedrockAgentCoreApp
     auto-detects that this is an async generator (confirmed against real

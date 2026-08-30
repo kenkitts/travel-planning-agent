@@ -90,6 +90,12 @@ class WebStack(Stack):
         oidc_token_endpoint: str,
         oidc_client_id: str,
         oidc_client_secret: str,
+        runtime_oidc_issuer: str,
+        runtime_oidc_token_endpoint: str,
+        runtime_oidc_client_id: str,
+        runtime_oidc_client_secret: str,
+        runtime_oidc_audience: str,
+        runtime_oidc_scope: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -169,6 +175,20 @@ class WebStack(Stack):
             secret_string_value=SecretValue.unsafe_plain_text(oidc_client_secret),
         )
         oidc_client_secret_resource.grant_read(task_role)
+
+        # Phase 2 auth rearchitecture: a second, independent Okta app's
+        # client secret — the dedicated "API Services" app configured for
+        # the Token Exchange grant type (DESIGN.md's Phase 2 decision),
+        # used to exchange a user's Okta access token for a Runtime-
+        # audienced JWT (web/auth.py's exchange_token_for_runtime()).
+        # Same secret-storage treatment as OidcClientSecret above, for the
+        # same reason: a real bearer credential, not a plain env var.
+        runtime_oidc_client_secret_resource = secretsmanager.Secret(
+            self,
+            "RuntimeOidcClientSecret",
+            secret_string_value=SecretValue.unsafe_plain_text(runtime_oidc_client_secret),
+        )
+        runtime_oidc_client_secret_resource.grant_read(task_role)
 
         task_definition = ecs.FargateTaskDefinition(
             self,
@@ -286,6 +306,18 @@ class WebStack(Stack):
                 redirect_uri,
                 "--session-cookie-kms-key-id",
                 session_cookie_key.key_id,
+                "--runtime-oidc-issuer",
+                runtime_oidc_issuer,
+                "--runtime-oidc-token-endpoint",
+                runtime_oidc_token_endpoint,
+                "--runtime-oidc-client-id",
+                runtime_oidc_client_id,
+                "--runtime-oidc-client-secret-arn",
+                runtime_oidc_client_secret_resource.secret_arn,
+                "--runtime-oidc-audience",
+                runtime_oidc_audience,
+                "--runtime-oidc-scope",
+                runtime_oidc_scope,
             ],
         )
 

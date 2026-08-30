@@ -81,6 +81,17 @@ def _make_okta_config() -> web_auth.OktaConfig:
     )
 
 
+def _make_runtime_oidc_config() -> web_auth.RuntimeOidcConfig:
+    return web_auth.RuntimeOidcConfig(
+        issuer="https://test.okta.com/runtime",
+        token_endpoint="https://test.okta.com/runtime/token",
+        client_id="test-exchange-client-id",
+        client_secret="test-exchange-client-secret",
+        audience="travel-agent-runtime",
+        scope="runtime:invoke",
+    )
+
+
 def _make_access_token(sub: str, expires_in_seconds: int = 3600) -> str:
     """A JWT-shaped Okta access token, matching auth.py's
     _sub_from_access_token() decode-without-verification assumption."""
@@ -102,6 +113,19 @@ def _make_session_cookie(codec: web_auth.SessionCookieCodec, sub: str, expired: 
         sub=sub,
     )
     return codec.encode(tokens)
+
+
+def _make_runtime_token_cookie(
+    codec: web_auth.RuntimeTokenCookieCodec, expired: bool = False
+) -> str:
+    """Directly build a valid (or already-expired) encrypted Runtime-token
+    cookie, bypassing a real token-exchange call — the fast path for
+    tests that need "a cached Runtime token already present"."""
+    token = web_auth.RuntimeToken(
+        access_token="test-runtime-jwt",
+        expires_at=(time.time() - 10) if expired else (time.time() + 3600),
+    )
+    return codec.encode(token)
 
 
 def _resource_not_found_error(operation_name: str) -> ClientError:
@@ -133,16 +157,22 @@ class _AppTestCase(unittest.TestCase):
     def _build_app(self, **extra_create_app_kwargs):
         self.okta_config = _make_okta_config()
         self.codec = web_auth.SessionCookieCodec(kms_key_id="test-key", kms_client=FakeKmsClient())
+        self.runtime_oidc_config = _make_runtime_oidc_config()
+        self.runtime_token_codec = web_auth.RuntimeTokenCookieCodec(
+            kms_key_id="test-key", kms_client=FakeKmsClient()
+        )
         kwargs = dict(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
             okta_config=self.okta_config,
             session_codec=self.codec,
+            runtime_oidc_config=self.runtime_oidc_config,
+            runtime_token_codec=self.runtime_token_codec,
         )
         kwargs.update(extra_create_app_kwargs)
         return web_server.create_app(**kwargs)
 
-    def _authed_client(self, app, sub="web-user") -> TestClient:
+    def _authed_client(self, app, sub="web-user", with_runtime_token=True) -> TestClient:
         """A TestClient pre-loaded with a valid session cookie for `sub`.
 
         base_url is explicitly HTTPS — the session cookie's Secure flag
@@ -150,11 +180,21 @@ class _AppTestCase(unittest.TestCase):
         default plain-http base_url, which looks like a missing-cookie/401
         failure but is actually a test-harness artifact, not a real auth
         bug (confirmed by comparing behavior with/without this fix).
+
+        with_runtime_token=True (default) also pre-loads a valid Runtime-
+        token cookie, so /api/chat tests don't perform a real (mocked)
+        exchange call unless they specifically want to exercise that path
+        — set False for tests that need to observe the exchange happening.
         """
         client = TestClient(app, base_url="https://testserver")
         client.cookies.set(
             web_auth.SESSION_COOKIE_NAME, _make_session_cookie(self.codec, sub)
         )
+        if with_runtime_token:
+            client.cookies.set(
+                web_auth.RUNTIME_TOKEN_COOKIE_NAME,
+                _make_runtime_token_cookie(self.runtime_token_codec),
+            )
         return client
 
     def setUp(self):
@@ -231,6 +271,182 @@ class SessionCookieCodecTests(unittest.TestCase):
             self.codec.decode(tampered)
 
 
+class RuntimeTokenCookieCodecTests(unittest.TestCase):
+    """Tests for the Phase 2 Runtime-token cookie's envelope-encryption
+    round trip — same _KmsEnvelopeCodec machinery as
+    SessionCookieCodecTests above, applied to RuntimeTokenCookieCodec's
+    smaller RuntimeToken payload. Kept as a genuinely separate cookie
+    from the session cookie (DESIGN.md's Phase 2 decision, driven by a
+    real measured cookie-size check) — this class only tests its own
+    codec, not any interaction with the session cookie."""
+
+    def setUp(self):
+        self.codec = web_auth.RuntimeTokenCookieCodec(kms_key_id="test-key", kms_client=FakeKmsClient())
+
+    def test_round_trips_runtime_token(self):
+        token = web_auth.RuntimeToken(access_token="runtime-jwt-abc", expires_at=1234567890.0)
+
+        cookie_value = self.codec.encode(token)
+        decoded = self.codec.decode(cookie_value)
+
+        self.assertEqual(decoded.access_token, "runtime-jwt-abc")
+        self.assertEqual(decoded.expires_at, 1234567890.0)
+
+    def test_rejects_malformed_cookie(self):
+        with self.assertRaises(web_auth.AuthError):
+            self.codec.decode("not-valid-base64url-json!!!")
+
+    def test_rejects_tampered_ciphertext(self):
+        token = web_auth.RuntimeToken(access_token="runtime-jwt-abc", expires_at=1234567890.0)
+        cookie_value = self.codec.encode(token)
+        tampered = cookie_value[:-4] + ("A" if cookie_value[-4] != "A" else "B") + cookie_value[-3:]
+
+        with self.assertRaises(web_auth.AuthError):
+            self.codec.decode(tampered)
+
+    def test_uses_a_genuinely_different_cookie_name_from_the_session_cookie(self):
+        # Regression guard for the actual design decision this class
+        # exists to implement — the two cookies must never collide.
+        self.assertNotEqual(web_auth.RUNTIME_TOKEN_COOKIE_NAME, web_auth.SESSION_COOKIE_NAME)
+
+
+class TokenExchangeTests(unittest.TestCase):
+    """Tests for exchange_token_for_runtime() (the raw RFC 8693 call to
+    Okta) and get_or_exchange_runtime_token() (the silent-re-exchange-on-
+    missing/expired orchestration) — independent of any FastAPI route."""
+
+    def setUp(self):
+        self.runtime_oidc_config = _make_runtime_oidc_config()
+        self.codec = web_auth.RuntimeTokenCookieCodec(kms_key_id="test-key", kms_client=FakeKmsClient())
+
+    def test_exchange_sends_rfc8693_grant_and_basic_auth(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": "exchanged-jwt",
+                "expires_in": 3600,
+            }
+            result = web_auth.exchange_token_for_runtime(self.runtime_oidc_config, "okta-access-token-abc")
+
+        self.assertEqual(result.access_token, "exchanged-jwt")
+        call_kwargs = mock_post.call_args.kwargs
+        self.assertEqual(call_kwargs["data"]["grant_type"], "urn:ietf:params:oauth:grant-type:token-exchange")
+        self.assertEqual(
+            call_kwargs["data"]["subject_token_type"], "urn:ietf:params:oauth:token-type:access_token"
+        )
+        self.assertEqual(call_kwargs["data"]["subject_token"], "okta-access-token-abc")
+        self.assertEqual(call_kwargs["data"]["scope"], "runtime:invoke")
+        self.assertEqual(call_kwargs["data"]["audience"], "travel-agent-runtime")
+        self.assertEqual(
+            call_kwargs["auth"], ("test-exchange-client-id", "test-exchange-client-secret")
+        )
+
+    def test_exchange_raises_auth_error_on_non_2xx(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = False
+            mock_post.return_value.status_code = 400
+            mock_post.return_value.text = "invalid_scope"
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.exchange_token_for_runtime(self.runtime_oidc_config, "okta-access-token-abc")
+
+    def test_exchange_raises_auth_error_on_network_failure(self):
+        import requests
+
+        with patch("auth.requests.post", side_effect=requests.RequestException("boom")):
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.exchange_token_for_runtime(self.runtime_oidc_config, "okta-access-token-abc")
+
+    def test_exchange_raises_auth_error_on_missing_fields(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {"expires_in": 3600}  # no access_token
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.exchange_token_for_runtime(self.runtime_oidc_config, "okta-access-token-abc")
+
+    def _fake_request(self, cookie_value: str = None):
+        request = MagicMock()
+        request.cookies = {web_auth.RUNTIME_TOKEN_COOKIE_NAME: cookie_value} if cookie_value else {}
+        return request
+
+    def test_uses_cached_token_when_still_valid(self):
+        cookie_value = _make_runtime_token_cookie(self.codec)
+        request = self._fake_request(cookie_value)
+
+        with patch("auth.requests.post") as mock_post:
+            context = web_auth.get_or_exchange_runtime_token(
+                request, self.codec, self.runtime_oidc_config, "okta-access-token-abc"
+            )
+
+        mock_post.assert_not_called()
+        self.assertFalse(context.exchanged)
+        self.assertEqual(context.access_token, "test-runtime-jwt")
+
+    def test_re_exchanges_when_cookie_missing(self):
+        request = self._fake_request(cookie_value=None)
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": "freshly-exchanged-jwt",
+                "expires_in": 3600,
+            }
+            context = web_auth.get_or_exchange_runtime_token(
+                request, self.codec, self.runtime_oidc_config, "okta-access-token-abc"
+            )
+
+        mock_post.assert_called_once()
+        self.assertTrue(context.exchanged)
+        self.assertEqual(context.access_token, "freshly-exchanged-jwt")
+
+    def test_re_exchanges_when_cookie_expired(self):
+        cookie_value = _make_runtime_token_cookie(self.codec, expired=True)
+        request = self._fake_request(cookie_value)
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": "freshly-exchanged-jwt",
+                "expires_in": 3600,
+            }
+            context = web_auth.get_or_exchange_runtime_token(
+                request, self.codec, self.runtime_oidc_config, "okta-access-token-abc"
+            )
+
+        mock_post.assert_called_once()
+        self.assertTrue(context.exchanged)
+
+    def test_re_exchanges_when_cookie_is_malformed(self):
+        request = self._fake_request(cookie_value="not-valid-base64url!!!")
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": "freshly-exchanged-jwt",
+                "expires_in": 3600,
+            }
+            context = web_auth.get_or_exchange_runtime_token(
+                request, self.codec, self.runtime_oidc_config, "okta-access-token-abc"
+            )
+
+        # A malformed/undecryptable cookie is never itself an auth
+        # failure here (DESIGN.md's Phase 2 decision) — it just triggers
+        # a fresh exchange, unlike a bad session cookie which raises.
+        mock_post.assert_called_once()
+        self.assertTrue(context.exchanged)
+
+    def test_exchange_failure_propagates_as_auth_error(self):
+        request = self._fake_request(cookie_value=None)
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = False
+            mock_post.return_value.status_code = 500
+            mock_post.return_value.text = "server_error"
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.get_or_exchange_runtime_token(
+                    request, self.codec, self.runtime_oidc_config, "okta-access-token-abc"
+                )
+
+
 class OAuthFlowTests(unittest.TestCase):
     """Tests for the real OIDC redirect + /oauth2/callback flow — the
     401-vs-redirect split, PKCE/state round-trip, and code exchange."""
@@ -242,11 +458,17 @@ class OAuthFlowTests(unittest.TestCase):
 
         self.okta_config = _make_okta_config()
         self.codec = web_auth.SessionCookieCodec(kms_key_id="test-key", kms_client=FakeKmsClient())
+        self.runtime_oidc_config = _make_runtime_oidc_config()
+        self.runtime_token_codec = web_auth.RuntimeTokenCookieCodec(
+            kms_key_id="test-key", kms_client=FakeKmsClient()
+        )
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
             okta_config=self.okta_config,
             session_codec=self.codec,
+            runtime_oidc_config=self.runtime_oidc_config,
+            runtime_token_codec=self.runtime_token_codec,
             memory_id="mem-123",
         )
         self.client = TestClient(self.app, follow_redirects=False, base_url="https://testserver")
@@ -361,11 +583,17 @@ class SessionRefreshTests(unittest.TestCase):
 
         self.okta_config = _make_okta_config()
         self.codec = web_auth.SessionCookieCodec(kms_key_id="test-key", kms_client=FakeKmsClient())
+        self.runtime_oidc_config = _make_runtime_oidc_config()
+        self.runtime_token_codec = web_auth.RuntimeTokenCookieCodec(
+            kms_key_id="test-key", kms_client=FakeKmsClient()
+        )
         self.app = web_server.create_app(
             agent_runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test",
             region="us-east-1",
             okta_config=self.okta_config,
             session_codec=self.codec,
+            runtime_oidc_config=self.runtime_oidc_config,
+            runtime_token_codec=self.runtime_token_codec,
         )
         self.client = TestClient(self.app, base_url="https://testserver")
 
@@ -448,12 +676,13 @@ class ChatEndpointTests(_AppTestCase):
         )
         mock_stream_agent_events.assert_called_once()
         call_args = mock_stream_agent_events.call_args.args
-        # stream_agent_events(agent_runtime_arn, region, runtime_session_id, prompt, actor_id, qualifier)
+        # stream_agent_events(agent_runtime_arn, region, runtime_session_id, prompt, actor_id, bearer_token, qualifier)
         self.assertEqual(call_args[0], "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test")
         self.assertEqual(call_args[1], "us-east-1")
         self.assertEqual(call_args[2], VALID_SESSION_ID)
         self.assertEqual(call_args[3], "Plan a trip to Boston")
         self.assertEqual(call_args[4], "web-user")
+        self.assertEqual(call_args[5], "test-runtime-jwt")
 
     @patch("web_server.stream_agent_events")
     def test_chat_strips_whitespace_from_prompt(self, mock_stream_agent_events):
@@ -517,6 +746,73 @@ class ChatEndpointTests(_AppTestCase):
         self.assertEqual(events[0], {"type": "text", "data": "partial "})
         self.assertEqual(events[-1]["type"], "error")
         self.assertIn("boom", events[-1]["data"]["note"])
+
+    @patch("web_server.stream_agent_events")
+    def test_chat_performs_fresh_exchange_when_no_runtime_token_cookie(
+        self, mock_stream_agent_events
+    ):
+        # This test's own client intentionally omits the Runtime-token
+        # cookie (unlike self.client from setUp, which _authed_client()
+        # pre-loads with one) — exercising the real "first Runtime call
+        # after login" path, where get_or_exchange_runtime_token() must
+        # perform a genuine exchange.
+        client = self._authed_client(self.app, with_runtime_token=False)
+        mock_stream_agent_events.return_value = iter([{"type": "done", "data": "ok"}])
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": "freshly-exchanged-jwt",
+                "expires_in": 3600,
+            }
+            response = client.post(
+                "/api/chat",
+                json={"prompt": "hello", "session_id": VALID_SESSION_ID},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_post.assert_called_once()
+        bearer_token_sent = mock_stream_agent_events.call_args.args[5]
+        self.assertEqual(bearer_token_sent, "freshly-exchanged-jwt")
+        self.assertIn(web_auth.RUNTIME_TOKEN_COOKIE_NAME, response.cookies)
+
+    @patch("web_server.stream_agent_events")
+    def test_chat_does_not_re_exchange_when_cached_runtime_token_is_valid(
+        self, mock_stream_agent_events
+    ):
+        # self.client (from setUp) already has a valid Runtime-token
+        # cookie pre-loaded via _authed_client()'s default
+        # with_runtime_token=True — no exchange call should happen.
+        mock_stream_agent_events.return_value = iter([{"type": "done", "data": "ok"}])
+
+        with patch("auth.requests.post") as mock_post:
+            response = self.client.post(
+                "/api/chat",
+                json={"prompt": "hello", "session_id": VALID_SESSION_ID},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_post.assert_not_called()
+        bearer_token_sent = mock_stream_agent_events.call_args.args[5]
+        self.assertEqual(bearer_token_sent, "test-runtime-jwt")
+
+    def test_chat_returns_502_when_token_exchange_fails(self):
+        client = self._authed_client(self.app, with_runtime_token=False)
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = False
+            mock_post.return_value.status_code = 400
+            mock_post.return_value.text = "invalid_scope"
+            response = client.post(
+                "/api/chat",
+                json={"prompt": "hello", "session_id": VALID_SESSION_ID},
+            )
+
+        # A token-exchange failure is a downstream-dependency failure
+        # (Okta's token endpoint), not a session-invalid failure — 502,
+        # not 401/redirect (DESIGN.md's Phase 2 decision).
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Runtime access token", response.json()["detail"])
 
     def test_config_endpoint_reports_history_disabled_by_default(self):
         # /api/config is intentionally unauthenticated (see server.py) —

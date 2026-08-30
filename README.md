@@ -15,10 +15,13 @@ there is no CLI or other standalone client.
 Web UI (web/server.py), hosted on ECS Fargate behind a plain ALB —
 the server itself runs the OIDC login flow against Okta and issues
 its own KMS-encrypted session cookie
-   │  IAM/SigV4 InvokeAgentRuntime (via web/agent_client.py)
+   │  InvokeAgentRuntime (via web/agent_client.py) — IAM/SigV4 by
+   │  default, or a JWT bearer token (RFC 8693 token-exchanged from
+   │  the user's own Okta session) once TravelAgentRuntimeStack's
+   │  optional Okta config is set — see "Authentication" below
    │  actor_id passed explicitly in the payload
    ▼
-AgentCore Runtime (IAM auth)  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
+AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
    │                                   │
    │                                   ├─▶ AgentCore Memory (short-term events +
    │                                   │    long-term traveler preferences /
@@ -88,9 +91,18 @@ single-user tool without its own real Okta app configuration — see
 "Hosting the Web UI" below.
 
 The Runtime itself is IAM/SigV4-authenticated (`InvokeAgentRuntime`, via
-boto3) — there is no separate identity provider or bearer-token flow for
-the Runtime. `TravelAgentWebStack`'s ECS task calls it with its own IAM
-role; there is no other caller.
+boto3) by default — there is no separate identity provider or bearer-
+token flow for the Runtime unless the optional `WEB_RUNTIME_OIDC_*`
+configuration is set (see "Hosting the Web UI" below), in which case the
+web server exchanges each logged-in user's own Okta access token for a
+Runtime-audienced JWT (RFC 8693 OAuth 2.0 Token Exchange) and presents
+that instead — AWS's own docs confirm a Runtime can accept either
+IAM/SigV4 or JWT bearer tokens, never both at once, so configuring this
+fully replaces IAM access to that Runtime, and boto3 can no longer be
+used to invoke it (`web/agent_client.py` makes a raw HTTPS call with an
+`Authorization: Bearer` header instead). Without that config,
+`TravelAgentWebStack`'s ECS task calls the Runtime with its own IAM role
+and there is no other caller.
 
 ## Setup
 
@@ -168,6 +180,9 @@ python web/server.py --agent-runtime-arn <runtime-arn> --memory-id <memory-id> \
     --oidc-authorization-endpoint <url> --oidc-token-endpoint <url> \
     --oidc-client-id <id> --oidc-client-secret-arn <secrets-manager-arn> \
     --oidc-redirect-uri <url> --session-cookie-kms-key-id <key-id> \
+    --runtime-oidc-issuer <issuer> --runtime-oidc-token-endpoint <url> \
+    --runtime-oidc-client-id <id> --runtime-oidc-client-secret-arn <secrets-manager-arn> \
+    --runtime-oidc-audience <audience> --runtime-oidc-scope <scope> \
     --host 127.0.0.1
 ```
 
@@ -210,7 +225,13 @@ Scope/non-goals for the web UI:
 You can also test the deployed Runtime directly from the **AgentCore
 console's test chat**, bypassing the web UI (and its OIDC-derived
 `actor_id`) entirely — useful for a quick sanity check that the Runtime
-itself is healthy.
+itself is healthy. **This only works when the Runtime is IAM-authorized
+(the default)** — the console's test chat itself requires a valid JWT
+for console access, and AWS's own docs confirm a Runtime can only accept
+either IAM/SigV4 or JWT bearer tokens, never both. Once `WEB_RUNTIME_OIDC_*`
+is configured (see "Hosting the Web UI" below), this Runtime switches to
+JWT-only auth and the console's test chat stops working for it (confirmed
+live) — the web UI becomes the only way to exercise the Runtime.
 
 ## Hosting the Web UI
 

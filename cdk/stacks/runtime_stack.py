@@ -5,17 +5,29 @@ AgentCore Runtime. Bundling pip-installs agent/requirements.txt into the
 asset before upload, matching the standard Lambda-style dependency bundling
 pattern since AgentRuntimeArtifact.from_code_asset does not do this itself.
 
-Auth is IAM/SigV4 (RuntimeAuthorizerConfiguration.using_iam()) — this is a
-reversion of the Okta-JWT cutover from DESIGN.md decisions #26-35 (decision
-#37 in DESIGN.md explains why): once TravelAgentWebStack's OIDC-authenticated
-ALB became the human-facing identity boundary, the Runtime's own JWT
-authorizer was redundant plumbing rather than a second real trust boundary,
-and it could not be reused for the CLI's local/dev use case at all (there's
-no ALB in front of the CLI). actor_id is now passed explicitly in the
-invocation payload (see agent/agent.py's get_actor_id()) by whichever
-caller already knows who the user is — the web container (from the ALB's
-verified OIDC claims) or the CLI (from a --actor-id flag) — rather than
+Auth is IAM/SigV4 (RuntimeAuthorizerConfiguration.using_iam()) by default —
+this is a reversion of the Okta-JWT cutover from DESIGN.md decisions #26-35
+(decision #37 in DESIGN.md explains why): once TravelAgentWebStack's OIDC-
+authenticated ALB became the human-facing identity boundary, the Runtime's
+own JWT authorizer was redundant plumbing rather than a second real trust
+boundary. actor_id was passed explicitly in the invocation payload (see
+agent/agent.py's get_actor_id()) by the web UI's ECS task, which already
+knew who the user was from the ALB's verified OIDC claims — rather than
 being derived from a bearer token inside the Runtime.
+
+Phase 2 (auth rearchitecture, added after Phase 1's ALB removal): auth
+switches to JWT Bearer Token (RuntimeAuthorizerConfiguration.using_jwt())
+when runtime_oidc_discovery_url is provided to this stack's constructor —
+still IAM by default when omitted, preserving this stack's standalone
+deployability (no Okta prerequisite) for use cases like testing the
+Runtime directly via the AgentCore console. AWS's own docs confirm this
+is a hard, mutually-exclusive switch, not an additive one: "An AgentCore
+Runtime can support either IAM SigV4 or JWT Bearer Token based inbound
+auth, but not both simultaneously." When JWT is configured, the caller
+(TravelAgentWebStack's web server) must present a Runtime-audienced JWT
+obtained via RFC 8693 Token Exchange (see web/auth.py's
+exchange_token_for_runtime()) instead of SigV4-signing the call — see
+DESIGN.md's Phase 2 section for the full design.
 
 The agent process reads its Gateway URL and Memory ID from environment
 variables (GATEWAY_URL, MEMORY_ID) — this stack wires those from the
@@ -53,7 +65,8 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-5"
 
 
 class RuntimeStack(Stack):
-    """AgentCore Runtime hosting the travel planning agent, IAM auth."""
+    """AgentCore Runtime hosting the travel planning agent, IAM auth by
+    default (JWT auth when Okta config is provided — see module docstring)."""
 
     def __init__(
         self,
@@ -62,6 +75,10 @@ class RuntimeStack(Stack):
         *,
         gateway: agentcore.IGateway,
         memory: agentcore.IMemory,
+        runtime_oidc_discovery_url: str | None = None,
+        runtime_oidc_allowed_audience: list[str] | None = None,
+        runtime_oidc_allowed_clients: list[str] | None = None,
+        runtime_oidc_allowed_scopes: list[str] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -100,12 +117,25 @@ class RuntimeStack(Stack):
             runtime_name="travel_planning_agent",
             description="Strands travel planning agent (itinerary builder).",
             agent_runtime_artifact=agent_runtime_artifact,
-            # IAM/SigV4 auth (DESIGN.md decision #37, reverting decisions
-            # #26-35's Okta JWT cutover) — every caller (the CLI, and now
-            # TravelAgentWebStack's ECS task) invokes InvokeAgentRuntime
-            # with its own AWS credentials, SigV4-signed. There is no
-            # bearer-token forwarding to configure.
-            authorizer_configuration=agentcore.RuntimeAuthorizerConfiguration.using_iam(),
+            # Auth is IAM/SigV4 by default (DESIGN.md decision #37,
+            # reverting decisions #26-35's Okta JWT cutover) — switches to
+            # JWT Bearer Token auth (DESIGN.md's Phase 2 decision) only
+            # when runtime_oidc_discovery_url is explicitly provided. This
+            # is a hard, mutually-exclusive switch, not additive — AWS's
+            # own docs confirm "An AgentCore Runtime can support either
+            # IAM SigV4 or JWT Bearer Token based inbound auth, but not
+            # both simultaneously" — so RuntimeStack keeps IAM as the
+            # default rather than requiring every deployment to configure
+            # Okta, preserving this stack's existing standalone
+            # deployability (e.g. testing the Runtime directly via the
+            # AgentCore console, with no web-hosting/Okta prerequisites
+            # at all — see README's "Web UI" section).
+            authorizer_configuration=self._build_authorizer_configuration(
+                runtime_oidc_discovery_url,
+                runtime_oidc_allowed_audience,
+                runtime_oidc_allowed_clients,
+                runtime_oidc_allowed_scopes,
+            ),
             environment_variables={
                 "GATEWAY_URL": gateway.gateway_url,
                 "MEMORY_ID": memory.memory_id,
@@ -162,3 +192,41 @@ class RuntimeStack(Stack):
         # Grant the Runtime's execution role permission to read/write
         # AgentCore Memory (short-term events + long-term retrieval).
         memory.grant_full_access(self.runtime)
+
+    @staticmethod
+    def _build_authorizer_configuration(
+        discovery_url: str | None,
+        allowed_audience: list[str] | None,
+        allowed_clients: list[str] | None,
+        allowed_scopes: list[str] | None,
+    ) -> agentcore.RuntimeAuthorizerConfiguration:
+        """IAM (default) unless discovery_url is provided, then JWT.
+
+        discovery_url alone is the switch — allowed_audience/allowed_clients/
+        allowed_scopes are optional refinements once JWT is selected (the
+        JWT authorizer itself requires at least one of allowed_audience/
+        allowed_clients/allowed_scopes/custom_claims to be set — enforced
+        by AgentCore, not re-validated here).
+
+        allowed_clients validates a `client_id` claim that this project's
+        Okta org does not actually populate on its issued tokens — Okta
+        places the client identifier in a `cid` claim instead (confirmed
+        live twice now: once during the original, later-reverted Okta-JWT
+        cutover — decisions #26-35 — and again during Phase 2's RFC 8693
+        token-exchange rollout, where a real exchanged token was rejected
+        with "Claim 'client_id' value mismatch with configuration" even
+        though `allowedAudience`/`allowedScopes` both matched correctly).
+        `RuntimeStack`'s own callers (cdk/app.py) do not pass
+        allowed_clients at all as of that second fix — this parameter is
+        kept here only so a caller who *has* confirmed their own Okta org
+        populates a real `client_id` claim can still use it; DO NOT wire
+        WEB_RUNTIME_OIDC_CLIENT_ID into this parameter by default again.
+        """
+        if discovery_url is None:
+            return agentcore.RuntimeAuthorizerConfiguration.using_iam()
+        return agentcore.RuntimeAuthorizerConfiguration.using_jwt(
+            discovery_url=discovery_url,
+            allowed_clients=allowed_clients,
+            allowed_audience=allowed_audience,
+            allowed_scopes=allowed_scopes,
+        )

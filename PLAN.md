@@ -1108,6 +1108,127 @@ tests) after both deploys:
   session → `401` in both cases — the fetch()-vs-navigation split (decision
   #56) working as designed against real traffic, not just the test suite.
 
+## Phase 13 — Auth rearchitecture Phase 2: RFC 8693 token exchange replaces IAM/SigV4 for the Runtime (added 2026-08-29)
+
+See DESIGN.md §2f (decisions #63-75) for the full design rationale and
+the two AWS-documentation findings that reshaped this phase mid-design
+(JWT/IAM inbound auth are mutually exclusive per-Runtime, and boto3
+cannot invoke a JWT-authorized Runtime at all).
+
+### What was built
+- `web/auth.py`: `RuntimeOidcConfig`/`RuntimeToken` dataclasses,
+  `exchange_token_for_runtime()` (real RFC 8693 call to a dedicated Okta
+  "API Services" app), a second, independent KMS-envelope-encrypted
+  cookie (`RUNTIME_TOKEN_COOKIE_NAME`, via `RuntimeTokenCookieCodec` —
+  `SessionCookieCodec`'s envelope logic was refactored into a shared
+  `_KmsEnvelopeCodec` base so both cookies use the identical scheme
+  without duplicating it), and `get_or_exchange_runtime_token()`
+  (silent re-exchange on a missing/expired/malformed Runtime-token
+  cookie — never itself an auth failure, per decision #69).
+- `web/agent_client.py`: `stream_agent_events()` fully rewritten —
+  `boto3.client('bedrock-agentcore').invoke_agent_runtime()` replaced
+  with a raw `requests.post()` to the documented direct-Runtime HTTPS
+  invocation URL, `Authorization: Bearer` header, manual SSE-body
+  parsing (same yielded event shape as before). Gained a new required
+  `bearer_token` parameter.
+- `web/server.py`: `/api/chat` — and only `/api/chat`, per decision
+  #70 — now resolves a Runtime-audienced JWT before invoking the agent,
+  writes back a refreshed Runtime-token cookie when a fresh exchange
+  happened, and returns a clean `502` (not a 401/redirect) on a genuine
+  exchange failure (decision #71).
+- `cdk/stacks/runtime_stack.py`: JWT authorizer support added as fully
+  **optional** (decision #75) — `using_iam()` remains the default;
+  `using_jwt(...)` only when `runtime_oidc_discovery_url` is passed in.
+- `cdk/stacks/web_stack.py`: 6 new required constructor parameters for
+  the exchange app's config, a second Secrets Manager secret
+  (`RuntimeOidcClientSecret`) for its client secret (mirroring Phase
+  1's `OidcClientSecret` pattern exactly), 6 new `--runtime-oidc-*`
+  container command args.
+- `cdk/app.py`: derives the Runtime's `discovery_url` from
+  `WEB_RUNTIME_OIDC_ISSUER` + `/.well-known/openid-configuration`
+  (Okta's discovery-URL convention); `RuntimeStack`'s new JWT config is
+  entirely independent of `WEB_CERTIFICATE_ARN`/`WebStack` being
+  deployed at all (decision #75); `WebStack`'s own `required_web_vars`
+  gained the 6 new `WEB_RUNTIME_OIDC_*` keys as required-together-with
+  the rest of `WEB_*`.
+- `.env`/`.env.template`: new `WEB_RUNTIME_OIDC_*` block, using the same
+  `{issuer}/v1/token` derivation convention already confirmed against
+  Phase 1's own `WEB_OIDC_TOKEN_ENDPOINT`.
+- Test suite: 163/163 passing (was 144 before this phase) — new
+  `RuntimeTokenCookieCodecTests`, `TokenExchangeTests`, three new
+  `/api/chat` integration tests (fresh-exchange, cached-token-reuse,
+  exchange-failure-502), and a full rewrite of `test_agent_client.py`
+  to mock `requests.post` instead of `boto3.client`.
+
+### Verified
+- `cdk synth TravelAgentRuntimeStack TravelAgentWebStack` against the
+  **real** `.env` (not dummy values) — confirmed via direct JSON
+  inspection of the synthesized templates: `AWS::BedrockAgentCore::Runtime`'s
+  `AuthorizerConfiguration.CustomJWTAuthorizer` has the exact real
+  `AllowedAudience`/`AllowedClients`/`AllowedScopes`/`DiscoveryUrl`;
+  `WebStack` has the new `RuntimeOidcClientSecret` resource, all 6 new
+  `--runtime-oidc-*` container args with correct real values, and
+  `secretsmanager:GetSecretValue` IAM permission for the task role.
+- Full test suite: 163 passed, 0 failed.
+
+### Remaining manual steps
+1. ~~`cdk deploy TravelAgentRuntimeStack TravelAgentWebStack`~~ — **done**
+   (2026-08-29), with explicit user confirmation beforehand. Both
+   stacks reached `UPDATE_COMPLETE`; confirmed via `describe-target-health`
+   that the new ECS task is healthy and the old one drained; confirmed
+   via CloudWatch logs that the container booted cleanly with all the
+   new required `--runtime-oidc-*` args (`Application startup complete`,
+   no argparse failures) and was already serving real traffic
+   (`/api/config` 200s from the ALB health check, plus the live `curl`
+   verification below).
+2. Live verification after deploy via `curl` (not yet a real browser
+   login) confirmed Phase 1 behavior is completely unaffected:
+   unauthenticated `/api/config` → `200`, unauthenticated navigation to
+   `/` → `302` to Okta, unauthenticated `/api/whoami` → `401`. **Not yet
+   verified**: a real end-to-end `/api/chat` call (real login → real
+   token exchange → real bearer-token `InvokeAgentRuntime` call → a
+   real streamed response) — this requires a real browser login and has
+   not been done yet; `curl` alone cannot exercise it (no real Okta
+   session cookie to present).
+3. ~~Consider testing the Runtime directly via the AgentCore console's
+   test chat~~ — **confirmed regression** (user-reported, 2026-08-29):
+   the AgentCore console's test-chat feature does require a valid JWT
+   for console access and no longer works for this Runtime now that its
+   authorizer is JWT-only — exactly the risk this step flagged before
+   deploy, now confirmed rather than hypothetical. This is an accepted,
+   known consequence of decision #63's opening AWS-docs finding (IAM and
+   JWT inbound auth are mutually exclusive per-Runtime), not a bug to
+   fix — the README's documented use case of testing the Runtime
+   directly via the console (bypassing the web UI) is no longer
+   available for this Runtime once `WEB_RUNTIME_OIDC_*` is configured.
+   If this console-testing capability needs to be restored, the only
+   options are: (a) revert this Runtime to IAM-only (undoes Phase 2
+   entirely for this Runtime), or (b) obtain a valid JWT some other way
+   to use in the console (e.g. minted via the same Okta token-exchange
+   app, manually) — neither has been requested or built.
+4. ~~Verify a real end-to-end `/api/chat` call~~ — **in progress, found
+   and fixed two real bugs along the way** (DESIGN.md decisions #76-77):
+   - A real login + real chat attempt first failed at the token-exchange
+     step itself: Okta rejected the exchange with `invalid_dpop_proof`
+     (DPoP/RFC 9449 was required on the exchange app — an unrelated,
+     separate app-level Okta setting, not anything this phase's design
+     covered). User disabled it in the Okta Admin Console; no code
+     change needed.
+   - The next real attempt got past token exchange but failed at
+     `InvokeAgentRuntime` itself: `401 Claim 'client_id' value mismatch`
+     — the *same* `cid`-vs-`client_id` real-token-shape mismatch this
+     project already hit once before (see the original, later-reverted
+     Okta-JWT cutover's own post-implementation fix, above). Fixed by
+     removing `allowed_clients` from `RuntimeStack`'s JWT authorizer
+     config entirely — `cdk/app.py` no longer wires
+     `WEB_RUNTIME_OIDC_CLIENT_ID` into it; validation now relies solely
+     on `allowedAudience`/`allowedScopes`. Redeployed
+     `TravelAgentRuntimeStack` with this fix.
+   - **Confirmed working end-to-end** (user-reported, 2026-08-29): a
+     real login → real token exchange → real bearer-token
+     `InvokeAgentRuntime` call → a real streamed agent response, all
+     succeeding. Phase 2 is fully live and verified.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

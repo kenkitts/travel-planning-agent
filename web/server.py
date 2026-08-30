@@ -71,12 +71,16 @@ from auth import (
     AuthContext,
     AuthError,
     OktaConfig,
+    RuntimeOidcConfig,
+    RuntimeTokenCookieCodec,
     SessionCookieCodec,
     apply_refreshed_cookie_if_needed,
+    apply_runtime_token_cookie_if_needed,
     clear_pending_login_cookie,
     clear_session_cookie,
     decode_pending_login,
     exchange_code_for_tokens,
+    get_or_exchange_runtime_token,
     get_or_refresh_session,
     is_browser_navigation,
     redirect_to_login,
@@ -335,6 +339,8 @@ def create_app(
     region: str,
     okta_config: OktaConfig,
     session_codec: SessionCookieCodec,
+    runtime_oidc_config: RuntimeOidcConfig,
+    runtime_token_codec: RuntimeTokenCookieCodec,
     qualifier: Optional[str] = None,
     memory_id: Optional[str] = None,
 ) -> FastAPI:
@@ -342,6 +348,9 @@ def create_app(
 
     `okta_config`/`session_codec` back every protected route's identity
     resolution — see auth.py for the full OIDC + session-cookie design.
+    `runtime_oidc_config`/`runtime_token_codec` back /api/chat's own,
+    separate Runtime-token exchange + cookie (Phase 2 — see auth.py's
+    module docstring and DESIGN.md's Phase 2 section).
     """
     # Memory access (ListSessions/ListEvents/CreateEvent/DeleteEvent) and
     # Runtime invocation both use this process's own IAM role — the ECS
@@ -472,8 +481,32 @@ def create_app(
         request's own verified session cookie (not cached from startup),
         so a long-running container correctly serves multiple distinct
         users without mixing up whose Memory a turn should read/write.
+
+        Phase 2: this is the only route that resolves a Runtime-audienced
+        JWT (via auth.get_or_exchange_runtime_token()) — /api/whoami and
+        the conversation-history endpoints talk to AgentCore Memory
+        directly via this process's own IAM role and have no reason to
+        ever need it (DESIGN.md's Phase 2 decision). The exchange is
+        resolved *before* the streaming response starts, so a genuine
+        exchange failure (Okta's token endpoint down, misconfigured
+        scope/audience) can still surface as a clean 502 rather than only
+        being expressible as an in-band SSE error event after a 200 has
+        already gone out.
         """
-        actor_id = _actor_id(request, response)
+        context = _resolve_auth(request)
+        apply_refreshed_cookie_if_needed(response, context, session_codec)
+        actor_id = _sanitize_actor_id(context.sub)
+
+        try:
+            runtime_token_context = get_or_exchange_runtime_token(
+                request, runtime_token_codec, runtime_oidc_config, context.tokens.access_token
+            )
+        except AuthError as e:
+            raise HTTPException(
+                status_code=502, detail=f"Failed to obtain a Runtime access token: {e}"
+            ) from e
+        apply_runtime_token_cookie_if_needed(response, runtime_token_context, runtime_token_codec)
+        bearer_token = runtime_token_context.access_token
 
         prompt = body.prompt.strip()
         if not prompt:
@@ -491,22 +524,29 @@ def create_app(
         def _event_stream():
             try:
                 for event in stream_agent_events(
-                    agent_runtime_arn, region, body.session_id, prompt, actor_id, qualifier
+                    agent_runtime_arn,
+                    region,
+                    body.session_id,
+                    prompt,
+                    actor_id,
+                    bearer_token,
+                    qualifier,
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except RuntimeError as e:
-                # A transport-level failure (a boto3 ClientError, malformed
-                # SSE from the Runtime) discovered mid-stream — the
-                # response has already started with a 200, so this can't
-                # become an HTTPException; forward it as one more in-band
-                # error event instead, matching the shape of an
+                # A transport-level failure (an HTTP/network error,
+                # malformed SSE from the Runtime) discovered mid-stream —
+                # the response has already started with a 200, so this
+                # can't become an HTTPException; forward it as one more
+                # in-band error event instead, matching the shape of an
                 # agent-raised error event.
                 yield f"data: {json.dumps({'type': 'error', 'data': {'note': str(e)}})}\n\n"
 
         # response's headers (including any Set-Cookie from a just-
-        # performed refresh, see _actor_id() above) are carried onto this
-        # StreamingResponse — FastAPI merges a dependency-injected
-        # Response's headers onto whatever the route actually returns.
+        # performed session and/or Runtime-token refresh, see above) are
+        # carried onto this StreamingResponse — FastAPI merges a
+        # dependency-injected Response's headers onto whatever the route
+        # actually returns.
         streaming_response = StreamingResponse(
             _event_stream(),
             media_type="text/event-stream",
@@ -796,7 +836,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="KMS key ID (or ARN) used to envelope-encrypt the session "
         "cookie (see web/auth.py's SessionCookieCodec and "
-        "cdk/stacks/web_stack.py's SessionCookieKey resource).",
+        "cdk/stacks/web_stack.py's SessionCookieKey resource). Also used "
+        "to encrypt the separate Runtime-token cookie (see "
+        "--runtime-oidc-* below) — same KMS key, same encrypt/decrypt "
+        "pattern, two independent cookies (DESIGN.md's Phase 2 decision).",
+    )
+    parser.add_argument(
+        "--runtime-oidc-issuer",
+        required=True,
+        help="Issuer URL of the Token-Exchange app's Okta authorization "
+        "server (documentation/debugging context only — not sent in the "
+        "exchange request itself; see RuntimeOidcConfig in web/auth.py).",
+    )
+    parser.add_argument(
+        "--runtime-oidc-token-endpoint",
+        required=True,
+        help="Okta's /token endpoint for the dedicated 'API Services' "
+        "app used for RFC 8693 Token Exchange, exchanging a user's Okta "
+        "access token for a Runtime-audienced JWT (DESIGN.md's Phase 2 "
+        "auth rearchitecture decision) — a different Okta authorization "
+        "server than --oidc-issuer/--oidc-token-endpoint above.",
+    )
+    parser.add_argument(
+        "--runtime-oidc-client-id",
+        required=True,
+        help="Client ID of the dedicated Token-Exchange 'API Services' "
+        "Okta app (Advanced grant type: Token Exchange).",
+    )
+    parser.add_argument(
+        "--runtime-oidc-client-secret-arn",
+        required=True,
+        help="Secrets Manager ARN of the Token-Exchange app's client "
+        "secret (see cdk/stacks/web_stack.py's RuntimeOidcClientSecret "
+        "resource) — never passed as a plain CLI argument or environment "
+        "variable.",
+    )
+    parser.add_argument(
+        "--runtime-oidc-audience",
+        required=True,
+        help="The RFC 8693 'audience' value requested during token "
+        "exchange — must match this Runtime's own JWT authorizer "
+        "allowed_audience (see cdk/stacks/runtime_stack.py).",
+    )
+    parser.add_argument(
+        "--runtime-oidc-scope",
+        required=True,
+        help="The RFC 8693 'scope' value requested during token exchange "
+        "(a custom Okta scope, e.g. 'runtime:invoke') — must match this "
+        "Runtime's own JWT authorizer allowed_scopes.",
     )
     parser.add_argument(
         "--region",
@@ -865,11 +952,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     session_codec = SessionCookieCodec(kms_key_id=args.session_cookie_kms_key_id)
 
+    runtime_oidc_client_secret = _fetch_secret_value(
+        args.runtime_oidc_client_secret_arn, args.region
+    )
+    runtime_oidc_config = RuntimeOidcConfig(
+        issuer=args.runtime_oidc_issuer,
+        token_endpoint=args.runtime_oidc_token_endpoint,
+        client_id=args.runtime_oidc_client_id,
+        client_secret=runtime_oidc_client_secret,
+        audience=args.runtime_oidc_audience,
+        scope=args.runtime_oidc_scope,
+    )
+    runtime_token_codec = RuntimeTokenCookieCodec(kms_key_id=args.session_cookie_kms_key_id)
+
     app = create_app(
         agent_runtime_arn=args.agent_runtime_arn,
         region=args.region,
         okta_config=okta_config,
         session_codec=session_codec,
+        runtime_oidc_config=runtime_oidc_config,
+        runtime_token_codec=runtime_token_codec,
         qualifier=args.qualifier,
         memory_id=args.memory_id,
     )

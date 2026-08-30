@@ -16,9 +16,12 @@ now sets up:
     tokens in a single, KMS-envelope-encrypted cookie. This keeps the
     Fargate tasks stateless — any task can serve any request, since
     nothing about a session lives server-side.
-  - The AgentCore Runtime's own authorizer remains IAM/SigV4 (RuntimeStack,
-    decision #37, unchanged by this phase) — this stack's Fargate task
-    still calls InvokeAgentRuntime with its own IAM role.
+  - The AgentCore Runtime's own authorizer is switched to JWT Bearer
+    Token auth (RuntimeStack, DESIGN.md's Phase 2 auth rearchitecture
+    decision) whenever this stack's WEB_RUNTIME_OIDC_* config is present
+    — this stack's Fargate task exchanges each user's Okta access token
+    for a Runtime-audienced JWT (RFC 8693, web/auth.py) and presents
+    that instead of calling InvokeAgentRuntime with its own IAM role.
 
 Networking: a dedicated VPC (2 AZs, public + private-with-egress subnets,
 one NAT Gateway per AZ) — self-contained rather than depending on any
@@ -126,16 +129,22 @@ class WebStack(Stack):
         # Task role: the container's own AWS credentials at runtime (ECS
         # injects these via the task metadata endpoint — no static keys in
         # the image or environment). Tightly scoped to the exact Memory
-        # and Runtime ARNs this deployment uses (DESIGN.md decision #37) —
-        # no wildcards, matching this project's existing least-privilege
+        # ARN this deployment uses (DESIGN.md decision #37) — no
+        # wildcards, matching this project's existing least-privilege
         # convention (e.g. GatewayStack's _grant_web_search_invoke()).
+        # No `runtime.grant_invoke()` here — this task role never calls
+        # InvokeAgentRuntime itself; the web server presents a Runtime-
+        # audienced JWT instead (RFC 8693 token exchange, DESIGN.md's
+        # Phase 2 decision), and AWS's own docs confirm IAM/SigV4 and JWT
+        # inbound auth are mutually exclusive per-Runtime, so an IAM grant
+        # here would be dead permission once WEB_RUNTIME_OIDC_* (always
+        # required for this stack) switches the Runtime to JWT-only auth.
         task_role = iam.Role(
             self,
             "WebTaskRole",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
         memory.grant_full_access(task_role)
-        runtime.grant_invoke(task_role)
 
         # Envelope-encryption key for the session cookie (web/auth.py's
         # SessionCookieCodec) — replaces the ALB's own signing keypair now

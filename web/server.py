@@ -11,8 +11,10 @@ single, KMS-envelope-encrypted cookie this server issues, reads, and
 transparently refreshes.
 
 Serves a small chat UI and a streaming API that invokes the deployed
-AgentCore Runtime agent via IAM/SigV4 (`agent_client.py`, in this same
-directory — DESIGN.md decision #37, unchanged by this phase), plus
+AgentCore Runtime agent via a JWT bearer token, RFC 8693-exchanged from
+this server's own verified Okta session (`agent_client.py`/`auth.py`,
+this same directory — DESIGN.md's Phase 2 auth rearchitecture decision;
+this reverts decision #37's original IAM/SigV4 choice), plus
 read-only endpoints that list and replay past conversations directly from
 AgentCore Memory (no separate local storage — Memory is the source of
 truth).
@@ -43,11 +45,14 @@ Usage:
         --oidc-redirect-uri <url> --session-cookie-kms-key-id <key-id> \\
         [--region <region>] [--qualifier <qualifier>] [--port <port>]
 
-Auth: see auth.py for the full OIDC flow, session-cookie encryption, and
-refresh logic. AWS credentials for Memory access, Runtime invocation, and
-the session cookie's KMS/Secrets Manager calls all come from this
-process's own IAM role (the ECS task role in the hosted deployment; your
-local credentials if run outside ECS for testing).
+Auth: see auth.py for the full OIDC flow, session-cookie encryption,
+refresh logic, and the Phase 2 RFC 8693 Runtime-token exchange. AWS
+credentials for Memory access and the session/Runtime-token cookies'
+KMS/Secrets Manager calls come from this process's own IAM role (the ECS
+task role in the hosted deployment; your local credentials if run
+outside ECS for testing) — but Runtime invocation itself (agent_client.py)
+no longer uses that IAM role at all; it presents the exchanged JWT
+bearer token instead (DESIGN.md's Phase 2 decision).
 """
 import argparse
 import json

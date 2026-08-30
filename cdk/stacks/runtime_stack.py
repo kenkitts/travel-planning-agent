@@ -208,19 +208,24 @@ class RuntimeStack(Stack):
         allowed_clients/allowed_scopes/custom_claims to be set — enforced
         by AgentCore, not re-validated here).
 
-        allowed_clients validates a `client_id` claim that this project's
-        Okta org does not actually populate on its issued tokens — Okta
-        places the client identifier in a `cid` claim instead (confirmed
-        live twice now: once during the original, later-reverted Okta-JWT
-        cutover — decisions #26-35 — and again during Phase 2's RFC 8693
-        token-exchange rollout, where a real exchanged token was rejected
-        with "Claim 'client_id' value mismatch with configuration" even
-        though `allowedAudience`/`allowedScopes` both matched correctly).
-        `RuntimeStack`'s own callers (cdk/app.py) do not pass
-        allowed_clients at all as of that second fix — this parameter is
-        kept here only so a caller who *has* confirmed their own Okta org
-        populates a real `client_id` claim can still use it; DO NOT wire
-        WEB_RUNTIME_OIDC_CLIENT_ID into this parameter by default again.
+        allowed_clients validates a `client_id` claim on the presented JWT.
+        This project's Okta org previously did not populate that claim —
+        Okta placed the client identifier in a `cid` claim instead
+        (confirmed live twice: once during the original, later-reverted
+        Okta-JWT cutover — decisions #26-35 — and again during Phase 2's
+        RFC 8693 token-exchange rollout, where a real exchanged token was
+        rejected with "Claim 'client_id' value mismatch with configuration"
+        even though `allowedAudience`/`allowedScopes` both matched
+        correctly). The client registrations were later reconfigured to
+        include a real `client_id` claim, and `cdk/app.py` now wires
+        WEB_RUNTIME_OIDC_CLIENT_ID into this parameter again as defense in
+        depth on top of allowed_audience/allowed_scopes — narrowing
+        acceptance to tokens issued specifically to that app, not just any
+        token with a matching audience/scope. If a future Okta org (or a
+        reverted claims config) drops the `client_id` claim again, every
+        real token will be rejected with the same mismatch error — that's
+        the first thing to check if JWT auth suddenly starts failing after
+        an Okta-side change.
         """
         if discovery_url is None:
             return agentcore.RuntimeAuthorizerConfiguration.using_iam()

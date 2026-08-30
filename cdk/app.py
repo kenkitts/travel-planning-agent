@@ -113,14 +113,17 @@ memory_stack = MemoryStack(app, "TravelAgentMemoryStack", env=env)
 # itself requires a discovery_url shape, unlike Phase 1's ALB/web-server
 # OIDC config, so there's no equivalent explicit-endpoints option here).
 #
-# allowed_clients is deliberately NOT set here (WEB_RUNTIME_OIDC_CLIENT_ID
-# is not wired into it) — confirmed live that this Okta org's issued
-# tokens carry the client identifier in a `cid` claim, not `client_id`,
-# the same real-token-shape mismatch already found once during the
-# original (later-reverted) Okta-JWT cutover, decisions #26-35. Validating
-# only allowed_audience/allowed_scopes (both confirmed to match correctly
-# against real tokens) is sufficient — see runtime_stack.py's
-# _build_authorizer_configuration() docstring for the fuller history.
+# allowed_clients validates a `client_id` claim on the exchanged JWT,
+# narrowing acceptance to tokens issued specifically to the
+# WEB_RUNTIME_OIDC_CLIENT_ID app (defense in depth on top of
+# allowed_audience/allowed_scopes). Previously NOT wired here — confirmed
+# live that this Okta org's issued tokens carried the client identifier
+# in a `cid` claim, not `client_id` (the same mismatch found once during
+# the original, later-reverted Okta-JWT cutover, decisions #26-35, and
+# again during Phase 2's rollout). Re-enabled now that the org's client
+# registrations have been reconfigured to include a real `client_id`
+# claim — see runtime_stack.py's _build_authorizer_configuration()
+# docstring for the fuller history.
 runtime_oidc_issuer = os.environ.get("WEB_RUNTIME_OIDC_ISSUER")
 runtime_oidc_discovery_url = None
 runtime_oidc_allowed_audience = None
@@ -131,9 +134,12 @@ if runtime_oidc_issuer:
         runtime_oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
     )
     runtime_oidc_audience = os.environ.get("WEB_RUNTIME_OIDC_AUDIENCE")
+    runtime_oidc_client_id = os.environ.get("WEB_RUNTIME_OIDC_CLIENT_ID")
     runtime_oidc_scope = os.environ.get("WEB_RUNTIME_OIDC_SCOPE")
     if runtime_oidc_audience:
         runtime_oidc_allowed_audience = [runtime_oidc_audience]
+    if runtime_oidc_client_id:
+        runtime_oidc_allowed_clients = [runtime_oidc_client_id]
     if runtime_oidc_scope:
         runtime_oidc_allowed_scopes = [runtime_oidc_scope]
 

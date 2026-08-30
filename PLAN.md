@@ -1228,6 +1228,14 @@ cannot invoke a JWT-authorized Runtime at all).
      real login → real token exchange → real bearer-token
      `InvokeAgentRuntime` call → a real streamed agent response, all
      succeeding. Phase 2 is fully live and verified.
+   - **Update (2026-08-30, DESIGN.md decision #79):** the user
+     reconfigured the Okta client registrations to populate a real
+     `client_id` claim on issued tokens, removing the root cause behind
+     the `allowedClients` fix above. `allowed_clients` was wired back
+     into `RuntimeStack`'s JWT authorizer (`cdk/app.py` passes
+     `WEB_RUNTIME_OIDC_CLIENT_ID` again) as defense in depth on top of
+     `allowedAudience`/`allowedScopes`. Redeployed
+     `TravelAgentRuntimeStack` with this change.
 
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations

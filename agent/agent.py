@@ -3,11 +3,15 @@
 Wires together:
   - Claude Sonnet via Bedrock (strands.models.BedrockModel)
   - Tools from the AgentCore Gateway (Web Search + weather + places), over
-    MCP with AWS SigV4 (IAM) request signing. The Runtime's execution role
-    has bedrock-agentcore:InvokeGateway, but that permission only takes
-    effect if the outbound request is actually SigV4-signed — the Gateway
-    otherwise responds 401 Unauthorized (confirmed against a real deployment;
-    the Runtime does not sign Gateway calls automatically).
+    MCP — SigV4 (IAM) request signing by default, or a per-user JWT
+    bearer token obtained via RFC 8693 On-Behalf-Of token exchange when
+    the Gateway's own authorizer is switched to JWT (DESIGN.md's Phase 3
+    decision; see build_mcp_client() below). Under IAM auth, the
+    Runtime's execution role has bedrock-agentcore:InvokeGateway, but that
+    permission only takes effect if the outbound request is actually
+    SigV4-signed — the Gateway otherwise responds 401 Unauthorized
+    (confirmed against a real deployment; the Runtime does not sign
+    Gateway calls automatically).
   - AgentCore Memory (short-term conversation history + long-term traveler
     preferences and session summaries) via the Strands session_manager
     integration, so the agent recalls context within a session and across
@@ -25,21 +29,49 @@ text/event-stream StreamingResponse — see stream_agent_turn() for the
 event-shape translation and MaxTokensReachedException handling.
 
 Configuration is read from environment variables set by RuntimeStack:
-  GATEWAY_URL  - the AgentCore Gateway's MCP endpoint
-  MEMORY_ID    - the AgentCore Memory resource ID
-  AWS_REGION   - region for the Memory client (falls back to boto3 default)
-  MODEL_ID     - Bedrock model ID for Claude Sonnet (has a sane default)
+  GATEWAY_URL               - the AgentCore Gateway's MCP endpoint
+  MEMORY_ID                 - the AgentCore Memory resource ID
+  AWS_REGION                - region for the Memory client (falls back to boto3 default)
+  MODEL_ID                  - Bedrock model ID for Claude Sonnet (has a sane default)
+  GATEWAY_OBO_PROVIDER_NAME - name of the AgentCore Identity OAuth2 credential
+                              provider used for the Gateway's RFC 8693 On-Behalf-Of
+                              token exchange (see build_mcp_client() below); empty
+                              string if GatewayStack's JWT authorizer isn't configured
 
-Auth: the Runtime is configured with IAM/SigV4 auth (DESIGN.md decision
-#37, reverting the Okta-JWT cutover of decisions #26-35) — every caller
-signs its own request with its own AWS credentials, and there is no bearer
-token to decode here. actor_id is instead read directly from the
-invocation payload (see get_actor_id() below) — the caller (the hosted web
-UI's ECS task, deriving it from its ALB's verified OIDC claims) is trusted
-to supply the right value, the same way any other AgentCore Runtime
-IAM-authenticated caller is trusted with the payload it sends. This
-replaces the old "<actorId>___<sessionId>" runtime-session-id convention's
-actor_id half (the session_id half is unchanged; see parse_session_id()).
+Auth, Runtime inbound: IAM/SigV4 by default (DESIGN.md decision #37), or JWT
+Bearer Token when RuntimeStack's Okta config is set (DESIGN.md's Phase 2
+decision). Phase 3 changed how actor_id is derived once JWT inbound auth
+is active: get_actor_id() below now reads the caller's verified `sub`
+claim from the inbound Authorization header (via
+BedrockAgentCoreContext.get_request_headers()) instead of trusting a
+plain actor_id string in the invocation payload — restoring decision #31's
+original "derive server-side from a verified token, never from client
+input" stance for Memory scoping, now that a real per-request identity
+(the JWT itself) is available again. Falls back to the payload's actor_id
+field only when running under IAM inbound auth (no bearer token exists to
+read a `sub` from in that mode) — see get_actor_id()'s own docstring for
+the full trust rationale under each mode.
+
+Auth, Runtime -> Gateway (Phase 3, added after Phase 2): the Gateway's own
+inbound authorizer switches from AWS IAM/SigV4 to JWT Bearer Token when
+GatewayStack's Okta config is set (DESIGN.md's Phase 3 decision) — the
+same hard, mutually-exclusive IAM-vs-JWT switch already confirmed for the
+Runtime's own inbound auth in Phase 2, now also true for the Gateway.
+When JWT is configured, build_mcp_client() below performs an RFC 8693
+On-Behalf-Of token exchange via AgentCore Identity (bedrock_agentcore.
+identity.auth.IdentityClient, ON_BEHALF_OF_TOKEN_EXCHANGE flow) —
+exchanging the Runtime's own automatically-delivered workload access
+token (which itself carries the caller's original inbound JWT as its
+subject — see RuntimeStack's docstring) for a Gateway-audienced JWT, then
+presents that as a plain Bearer token to the Gateway's MCP endpoint
+instead of SigV4-signing the request. This is a materially different
+mechanism from Phase 2's own token exchange (web/auth.py's
+exchange_token_for_runtime(), a hand-rolled HTTP POST to Okta's /token
+endpoint) — here, AgentCore Identity performs the entire exchange
+server-side; agent.py never makes an HTTP call to Okta directly, and
+never touches the Okta client secret (held in Secrets Manager, read only
+by AgentCore Identity itself). See DESIGN.md's Phase 3 section for the
+full design.
 
 A fresh MCPClient and Agent are built per request (not shared globally),
 following the documented safe pattern for AgentCore Runtime: it avoids
@@ -50,9 +82,12 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from datetime import date
 from typing import Any, Optional
 
+from bedrock_agentcore.identity.auth import IdentityClient
 from bedrock_agentcore.memory.integrations.strands.config import (
     AgentCoreMemoryConfig,
     RetrievalConfig,
@@ -60,7 +95,8 @@ from bedrock_agentcore.memory.integrations.strands.config import (
 from bedrock_agentcore.memory.integrations.strands.session_manager import (
     AgentCoreMemorySessionManager,
 )
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.runtime import BedrockAgentCoreApp, BedrockAgentCoreContext
+from mcp.client.streamable_http import streamablehttp_client
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
@@ -76,6 +112,59 @@ logger = logging.getLogger(__name__)
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "")
 MEMORY_ID = os.environ.get("MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# Phase 3: name of GatewayStack's OAuth2 credential provider, used for the
+# Gateway's RFC 8693 On-Behalf-Of token exchange (see build_mcp_client()).
+# Empty string (not unset) when GatewayStack's JWT authorizer isn't
+# configured — mirrors GATEWAY_URL's own "empty string means not
+# configured" convention.
+GATEWAY_OBO_PROVIDER_NAME = os.environ.get("GATEWAY_OBO_PROVIDER_NAME", "")
+# Must match GATEWAY_OIDC_SCOPE/GATEWAY_OIDC_AUDIENCE in cdk/app.py, which
+# configures these same values on the Gateway's own JWT authorizer
+# (allowedScopes/allowedAudience) — see cdk/stacks/gateway_stack.py.
+GATEWAY_OBO_SCOPE = "gateway:invoke"
+GATEWAY_OBO_AUDIENCE = "travel-agent-gateway"
+# AgentCore Identity's TOKEN_EXCHANGE grant mode defaults subject_token_type
+# to "urn:ietf:params:oauth:token-type:jwt" — confirmed live (Okta System
+# Log: "invalid_subject_token_type") that this org's custom authorization
+# server only accepts "urn:ietf:params:oauth:token-type:access_token" for
+# this grant (matches Okta's own documented token-exchange examples, and
+# AWS's "Implement on-behalf-of token exchange for multi-tenant agents
+# with Amazon Bedrock AgentCore Gateway" blog post's "Common pitfalls"
+# section, which calls this out explicitly as an Okta-specific override).
+# There is no CDK/CfnOAuth2CredentialProvider-level field for this — the
+# override must be passed per-call via get_token()'s custom_parameters,
+# which maps directly to GetResourceOauth2Token's customParameters request
+# field (confirmed against the installed bedrock_agentcore SDK source).
+GATEWAY_OBO_SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# In-process cache for OBO-exchanged Gateway JWTs, keyed by the inbound
+# token's `sub` claim. Without this, every single agent turn re-runs the
+# full Runtime -> AgentCore Identity -> Okta round trip (confirmed live:
+# one exchange per build_mcp_client() call, and a fresh MCPClient/Agent is
+# built per request per this module's own docstring) — real added latency
+# and Okta token-endpoint load per message, for a token that's actually
+# valid for its full lifetime across many turns of the same conversation.
+# Keying by `sub` (rather than a single global cached token) is required
+# for correctness, not just tidiness: this Runtime's container can serve
+# different end users across requests, and caching one user's delegated
+# Gateway token under a shared key would hand it to a different user's
+# request. Process-local (not e.g. AgentCore Memory or another shared
+# store) because a cached token is only ever useful to requests landing on
+# this same container — sharing it further would just add complexity for
+# no benefit, and would need its own encryption-at-rest story for a live
+# bearer credential. A threading.Lock guards concurrent refresh attempts
+# for the same `sub` (AgentCore Runtime's documented pattern allows
+# concurrent invocations on one container), and expired entries for other
+# users are swept opportunistically on each access rather than via a
+# separate background task, since this cache is expected to stay small
+# (bounded by the number of distinct concurrent users a single container
+# actually serves).
+_GATEWAY_OBO_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_GATEWAY_OBO_TOKEN_CACHE_LOCK = threading.Lock()
+# Refresh this many seconds before the token's real `exp` claim to avoid a
+# request starting an MCP call with a token that expires mid-flight.
+GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS = 60
+
 # Sonnet is the design's chosen model (see DESIGN.md decision #7) for its
 # multi-step reasoning and tool-use reliability across the three Gateway tools.
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
@@ -109,34 +198,76 @@ app = BedrockAgentCoreApp()
 
 
 def get_actor_id(payload: dict) -> str:
-    """Derive the actor_id for Memory scoping from the invocation payload.
+    """Derive the actor_id for Memory scoping, from a verified JWT if one is available.
 
-    DESIGN.md decision #37: with IAM/SigV4 auth, the Runtime has no bearer
-    token to decode a `sub` claim from — the caller (the hosted web UI's
-    ECS task, deriving this from its ALB's verified OIDC claims) is
-    trusted to supply the correct actor_id directly in the payload, the
-    same way any IAM-authenticated caller's payload is already trusted.
-    This is a real trust shift from decision #31's "derive server-side
-    from a cryptographically verified token, never from client input"
-    stance — accepted because the only caller that can reach this Runtime
-    at all is this project's own web UI's ECS task, sitting behind an
-    OIDC-authenticated ALB that already did real identity verification
-    before the container ever sees the request. There is no untrusted
-    public path that can supply an arbitrary actor_id — see DESIGN.md
-    decision #37 for the full rationale.
+    Phase 3: when the Runtime's inbound authorizer is JWT (RuntimeStack's
+    Okta config is set — DESIGN.md's Phase 2 decision), the inbound
+    request carries a real `Authorization: Bearer <jwt>` header, which
+    AgentCore Runtime has already cryptographically verified (signature,
+    issuer, expiry) before invoking this code at all — see
+    _sub_from_authorization_header()'s docstring for why decoding it here
+    without re-verifying is safe. This restores decision #31's original
+    "derive server-side from a verified token, never from client input"
+    stance for Memory scoping, which decision #37 had walked back when
+    the Runtime's own inbound auth was IAM/SigV4-only (no bearer token to
+    decode). The payload's own actor_id field is used only as a fallback
+    when no such header is present — i.e. when the Runtime is still
+    running under IAM inbound auth, in which case the caller (the hosted
+    web UI's ECS task, deriving this from its own verified OIDC session)
+    is trusted to supply the correct actor_id directly, per decision #37's
+    original rationale.
 
     The raw actor_id is sanitized before use as AgentCore Memory's
     actorId, not used verbatim — see sanitize_actor_id()'s docstring.
 
-    Falls back to DEFAULT_ACTOR_ID if the payload doesn't include one, so
-    the agent still runs (without real per-user memory isolation) rather
-    than crashing the whole request.
+    Falls back to DEFAULT_ACTOR_ID if neither a decodable `sub` claim nor
+    a payload actor_id is available, so the agent still runs (without real
+    per-user memory isolation) rather than crashing the whole request.
     """
+    sub = _sub_from_authorization_header()
+    if sub:
+        return sanitize_actor_id(sub)
+
     raw = (payload or {}).get("actor_id")
     if not raw:
-        logger.warning("No 'actor_id' in payload; using default actor")
+        logger.warning("No 'sub' claim or 'actor_id' in payload; using default actor")
         return DEFAULT_ACTOR_ID
     return sanitize_actor_id(str(raw))
+
+
+def _sub_from_authorization_header() -> Optional[str]:
+    """Best-effort extraction of the `sub` claim from the inbound bearer token.
+
+    Reads the raw inbound `Authorization` header via
+    BedrockAgentCoreContext.get_request_headers() (populated by
+    BedrockAgentCoreApp before invoke() runs) and decodes its JWT payload
+    without verifying the signature. This is safe specifically because,
+    under JWT inbound auth, AgentCore Runtime's own JWT authorizer has
+    *already* cryptographically validated this exact token's signature,
+    issuer, and expiry before ever invoking this code — the same trust
+    argument web/auth.py's _sub_from_access_token() already makes for
+    Phase 2's token, just anchored at a different point in the request
+    path (the Runtime's authorizer having already run, rather than the
+    token having just been fetched fresh over TLS). Returns None (not an
+    error) for every case where no useful `sub` can be recovered — a
+    missing header, a malformed token, or plain IAM inbound auth where no
+    Authorization header carrying a real JWT is expected at all — so
+    get_actor_id() can fall back to the payload's own actor_id field
+    without this function's caller needing to distinguish those cases.
+    """
+    headers = BedrockAgentCoreContext.get_request_headers() or {}
+    auth_header = headers.get("Authorization") or headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[len("Bearer "):]
+    try:
+        import jwt as _jwt
+
+        claims = _jwt.decode(token, options={"verify_signature": False})
+        sub = claims.get("sub")
+        return str(sub) if sub else None
+    except Exception:  # noqa: BLE001 - best-effort; caller has a fallback
+        return None
 
 
 # AgentCore Memory's actorId pattern: must start with an alphanumeric, then
@@ -393,29 +524,199 @@ def build_session_manager(actor_id: str, session_id: str) -> Optional[AgentCoreM
     )
 
 
-def build_mcp_client() -> Optional[MCPClient]:
+async def build_mcp_client() -> Optional[MCPClient]:
     """Build the MCP client for the AgentCore Gateway.
 
     Returns None if GATEWAY_URL isn't configured, so the agent can still run
     (without tools) rather than failing outright.
 
-    Requests are SigV4-signed (aws_iam_streamablehttp_client) using the
-    Runtime's execution role credentials, which is what actually authorizes
-    against a Gateway configured with GatewayAuthorizer.using_aws_iam() —
-    the Runtime's execution role IAM policy alone is not sufficient; the
-    request itself must be signed, or the Gateway returns 401 Unauthorized.
+    Two auth modes, mirroring GatewayStack's own IAM/JWT authorizer switch
+    (mutually exclusive per AWS's docs — see this module's own docstring):
+
+    - Default (GATEWAY_OBO_PROVIDER_NAME empty): requests are SigV4-signed
+      (aws_iam_streamablehttp_client) using the Runtime's execution role
+      credentials, which is what actually authorizes against a Gateway
+      configured with GatewayAuthorizer.using_aws_iam() — the Runtime's
+      execution role IAM policy alone is not sufficient; the request
+      itself must be signed, or the Gateway returns 401 Unauthorized.
+    - Phase 3 (GATEWAY_OBO_PROVIDER_NAME set): performs an RFC 8693
+      On-Behalf-Of token exchange via AgentCore Identity
+      (bedrock_agentcore.identity.auth.IdentityClient.get_token(),
+      auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE") using the workload access
+      token Runtime already delivered for this request (read via
+      BedrockAgentCoreContext.get_workload_access_token() — never fetched
+      by this code itself; see RuntimeStack's docstring for why
+      GetWorkloadAccessToken* is deliberately not granted to this
+      Runtime's execution role), then presents the resulting Gateway-
+      audienced JWT as a plain `Authorization: Bearer` header via the
+      base mcp library's streamablehttp_client — no AWS-specific request
+      signing, since this Gateway is JWT-authorized once configured this
+      way, not IAM-authorized. Passes custom_parameters={"subject_token_type":
+      GATEWAY_OBO_SUBJECT_TOKEN_TYPE} — confirmed live (Okta System Log:
+      "invalid_subject_token_type") that AgentCore's default
+      subject_token_type ("...token-type:jwt") is rejected by this Okta
+      org's custom authorization server, which only accepts
+      "...token-type:access_token" for the TOKEN_EXCHANGE grant; see the
+      constant's own comment for the full citation. The actual exchange
+      call, and its per-`sub` caching, live in
+      _get_cached_or_exchange_gateway_token() — see that function's
+      docstring for why caching is scoped per-caller rather than global.
+
+    Raises (does not catch) if the workload access token is missing when
+    GATEWAY_OBO_PROVIDER_NAME is set — that combination means the Runtime's
+    own inbound auth isn't actually JWT-configured to match, a
+    configuration mismatch worth failing loudly on rather than silently
+    falling back to an unauthenticated/misconfigured Gateway call.
     """
     if not GATEWAY_URL:
         logger.warning("GATEWAY_URL not set; running without Gateway tools")
         return None
 
+    if not GATEWAY_OBO_PROVIDER_NAME:
+        return MCPClient(
+            lambda: aws_iam_streamablehttp_client(
+                endpoint=GATEWAY_URL,
+                aws_service="bedrock-agentcore",
+                aws_region=AWS_REGION,
+            )
+        )
+
+    workload_access_token = BedrockAgentCoreContext.get_workload_access_token()
+    if not workload_access_token:
+        raise RuntimeError(
+            "GATEWAY_OBO_PROVIDER_NAME is set but no workload access token is "
+            "available in context — the Runtime's own inbound authorizer must "
+            "be JWT-configured (RuntimeStack's Okta config) for this OBO "
+            "exchange to have a subject token to work from."
+        )
+
+    gateway_token = await _get_cached_or_exchange_gateway_token(workload_access_token)
+
     return MCPClient(
-        lambda: aws_iam_streamablehttp_client(
-            endpoint=GATEWAY_URL,
-            aws_service="bedrock-agentcore",
-            aws_region=AWS_REGION,
+        lambda: streamablehttp_client(
+            url=GATEWAY_URL,
+            headers={"Authorization": f"Bearer {gateway_token}"},
         )
     )
+
+
+async def _get_cached_or_exchange_gateway_token(workload_access_token: str) -> str:
+    """Return a cached Gateway OBO JWT for this request's caller, or exchange a new one.
+
+    Cache key is the *inbound* token's `sub` claim (via
+    _sub_from_authorization_header()) — not the workload access token
+    itself, which AgentCore mints per-invocation and so would never hit
+    the cache. Correctness (not just efficiency) depends on caching being
+    scoped to `sub`: see _GATEWAY_OBO_TOKEN_CACHE's own comment.
+
+    Falls back to skipping the cache entirely (always exchanges fresh) if
+    `sub` can't be determined — this should only happen if inbound JWT
+    auth isn't actually configured to match GATEWAY_OBO_PROVIDER_NAME
+    (build_mcp_client() already raises above if there's no workload token
+    at all, but a present-but-unparseable inbound token is a narrower edge
+    case not worth failing the whole request over).
+    """
+    cache_key = _sub_from_authorization_header()
+    now = time.time()
+    _raw_headers = BedrockAgentCoreContext.get_request_headers()
+    logger.info(
+        "Gateway OBO cache: resolved cache_key=%r (header keys present=%r)",
+        cache_key,
+        sorted(_raw_headers.keys()) if _raw_headers else _raw_headers,
+    )
+
+    if cache_key is not None:
+        with _GATEWAY_OBO_TOKEN_CACHE_LOCK:
+            # Opportunistic sweep of every expired entry, not just this
+            # caller's — keeps the dict from growing unbounded across many
+            # distinct users over a long-lived container's lifetime.
+            stale_keys = [
+                key for key, (_, expires_at) in _GATEWAY_OBO_TOKEN_CACHE.items() if expires_at <= now
+            ]
+            for stale_key in stale_keys:
+                del _GATEWAY_OBO_TOKEN_CACHE[stale_key]
+            if stale_keys:
+                logger.info("Gateway OBO cache: swept %d expired entr(y/ies)", len(stale_keys))
+
+            cached = _GATEWAY_OBO_TOKEN_CACHE.get(cache_key)
+            if cached is not None:
+                token, expires_at = cached
+                if expires_at > now:
+                    logger.info(
+                        "Gateway OBO cache: HIT for cache_key=%r (expires in %.1fs)",
+                        cache_key,
+                        expires_at - now,
+                    )
+                    return token
+                logger.info(
+                    "Gateway OBO cache: STALE entry for cache_key=%r (expired %.1fs ago)",
+                    cache_key,
+                    now - expires_at,
+                )
+            else:
+                logger.info("Gateway OBO cache: MISS for cache_key=%r (no entry)", cache_key)
+    else:
+        logger.info("Gateway OBO cache: bypassed — no cache_key (sub not resolvable)")
+
+    logger.info("Gateway OBO cache: performing token exchange (provider=%s)", GATEWAY_OBO_PROVIDER_NAME)
+    identity_client = IdentityClient(AWS_REGION)
+    gateway_token = await identity_client.get_token(
+        provider_name=GATEWAY_OBO_PROVIDER_NAME,
+        scopes=[GATEWAY_OBO_SCOPE],
+        audiences=[GATEWAY_OBO_AUDIENCE],
+        agent_identity_token=workload_access_token,
+        auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+        custom_parameters={"subject_token_type": GATEWAY_OBO_SUBJECT_TOKEN_TYPE},
+    )
+
+    if cache_key is not None:
+        expires_at = _jwt_expiry(gateway_token)
+        if expires_at is not None:
+            with _GATEWAY_OBO_TOKEN_CACHE_LOCK:
+                _GATEWAY_OBO_TOKEN_CACHE[cache_key] = (
+                    gateway_token,
+                    expires_at - GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS,
+                )
+            logger.info(
+                "Gateway OBO cache: STORED for cache_key=%r (raw exp in %.1fs, "
+                "cached TTL %.1fs after %ds skew)",
+                cache_key,
+                expires_at - now,
+                expires_at - now - GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS,
+                GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS,
+            )
+        else:
+            logger.info(
+                "Gateway OBO cache: NOT STORED for cache_key=%r — exchanged token has no "
+                "decodable `exp` claim",
+                cache_key,
+            )
+
+    return gateway_token
+
+
+def _jwt_expiry(token: str) -> Optional[float]:
+    """Best-effort extraction of a JWT's `exp` claim as a Unix timestamp.
+
+    Decoded without verifying the signature — this is AgentCore Identity's
+    own freshly-minted response, not untrusted client input, so there's
+    nothing to verify against here; this is purely reading a claim off a
+    token this process just received directly from a trusted AWS API call.
+    Returns None if the token isn't a decodable JWT or has no `exp`, so
+    the caller can fall back to not caching that token at all rather than
+    caching it with a made-up TTL.
+    """
+    try:
+        import jwt as _jwt
+
+        claims = _jwt.decode(token, options={"verify_signature": False})
+        exp = claims.get("exp")
+        if exp is None:
+            logger.info("Gateway OBO cache: exchanged token has no `exp` claim")
+        return float(exp) if exp is not None else None
+    except Exception as exc:  # noqa: BLE001 - best-effort; caller skips caching on failure
+        logger.info("Gateway OBO cache: failed to decode exchanged token for exp: %r", exc)
+        return None
 
 
 def build_conversation_manager() -> SummarizingConversationManager:
@@ -476,7 +777,7 @@ async def invoke(payload: dict, context: Any = None):
     actor_id = get_actor_id(payload)
 
     session_manager = build_session_manager(actor_id, session_id)
-    mcp_client = build_mcp_client()
+    mcp_client = await build_mcp_client()
     model = BedrockModel(
         model_id=MODEL_ID,
         region_name=AWS_REGION,

@@ -4,24 +4,29 @@
 Stack wiring:
   ToolsStack   -> weather + places Lambda functions
   GatewayStack -> AgentCore Gateway (Web Search + the two Lambda targets),
-                  depends on ToolsStack for the Lambda function references
+                  depends on ToolsStack for the Lambda function references.
+                  Auth is IAM-only by default — switches to JWT Bearer
+                  Token auth (DESIGN.md's Phase 3 decision) only when the
+                  GATEWAY_OIDC_* environment variables are present,
+                  independently of whether WebStack is deployed this run
+                  (mirrors RuntimeStack's own optional-JWT pattern below).
+                  When JWT is configured, also provisions a
+                  CfnOAuth2CredentialProvider for RFC 8693 On-Behalf-Of
+                  token exchange — see gateway_stack.py's module docstring.
   MemoryStack  -> AgentCore Memory (short-term + long-term strategies),
                   independent of the other two stacks
   RuntimeStack -> hosts the Strands agent on AgentCore Runtime, depends on
-                  both GatewayStack (for the Gateway URL) and MemoryStack
-                  (for the Memory ID). Uses IAM/SigV4 auth (DESIGN.md
-                  decision #37) — no Okta configuration needed here
-                  anymore.
-  RuntimeStack -> hosts the Strands agent on AgentCore Runtime, depends on
-                  both GatewayStack (for the Gateway URL) and MemoryStack
-                  (for the Memory ID). Uses IAM/SigV4 auth by default
-                  (DESIGN.md decision #37) — switches to JWT Bearer Token
-                  auth (DESIGN.md's Phase 2 decision) only when the
-                  WEB_RUNTIME_OIDC_* environment variables are present,
-                  independently of whether WebStack itself is being
-                  deployed this run (RuntimeStack has no hard dependency
-                  on WEB_CERTIFICATE_ARN/WEB_OIDC_* — see WebStack's own
-                  note below).
+                  both GatewayStack (for the Gateway URL and, once
+                  GATEWAY_OIDC_* is configured, the OAuth2 credential
+                  provider it needs to grant OBO-exchange permission
+                  against) and MemoryStack (for the Memory ID). Uses
+                  IAM/SigV4 auth by default (DESIGN.md decision #37) —
+                  switches to JWT Bearer Token auth (DESIGN.md's Phase 2
+                  decision) only when the WEB_RUNTIME_OIDC_* environment
+                  variables are present, independently of whether WebStack
+                  itself is being deployed this run (RuntimeStack has no
+                  hard dependency on WEB_CERTIFICATE_ARN/WEB_OIDC_* — see
+                  WebStack's own note below).
   WebStack     -> hosts the web UI on ECS Fargate behind a plain
                   (non-OIDC) ALB (see DESIGN.md's Phase 1 auth
                   rearchitecture decision, superseding decision #37/#38's
@@ -91,12 +96,44 @@ env = cdk.Environment(region="us-east-1")
 
 tools_stack = ToolsStack(app, "TravelAgentToolsStack", env=env)
 
+# GatewayStack's JWT authorizer is optional and independent of WebStack —
+# see this module's docstring. Same discovery-URL-derivation convention as
+# RuntimeStack's WEB_RUNTIME_OIDC_ISSUER handling below, applied to a
+# third, separate Okta "API Services" app dedicated to this exchange
+# (distinct from the web-login app and Phase 2's Runtime-exchange app —
+# three Okta apps total across this project's auth rearchitecture).
+gateway_oidc_issuer = os.environ.get("GATEWAY_OIDC_ISSUER")
+gateway_oidc_discovery_url = None
+gateway_oidc_allowed_audience = None
+gateway_oidc_allowed_clients = None
+gateway_oidc_allowed_scopes = None
+gateway_oidc_client_id = os.environ.get("GATEWAY_OIDC_CLIENT_ID")
+gateway_oidc_client_secret = os.environ.get("GATEWAY_OIDC_CLIENT_SECRET")
+if gateway_oidc_issuer:
+    gateway_oidc_discovery_url = (
+        gateway_oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
+    )
+    gateway_oidc_audience = os.environ.get("GATEWAY_OIDC_AUDIENCE")
+    gateway_oidc_scope = os.environ.get("GATEWAY_OIDC_SCOPE")
+    if gateway_oidc_audience:
+        gateway_oidc_allowed_audience = [gateway_oidc_audience]
+    if gateway_oidc_client_id:
+        gateway_oidc_allowed_clients = [gateway_oidc_client_id]
+    if gateway_oidc_scope:
+        gateway_oidc_allowed_scopes = [gateway_oidc_scope]
+
 gateway_stack = GatewayStack(
     app,
     "TravelAgentGatewayStack",
     env=env,
     weather_function=tools_stack.weather_function,
     places_function=tools_stack.places_function,
+    gateway_oidc_discovery_url=gateway_oidc_discovery_url,
+    gateway_oidc_allowed_audience=gateway_oidc_allowed_audience,
+    gateway_oidc_allowed_clients=gateway_oidc_allowed_clients,
+    gateway_oidc_allowed_scopes=gateway_oidc_allowed_scopes,
+    gateway_oidc_client_id=gateway_oidc_client_id,
+    gateway_oidc_client_secret=gateway_oidc_client_secret,
 )
 gateway_stack.add_dependency(tools_stack)
 
@@ -153,6 +190,7 @@ runtime_stack = RuntimeStack(
     runtime_oidc_allowed_audience=runtime_oidc_allowed_audience,
     runtime_oidc_allowed_clients=runtime_oidc_allowed_clients,
     runtime_oidc_allowed_scopes=runtime_oidc_allowed_scopes,
+    gateway_oauth2_credential_provider=gateway_stack.oauth2_credential_provider,
 )
 runtime_stack.add_dependency(gateway_stack)
 runtime_stack.add_dependency(memory_stack)

@@ -1237,6 +1237,152 @@ cannot invoke a JWT-authorized Runtime at all).
      `allowedAudience`/`allowedScopes`. Redeployed
      `TravelAgentRuntimeStack` with this change.
 
+## Phase 14 — Auth rearchitecture Phase 3: Gateway JWT authorizer + RFC 8693 On-Behalf-Of token exchange (added 2026-08-30)
+
+See DESIGN.md §2g (decisions #80-87) for the full design rationale, the
+AWS Security Blog post this follows almost directly, and the 18
+clarifying-question-and-answer exchange that shaped it before any code
+was written.
+
+### What was built
+- `cdk/stacks/gateway_stack.py`: authorizer switches from
+  `GatewayAuthorizer.using_aws_iam()` to `GatewayAuthorizer.using_custom_jwt()`
+  only when `gateway_oidc_discovery_url` is passed in (optional, mirrors
+  `RuntimeStack`'s own pattern exactly). New
+  `_add_oauth2_credential_provider()` provisions a
+  `CfnOAuth2CredentialProvider` (`CustomOauth2` vendor,
+  `onBehalfOfTokenExchangeConfig` with `grantType: TOKEN_EXCHANGE` and
+  `actorTokenContent: NONE`), client secret passed as a plain literal
+  string (**updated after live deployment** — the originally-planned
+  `SecretReferenceProperty`/Secrets-Manager-reference approach was
+  rejected by the live `CreateOauth2CredentialProvider` API for
+  `CLIENT_SECRET_BASIC`/`CLIENT_SECRET_POST` auth; see DESIGN.md
+  decision #90). Gateway construct ID is `"TravelAgentGatewayV2"`, not
+  `"TravelAgentGateway"` (see DESIGN.md decision #88 for why — a
+  permanent rename forced by AWS's Gateway API rejecting in-place
+  authorizer-type changes).
+- `cdk/stacks/runtime_stack.py`: removed the now-dead
+  `gateway.grant_invoke(self.runtime)` IAM/SigV4 grant (same
+  anti-pattern decision #78 already found and fixed once for
+  `web_stack.py`'s Runtime-invoke grant); added a new grant for
+  `bedrock-agentcore:GetResourceOauth2Token` (**expanded after live
+  deployment** — see DESIGN.md decision #91 — to cover four resource
+  families, not just the credential-provider ARN originally planned:
+  the credential-provider ARN itself, `token-vault/default`,
+  `workload-identity-directory/default`, and
+  `workload-identity-directory/default/workload-identity/{RUNTIME_NAME}-*`
+  as a wildcard prefix, not the resolved `agent_runtime_id`, to avoid a
+  circular CloudFormation dependency), plus a new
+  `secretsmanager:GetSecretValue` grant scoped to
+  `bedrock-agentcore-identity!default/oauth2/{provider_name}-*` — the
+  Secrets Manager secret AgentCore Identity creates and reads itself for
+  the credential provider's client secret. Deliberately not
+  `GetWorkloadAccessToken*` (AWS's docs confirm Runtime-managed
+  identities can't call those directly; the workload token is
+  auto-delivered). New `GATEWAY_OBO_PROVIDER_NAME` environment variable
+  passed to the agent process. Also sets
+  `request_header_configuration=agentcore.RequestHeaderConfiguration(allowlisted_headers=["Authorization"])`
+  on the Runtime construct — **added after live deployment**, see
+  DESIGN.md decision #95; without it the inbound `Authorization` header
+  never reaches `agent.py` at all despite `authorizer_configuration`
+  being set.
+- `cdk/app.py`: new `GATEWAY_OIDC_*` env-var block (a third, separate
+  Okta "API Services" app — distinct from both `WEB_OIDC_*` and
+  `WEB_RUNTIME_OIDC_*`), read before `GatewayStack` construction and
+  wired into its 6 new constructor kwargs; `RuntimeStack` construction
+  now passes `gateway_oauth2_credential_provider=gateway_stack.oauth2_credential_provider`.
+- `.env.template`: new `GATEWAY_OIDC_ISSUER`/`CLIENT_ID`/`CLIENT_SECRET`/
+  `AUDIENCE`/`SCOPE` block with full setup instructions, matching Phase
+  2's own `WEB_RUNTIME_OIDC_*` documentation style.
+- `agent/agent.py`:
+  - `get_actor_id()` now derives `actor_id` from the inbound JWT's `sub`
+    claim (read via a new `_sub_from_authorization_header()` helper,
+    decoding `BedrockAgentCoreContext.get_request_headers()`'s
+    `Authorization` header without re-verifying the signature — safe
+    because AgentCore Runtime's own JWT authorizer already verified it
+    before invoking this code at all) — falling back to the payload's
+    `actor_id` field only under IAM inbound auth. This restores decision
+    #31's original "derive server-side from a verified token" stance for
+    Memory scoping, closing the trust gap decision #37 had accepted.
+  - `build_mcp_client()` is now `async def`. Unchanged (IAM/SigV4) path
+    when `GATEWAY_OBO_PROVIDER_NAME` is empty. New path when set:
+    reads the Runtime's own auto-delivered workload access token via
+    `BedrockAgentCoreContext.get_workload_access_token()`, checks a new
+    per-`sub`-keyed in-process cache
+    (`_get_cached_or_exchange_gateway_token()`/`_GATEWAY_OBO_TOKEN_CACHE`
+    — **added after live deployment**, see DESIGN.md decision #96;
+    every conversation turn was re-exchanging against Okta without it),
+    and on a cache miss exchanges the workload token for a
+    Gateway-audienced JWT via
+    `bedrock_agentcore.identity.auth.IdentityClient.get_token(auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+    custom_parameters={"subject_token_type": "urn:ietf:params:oauth:token-type:access_token"})`
+    — the `custom_parameters` override **added after live deployment**,
+    see DESIGN.md decision #92; AgentCore Identity's own default
+    `subject_token_type` was rejected by this Okta org — then builds
+    the MCP client with the base `mcp` library's own
+    `streamablehttp_client(url=..., headers={"Authorization": f"Bearer {token}"})`
+    instead of `aws_iam_streamablehttp_client` — no request signing at
+    all under this mode. Raises `RuntimeError` (fails loud, doesn't
+    silently degrade) if `GATEWAY_OBO_PROVIDER_NAME` is set but no
+    workload token is present, since that combination means the
+    Runtime's own inbound auth isn't actually JWT-configured to match.
+- Test suite: 172/172 passing (was 163) — new `GetActorIdTests` cases for
+  the JWT `sub`-claim path (a fake unsigned JWT via `pyjwt`'s `"none"`
+  algorithm, since the decode path never verifies signatures anyway), and
+  a new `BuildMcpClientTests` class covering both the IAM and OBO paths
+  with mocked `IdentityClient`/`streamablehttp_client` calls (no real
+  AgentCore Identity or network calls).
+
+### Verified
+- `cdk synth TravelAgentGatewayStack TravelAgentRuntimeStack` — both with
+  no JWT config (falls back to IAM, matching the pre-Phase-3 baseline)
+  and with dummy `GATEWAY_OIDC_*` values set — confirmed via direct JSON
+  inspection of the synthesized templates: the Gateway's
+  `AuthorizerConfiguration.CustomJWTAuthorizer` has the exact
+  `AllowedAudience`/`AllowedClients`/`AllowedScopes`/`DiscoveryUrl`; the
+  `AWS::BedrockAgentCore::OAuth2CredentialProvider` resource has the
+  correct `CredentialProviderVendor`/`ClientId`/`ClientSecretConfig`/
+  `OnBehalfOfTokenExchangeConfig` shape; the Runtime's IAM policy has
+  exactly one new statement (`GetResourceOauth2Token`, correctly scoped
+  to the credential provider's cross-stack-imported ARN) and zero
+  `InvokeGateway`/`grant_invoke` statements remaining.
+- `python -m pytest tests/ web/tests/`: 175/175 passing (was 172 at
+  synth-only verification time — 3 new tests added for the OBO token
+  cache, see below).
+- **Deployed and verified live** (2026-08-31) — see DESIGN.md's "Live
+  deployment findings" (decisions #88-96) for the full account of what
+  the live deploy actually surfaced beyond synth/unit-test verification:
+  a Gateway-authorizer-type change forcing full CDK-level replacement
+  (construct-ID rename cascaded to the CloudWatch delivery sources), a
+  `clientSecretConfig` API rejection requiring a plain-literal client
+  secret instead, three sequential `AccessDeniedException`s resolving
+  the true multi-resource-family IAM shape `GetResourceOauth2Token`
+  actually needs, an Okta-specific `subject_token_type` override
+  required via `customParameters`, a stale local `__pycache__` silently
+  shipping through every deploy until the bundling command was fixed to
+  strip it, AgentCore Runtime's per-session code pinning (requiring a
+  fresh conversation to observe any new deploy's effect), and a missing
+  `RequestHeaderConfiguration`/`allowlisted_headers=["Authorization"]`
+  on `RuntimeStack` (decision #34 had already identified this
+  requirement in the abstract during Phase 2's design, but it was never
+  actually implemented until this live debugging surfaced it) — without
+  which the inbound `Authorization` header never reached `agent.py` at
+  all, silently breaking both `sub`-claim actor-ID derivation's edge
+  case and the new OBO token cache below.
+- Added an in-process, per-`sub`-keyed OBO token cache
+  (`agent/agent.py`'s `_GATEWAY_OBO_TOKEN_CACHE`) after confirming live
+  that every conversation turn was re-running the full RFC 8693 exchange
+  against Okta — see DESIGN.md decision #96. Reduces this to
+  approximately once per token lifetime (~1 hour) or per fresh/resumed
+  session, confirmed live via CloudWatch logs showing 3 consecutive
+  cache `HIT`s after the first `MISS`+`STORE` on a new session.
+- End-to-end confirmed live: a real chat message exercising Gateway
+  tools (weather/places/web search) succeeds with the Gateway's
+  authorizer on `CUSTOM_JWT`, the Runtime performing the OBO exchange,
+  and the exchanged token cached and reused across turns — the actual
+  goal this phase set out to verify, not previously exercised at
+  synth-only verification time.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

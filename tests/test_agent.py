@@ -1,20 +1,24 @@
 """Unit tests for agent/agent.py's pure-function helpers.
 
 Covers extract_response_text(), extract_tool_result_text(),
-stream_agent_turn(), parse_session_id(), and get_actor_id().
-stream_agent_turn() is tested with a fake Agent double (an async generator
-standing in for Agent.stream_async(), no real Strands Agent, no AWS/
-network dependencies) so the event-translation and
+stream_agent_turn(), parse_session_id(), get_actor_id(), and
+build_mcp_client(). stream_agent_turn() is tested with a fake Agent double
+(an async generator standing in for Agent.stream_async(), no real Strands
+Agent, no AWS/network dependencies) so the event-translation and
 MaxTokensReachedException handling paths can be exercised
-deterministically. get_actor_id() is tested against plain payload dicts
-(DESIGN.md decision #37: actor_id comes directly from the invocation
-payload under IAM auth, not from a decoded bearer token).
+deterministically. get_actor_id() is tested against both the Phase 3 JWT
+path (a `sub` claim decoded from a fake inbound Authorization header, via
+BedrockAgentCoreContext) and the IAM-mode fallback path (a plain payload
+dict — DESIGN.md decision #37). build_mcp_client() is tested against both
+the default IAM/SigV4 path and the Phase 3 OBO-exchange path (a fake
+IdentityClient.get_token(), no real AgentCore Identity/network calls).
 """
 import importlib.util
 import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 _AGENT_DIR = Path(__file__).resolve().parents[1] / "agent"
 _AGENT_PATH = _AGENT_DIR / "agent.py"
@@ -44,6 +48,13 @@ def _run_async(coro_or_agen):
         return [event async for event in coro_or_agen]
 
     return asyncio.run(_collect())
+
+
+def asyncio_run(coro):
+    """Run a plain coroutine (not an async generator) to completion."""
+    import asyncio
+
+    return asyncio.run(coro)
 
 
 class _FakeAgent:
@@ -165,6 +176,74 @@ class SanitizeActorIdTests(unittest.TestCase):
 
 
 class GetActorIdTests(unittest.TestCase):
+    def tearDown(self):
+        # Reset the request-headers context var so tests don't leak state
+        # into each other — BedrockAgentCoreContext's ContextVar has no
+        # default, so explicitly setting {} here restores "no headers
+        # present" for get_request_headers()'s purposes (an empty dict has
+        # no "Authorization" key, same as None does for get_actor_id()).
+        travel_agent.BedrockAgentCoreContext.set_request_headers({})
+
+    @staticmethod
+    def _fake_jwt(sub: str) -> str:
+        """An unsigned-but-well-formed JWT carrying only a `sub` claim.
+
+        get_actor_id()'s JWT path deliberately does not verify the
+        signature (see _sub_from_authorization_header()'s docstring), so
+        a real signature isn't needed to exercise it — pyjwt's own
+        "none" algorithm produces a real, decodable JWT structure without
+        needing a signing key.
+        """
+        import jwt as _jwt
+
+        return _jwt.encode({"sub": sub}, key=None, algorithm="none")
+
+    def test_extracts_sub_from_authorization_header_when_present(self):
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": f"Bearer {self._fake_jwt('kenkitts@amazon.com')}"}
+        )
+
+        self.assertEqual(
+            travel_agent.get_actor_id({"prompt": "hi", "actor_id": "ignored"}),
+            "kenkitts-amazon-com",
+        )
+
+    def test_prefers_sub_claim_over_payload_actor_id(self):
+        # Regression: when both a real inbound JWT and a payload actor_id
+        # are present (JWT inbound auth mode), the verified sub must win.
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": f"Bearer {self._fake_jwt('real-sub')}"}
+        )
+
+        self.assertEqual(
+            travel_agent.get_actor_id({"prompt": "hi", "actor_id": "untrusted-payload-value"}),
+            "real-sub",
+        )
+
+    def test_falls_back_to_payload_when_no_authorization_header(self):
+        # IAM inbound auth mode: no bearer token exists at all.
+        self.assertEqual(
+            travel_agent.get_actor_id({"prompt": "hi", "actor_id": "ken"}), "ken"
+        )
+
+    def test_falls_back_to_payload_when_authorization_header_not_bearer(self):
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": "Basic dXNlcjpwYXNz"}
+        )
+
+        self.assertEqual(
+            travel_agent.get_actor_id({"prompt": "hi", "actor_id": "ken"}), "ken"
+        )
+
+    def test_falls_back_to_payload_when_bearer_token_is_malformed(self):
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": "Bearer not-a-real-jwt"}
+        )
+
+        self.assertEqual(
+            travel_agent.get_actor_id({"prompt": "hi", "actor_id": "ken"}), "ken"
+        )
+
     def test_extracts_actor_id_from_payload(self):
         self.assertEqual(
             travel_agent.get_actor_id({"prompt": "hi", "actor_id": "ken"}), "ken"
@@ -405,6 +484,167 @@ class StreamAgentTurnTests(unittest.TestCase):
         self.assertEqual(events[0]["type"], "error")
         self.assertEqual(events[0]["data"]["partial_text"], "")
         self.assertIn("cut off", events[0]["data"]["note"])
+
+
+class BuildMcpClientTests(unittest.TestCase):
+    def setUp(self):
+        # Reset module-level config each test — build_mcp_client() reads
+        # these as plain module globals (set once at import time from
+        # os.environ), so tests override them directly rather than
+        # through the environment.
+        self._orig_gateway_url = travel_agent.GATEWAY_URL
+        self._orig_obo_provider_name = travel_agent.GATEWAY_OBO_PROVIDER_NAME
+        travel_agent.GATEWAY_URL = "https://example-gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+
+    def tearDown(self):
+        travel_agent.GATEWAY_URL = self._orig_gateway_url
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = self._orig_obo_provider_name
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("")
+        travel_agent.BedrockAgentCoreContext.set_request_headers({})
+        travel_agent._GATEWAY_OBO_TOKEN_CACHE.clear()
+
+    def test_returns_none_when_gateway_url_not_set(self):
+        travel_agent.GATEWAY_URL = ""
+
+        client = asyncio_run(travel_agent.build_mcp_client())
+
+        self.assertIsNone(client)
+
+    def test_returns_iam_client_when_obo_provider_not_configured(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = ""
+
+        with patch.object(travel_agent, "aws_iam_streamablehttp_client") as fake_iam_client:
+            client = asyncio_run(travel_agent.build_mcp_client())
+            self.assertIsNotNone(client)
+            # MCPClient stores its transport factory as a private attribute;
+            # call it directly to confirm the IAM path (not the OBO/bearer
+            # path) is what's wired up, without needing MCPClient's full
+            # background-thread connection lifecycle.
+            client._transport_callable()
+            fake_iam_client.assert_called_once_with(
+                endpoint=travel_agent.GATEWAY_URL,
+                aws_service="bedrock-agentcore",
+                aws_region=travel_agent.AWS_REGION,
+            )
+
+    def test_raises_when_obo_configured_but_no_workload_token(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("")
+
+        with self.assertRaises(RuntimeError):
+            asyncio_run(travel_agent.build_mcp_client())
+
+    def test_obo_path_exchanges_workload_token_for_gateway_bearer_token(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+
+        fake_get_token = AsyncMock(return_value="fake-gateway-jwt")
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls, \
+                patch.object(travel_agent, "streamablehttp_client") as fake_streamable_client:
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            client = asyncio_run(travel_agent.build_mcp_client())
+            self.assertIsNotNone(client)
+            client._transport_callable()
+
+            fake_identity_client_cls.assert_called_once_with(travel_agent.AWS_REGION)
+            fake_get_token.assert_awaited_once_with(
+                provider_name="travel-planning-agent-gateway-obo",
+                scopes=[travel_agent.GATEWAY_OBO_SCOPE],
+                audiences=[travel_agent.GATEWAY_OBO_AUDIENCE],
+                agent_identity_token="fake-workload-token",
+                auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+                custom_parameters={
+                    "subject_token_type": travel_agent.GATEWAY_OBO_SUBJECT_TOKEN_TYPE
+                },
+            )
+            fake_streamable_client.assert_called_once_with(
+                url=travel_agent.GATEWAY_URL,
+                headers={"Authorization": "Bearer fake-gateway-jwt"},
+            )
+
+    @staticmethod
+    def _fake_gateway_jwt(exp_offset_seconds: float) -> str:
+        """An unsigned JWT with just an `exp` claim, for cache-TTL tests.
+
+        Mirrors GetActorIdTests._fake_jwt()'s "none"-algorithm approach —
+        _jwt_expiry() never verifies the signature (see its own
+        docstring), so no signing key is needed here either.
+        """
+        import time as _time
+
+        import jwt as _jwt
+
+        return _jwt.encode(
+            {"exp": _time.time() + exp_offset_seconds}, key=None, algorithm="none"
+        )
+
+    def test_obo_token_is_cached_per_sub_across_calls(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": f"Bearer {GetActorIdTests._fake_jwt('alice@example.com')}"}
+        )
+
+        fake_get_token = AsyncMock(return_value=self._fake_gateway_jwt(3600))
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls, \
+                patch.object(travel_agent, "streamablehttp_client"):
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            asyncio_run(travel_agent.build_mcp_client())
+            asyncio_run(travel_agent.build_mcp_client())
+
+            # Second call hit the cache — the exchange only happened once,
+            # even though build_mcp_client() (and thus a fresh MCPClient
+            # per this module's own per-request-isolation docstring) was
+            # invoked twice for the same caller.
+            fake_get_token.assert_awaited_once()
+
+    def test_obo_token_cache_is_scoped_per_sub(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+
+        fake_get_token = AsyncMock(
+            side_effect=[self._fake_gateway_jwt(3600), self._fake_gateway_jwt(3600)]
+        )
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls, \
+                patch.object(travel_agent, "streamablehttp_client"):
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            travel_agent.BedrockAgentCoreContext.set_request_headers(
+                {"Authorization": f"Bearer {GetActorIdTests._fake_jwt('alice@example.com')}"}
+            )
+            asyncio_run(travel_agent.build_mcp_client())
+
+            travel_agent.BedrockAgentCoreContext.set_request_headers(
+                {"Authorization": f"Bearer {GetActorIdTests._fake_jwt('bob@example.com')}"}
+            )
+            asyncio_run(travel_agent.build_mcp_client())
+
+            # A different caller's `sub` must never hit alice's cache entry
+            # — each of the two distinct users triggers its own exchange.
+            self.assertEqual(fake_get_token.await_count, 2)
+
+    def test_expired_cached_obo_token_triggers_fresh_exchange(self):
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": f"Bearer {GetActorIdTests._fake_jwt('alice@example.com')}"}
+        )
+
+        # Expires in 10s, but the refresh skew (60s) means it's already
+        # treated as expired by the cache — the second call must re-exchange.
+        fake_get_token = AsyncMock(
+            side_effect=[self._fake_gateway_jwt(10), self._fake_gateway_jwt(3600)]
+        )
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls, \
+                patch.object(travel_agent, "streamablehttp_client"):
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            asyncio_run(travel_agent.build_mcp_client())
+            asyncio_run(travel_agent.build_mcp_client())
+
+            self.assertEqual(fake_get_token.await_count, 2)
 
 
 if __name__ == "__main__":

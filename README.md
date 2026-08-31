@@ -18,8 +18,10 @@ its own KMS-encrypted session cookie
    │  InvokeAgentRuntime (via web/agent_client.py) — IAM/SigV4 by
    │  default, or a JWT bearer token (RFC 8693 token-exchanged from
    │  the user's own Okta session) once TravelAgentRuntimeStack's
-   │  optional Okta config is set — see "Authentication" below
-   │  actor_id passed explicitly in the payload
+   │  optional Okta config is set — see "Authentication" below.
+   │  actor_id is derived server-side from that JWT's verified `sub`
+   │  claim when present, or passed explicitly in the payload under
+   │  IAM auth
    ▼
 AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
    │                                   │
@@ -28,7 +30,10 @@ AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet 
    │                                   │    session summaries, scoped by the
    │                                   │    caller-supplied actor_id)
    │                                   │
-   │                                   └─▶ AgentCore Gateway (MCP, IAM auth)
+   │                                   └─▶ AgentCore Gateway (MCP, IAM auth
+   │                                        by default, or a per-user JWT
+   │                                        via RFC 8693 On-Behalf-Of token
+   │                                        exchange — see "Authentication")
    │                                          ├─ Web Search (managed connector)
    │                                          ├─ Weather Lambda (Open-Meteo)
    │                                          └─ Places Lambda (Amazon Location Service)

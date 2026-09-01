@@ -5,3 +5,6 @@ boto3==1.43.73
 PyJWT==2.13.0
 cryptography==50.0.0
 requests==2.32.5
+opentelemetry-distro==0.65b0
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0

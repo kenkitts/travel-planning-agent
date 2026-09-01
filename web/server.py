@@ -56,6 +56,7 @@ bearer token instead (DESIGN.md's Phase 2 decision).
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,12 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
 import uvicorn
 
@@ -364,6 +371,42 @@ def create_app(
     # if run outside ECS.
     client = boto3.client("bedrock-agentcore", region_name=region)
     app = FastAPI(title="Travel Planning Agent — Web UI")
+
+    # X-Ray tracing (observability pass, see DESIGN.md): the classic
+    # aws-xray-sdk's automatic incoming-request middleware only supports
+    # Django/Flask/Bottle (confirmed against AWS's own docs), not FastAPI/
+    # ASGI, and AWS's docs flag that SDK as entering maintenance mode with
+    # an explicit steer toward OpenTelemetry — so this app is instrumented
+    # with the OTel FastAPI auto-instrumentor instead of the classic SDK,
+    # while Lambdas/Gateway/Runtime elsewhere in this project keep their
+    # existing X-Ray-native tracing (Lambda's Tracing.ACTIVE is a Lambda
+    # platform feature, unrelated to this SDK choice). Traces are exported
+    # via OTLP/gRPC to the ADOT collector sidecar container running
+    # alongside this one in the same ECS task (see web_stack.py) — since
+    # both containers share the task's network namespace under `awsvpc`
+    # mode, "localhost" here reaches the sidecar directly, not the
+    # internet. The ADOT collector itself forwards to AWS X-Ray using the
+    # task role's AWSXRayDaemonWriteAccess permissions (also web_stack.py)
+    # — this process never talks to the X-Ray API directly.
+    #
+    # OTEL_EXPORTER_OTLP_ENDPOINT defaults to the sidecar's standard OTLP/
+    # gRPC port on localhost; overridable via env var (unset in
+    # web_stack.py today, but left configurable rather than hardcoded).
+    # BatchSpanProcessor (not the simple/synchronous processor) so export
+    # happens off the request's own execution path. Harmless when no
+    # collector is reachable (e.g. local dev via `python web/server.py`)
+    # — the exporter just fails to connect and drops spans silently, per
+    # OTel's default error-handling behavior; tracing is not required for
+    # local development.
+    otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    tracer_provider = TracerProvider(
+        resource=Resource.create({SERVICE_NAME: "travel-agent-web"})
+    )
+    tracer_provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
+    )
+    trace.set_tracer_provider(tracer_provider)
+    FastAPIInstrumentor.instrument_app(app)
 
     def _resolve_auth(request: Request) -> AuthContext:
         """Resolve the caller's session or raise HTTPException.

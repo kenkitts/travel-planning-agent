@@ -52,6 +52,7 @@ from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_logs as logs
 from aws_cdk import aws_secretsmanager as secretsmanager
 from constructs import Construct
 
@@ -74,6 +75,28 @@ MAX_TASK_COUNT = 3
 CPU_TARGET_UTILIZATION_PERCENT = 60
 
 CONTAINER_PORT = 8420
+
+# ADOT collector sidecar (observability pass, see DESIGN.md): collects
+# OTLP/gRPC traces from the WebContainer (server.py's FastAPI
+# instrumentation) and forwards them to AWS X-Ray.
+#
+# Config file: /etc/ecs/ecs-default-config.yaml, NOT
+# /etc/ecs/otel-instance-metrics-config.yaml (the config AWS's generic
+# "trace collection" ECS doc example uses, and what this project
+# originally deployed with — confirmed live to crash-loop on Fargate:
+# "Error: cannot start pipelines: failed to initialize NodeCapacity:
+# lstat /rootfs/proc: no such file or directory"). That config's bundled
+# receivers expect a real EC2 host filesystem for container-insights
+# host metrics, which Fargate does not expose. AWS's own ADOT-on-ECS
+# docs (aws-otel.github.io/docs/setup/ecs/task-definition-for-ecs-fargate)
+# are explicit that Fargate tasks must use one of two different,
+# Fargate-safe bundled configs instead — ecs-default-config.yaml (OTLP/
+# StatsD/X-Ray SDK traces, no host metrics) is the correct one here,
+# since this project only needs trace forwarding, not container-insights
+# resource-utilization metrics.
+ADOT_COLLECTOR_IMAGE = "public.ecr.aws/aws-observability/aws-otel-collector:v0.30.0"
+ADOT_COLLECTOR_CONFIG = "/etc/ecs/ecs-default-config.yaml"
+OTLP_GRPC_PORT = 4317
 
 
 class WebStack(Stack):
@@ -145,6 +168,17 @@ class WebStack(Stack):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
         memory.grant_full_access(task_role)
+
+        # Observability pass (see DESIGN.md): lets the ADOT collector
+        # sidecar (added below) forward the traces it receives from
+        # WebContainer to AWS X-Ray. AWS's managed policy for exactly
+        # this purpose — same permission set the classic X-Ray daemon
+        # itself would need (PutTraceSegments/PutTelemetryRecords/
+        # GetSampling*), reused here since the ADOT collector plays the
+        # same "forward segments to X-Ray" role.
+        task_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("AWSXRayDaemonWriteAccess")
+        )
 
         # Envelope-encryption key for the session cookie (web/auth.py's
         # SessionCookieCodec) — replaces the ALB's own signing keypair now
@@ -252,6 +286,45 @@ class WebStack(Stack):
             idle_timeout=ALB_IDLE_TIMEOUT,
         )
 
+        # ALB access logs -> CloudWatch Logs (observability pass, see
+        # DESIGN.md): this is CloudWatch's newer, direct-to-CWL vended-
+        # logs integration for ALB (`AWS::Logs::DeliverySource` with
+        # `LogType: ALB_ACCESS_LOGS`), not the older `access_logs.s3.*`
+        # load balancer attribute — chosen so ALB request-level logs land
+        # in CloudWatch alongside every other component's logs in this
+        # project, rather than introducing a new S3 bucket + lifecycle
+        # policy just for this one log type. Mirrors the same
+        # DeliverySource/DeliveryDestination/Delivery triple
+        # `gateway_stack.py` already uses for the Gateway's own
+        # application logs/traces — no new pattern introduced.
+        alb_access_log_group = logs.LogGroup(
+            self,
+            "AlbAccessLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+        alb_logs_source = logs.CfnDeliverySource(
+            self,
+            "AlbAccessLogsDeliverySource",
+            name="travel-agent-web-alb-access-logs-source",
+            log_type="ALB_ACCESS_LOGS",
+            resource_arn=self.load_balancer.load_balancer_arn,
+        )
+        alb_logs_destination = logs.CfnDeliveryDestination(
+            self,
+            "AlbAccessLogsDeliveryDestination",
+            name="travel-agent-web-alb-access-logs-destination",
+            delivery_destination_type="CWL",
+            destination_resource_arn=alb_access_log_group.log_group_arn,
+        )
+        alb_logs_delivery = logs.CfnDelivery(
+            self,
+            "AlbAccessLogsDelivery",
+            delivery_source_name=alb_logs_source.name,
+            delivery_destination_arn=alb_logs_destination.attr_arn,
+        )
+        alb_logs_delivery.node.add_dependency(alb_logs_source)
+        alb_logs_delivery.node.add_dependency(alb_logs_destination)
+
         # The OIDC redirect_uri points at web_hostname (a caller-supplied
         # friendly domain the caller has separately pointed at this ALB —
         # DNS is explicitly out of scope for this stack, decision #40),
@@ -285,11 +358,42 @@ class WebStack(Stack):
             # what previously forced the build context to be the whole
             # repo root plus a long exclude list for cdk.out/.venv/.git).
         )
-        task_definition.add_container(
+        # ADOT collector sidecar (observability pass, see DESIGN.md's
+        # rationale for choosing OTel over the classic X-Ray SDK for this
+        # FastAPI app): must start before WebContainer, which sends it
+        # traces over OTLP/gRPC on OTLP_GRPC_PORT via the task's shared
+        # `awsvpc` network namespace (both containers see "localhost" as
+        # the same network interface).
+        adot_log_group = logs.LogGroup(
+            self,
+            "AdotCollectorLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+        adot_container = task_definition.add_container(
+            "AdotCollector",
+            image=ecs.ContainerImage.from_registry(ADOT_COLLECTOR_IMAGE),
+            essential=True,
+            command=[f"--config={ADOT_COLLECTOR_CONFIG}"],
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="adot-collector", log_group=adot_log_group
+            ),
+        )
+
+        web_log_group = logs.LogGroup(
+            self,
+            "WebContainerLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+        web_container = task_definition.add_container(
             "WebContainer",
             image=container_image,
             port_mappings=[ecs.PortMapping(container_port=CONTAINER_PORT)],
-            logging=ecs.LogDrivers.aws_logs(stream_prefix="travel-agent-web"),
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="travel-agent-web", log_group=web_log_group
+            ),
+            environment={
+                "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://localhost:{OTLP_GRPC_PORT}",
+            },
             command=[
                 "--agent-runtime-arn",
                 runtime.agent_runtime_arn,
@@ -329,6 +433,22 @@ class WebStack(Stack):
                 runtime_oidc_scope,
             ],
         )
+        web_container.add_container_dependencies(
+            ecs.ContainerDependency(
+                container=adot_container,
+                condition=ecs.ContainerDependencyCondition.START,
+            )
+        )
+
+        # Explicit, not implicit: CDK defaults the load-balanced container
+        # to "the first essential container added to the task" — since
+        # AdotCollector (also essential=True, for the START dependency
+        # above to be meaningful) is added first, it would otherwise
+        # become the ALB's target instead of WebContainer, and fail synth
+        # entirely (AdotCollector defines no port mappings for the ALB to
+        # attach to). Set explicitly so this doesn't depend on container
+        # add-order going forward.
+        task_definition.default_container = web_container
 
         fargate_service = ecs.FargateService(
             self,

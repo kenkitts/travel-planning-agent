@@ -103,6 +103,7 @@ from aws_cdk import BundlingOptions, Stack
 from aws_cdk import aws_bedrockagentcore as agentcore
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -272,6 +273,24 @@ class RuntimeStack(Stack):
             # 100% indexing) for spans to reach the GenAI Observability
             # dashboard.
             tracing_enabled=True,
+        )
+
+        # Observability pass (see DESIGN.md): AgentCore creates this
+        # Runtime's application log group itself, lazily, on first
+        # invocation — not at deploy time, and not with any retention set
+        # (CDK's own docs for the Runtime construct confirm this and
+        # recommend exactly this LogRetention pattern). Without this, the
+        # log group defaults to "never expire" once AWS creates it,
+        # unlike every other log group in this project (all explicitly
+        # set to ONE_MONTH). log_group_name is built from
+        # self.runtime.agent_runtime_id (a token resolved at deploy time,
+        # not RUNTIME_NAME) to match AWS's documented naming convention:
+        # /aws/bedrock-agentcore/runtimes/{agentRuntimeId}-DEFAULT.
+        logs.LogRetention(
+            self,
+            "RuntimeLogRetention",
+            log_group_name=f"/aws/bedrock-agentcore/runtimes/{self.runtime.agent_runtime_id}-DEFAULT",
+            retention=logs.RetentionDays.ONE_MONTH,
         )
 
         # Claude Sonnet invocation for the agent's own reasoning. The "us."

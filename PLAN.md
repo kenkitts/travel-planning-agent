@@ -1383,6 +1383,112 @@ was written.
   goal this phase set out to verify, not previously exercised at
   synth-only verification time.
 
+## Phase 15 — Observability pass: logging, tracing, log retention across all 5 stacks (added 2026-08-31)
+
+See DESIGN.md §2h (decisions #97-104) for the full design rationale,
+including why custom metrics, alarms, and a dashboard were all
+considered and explicitly deferred rather than built this phase, and the
+mid-implementation deviation from the original plan (classic X-Ray SDK
+→ ADOT/OpenTelemetry for the Web stack only).
+
+### What was built
+- `lambdas/weather/handler.py` / `lambdas/places/handler.py`: added
+  `logger.info()`/`.warning()`/`.error()`/`.exception()` calls at the
+  request, upstream-call, and response boundaries — both handlers
+  previously emitted nothing beyond Lambda's own automatic invocation/
+  error/duration lines. Purely additive; no return values or control
+  flow changed.
+- `cdk/stacks/tools_stack.py`: both Lambda functions gained
+  `tracing=lambda_.Tracing.ACTIVE` (auto-grants
+  `xray:PutTraceSegments`/`PutTelemetryRecords` on the execution role —
+  no manual IAM statement needed) and an explicit `logs.LogGroup(
+  retention=RetentionDays.ONE_MONTH)` (Lambda's own default log group
+  has no retention set, i.e. never expires). Also added the project's
+  single account/region-wide `xray.CfnSamplingRule` (100% sampling,
+  `priority=1`, overriding X-Ray's built-in default rule) here, since
+  sampling rules have no natural per-stack home.
+- `cdk/stacks/runtime_stack.py`: added a `logs.LogRetention` custom
+  resource targeting `/aws/bedrock-agentcore/runtimes/
+  {self.runtime.agent_runtime_id}-DEFAULT` with `ONE_MONTH` retention —
+  the Runtime's own log group is created lazily by AgentCore on first
+  invocation, not by CDK at deploy time, so there's no direct
+  CDK-property equivalent (per the `aws_bedrockagentcore` module's own
+  documented workaround).
+- `web/requirements.txt` / `web/server.py`: added
+  `opentelemetry-distro`/`opentelemetry-exporter-otlp-proto-grpc`/
+  `opentelemetry-instrumentation-fastapi`. `server.py`'s `build_app()`
+  now configures a `TracerProvider` + `BatchSpanProcessor` +
+  `OTLPSpanExporter` (endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  defaulting to `http://localhost:4317`) and calls
+  `FastAPIInstrumentor.instrument_app(app)` — the classic X-Ray SDK's
+  automatic middleware doesn't support FastAPI/ASGI (confirmed against
+  AWS's own docs), so this app uses OpenTelemetry instead while every
+  other component keeps its existing X-Ray-native tracing.
+- `web/tests/conftest.py` (new file): sets `OTEL_SDK_DISABLED=true` for
+  the test run, since there's no local ADOT collector during tests —
+  purely to suppress harmless connection-refused log noise, not a
+  functional requirement.
+- `cdk/stacks/web_stack.py`:
+  - Added the `AWSXRayDaemonWriteAccess` managed policy to the ECS task
+    role (needed by the new ADOT collector sidecar to forward traces to
+    X-Ray).
+  - Added an `AdotCollector` sidecar container
+    (`public.ecr.aws/aws-observability/aws-otel-collector:v0.30.0`,
+    `--config=/etc/ecs/ecs-default-config.yaml` — **corrected after a
+    live deployment failure**; the initially-deployed
+    `otel-instance-metrics-config.yaml` bundles a host-metrics receiver
+    that requires a real EC2 host filesystem and crash-loops on Fargate
+    with `lstat /rootfs/proc: no such file or directory`; see DESIGN.md
+    decision #105) with its own retained log group; `WebContainer` now
+    depends on it via `ContainerDependencyCondition.START`.
+  - Explicitly set `task_definition.default_container = web_container`
+    — CDK otherwise defaults the ALB's target to "the first essential
+    container added," which became `AdotCollector` (no port mappings)
+    once it existed, breaking the target-group attachment
+    (`ContainerHasntDefinedPorts`) until this was set explicitly.
+  - Added explicit, retained log groups for both `WebContainer` and
+    `AdotCollector` (previously `WebContainer` had none — CDK's
+    `ecs.LogDrivers.aws_logs()` without an explicit `log_group=` never
+    expires by default).
+  - Added ALB access logs → CloudWatch Logs via a new
+    `AWS::Logs::DeliverySource`/`DeliveryDestination`/`Delivery` triple
+    (`LogType: ALB_ACCESS_LOGS`) — CloudWatch's newer direct-to-CWL
+    vended-logs path for ALB, not the older S3-attribute mechanism —
+    mirroring the exact pattern `gateway_stack.py` already used for the
+    Gateway's own logs/traces.
+- `cdk/stacks/gateway_stack.py`, `cdk/stacks/memory_stack.py`: reviewed
+  for applicable additions. Gateway already had logs+traces+30-day
+  retention from an earlier phase (unchanged). Memory has no compute or
+  request path of its own and no observability-related property exposed
+  by its CDK construct at all — confirmed a genuine no-op for this
+  phase, not an oversight.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 175/175 passing throughout —
+  every code change in this phase was additive (new logging statements,
+  new tracing config, new log groups/sampling rule/delivery resources);
+  no existing behavior, return value, or test needed to change.
+- `cdk synth --all`: all 5 stacks synthesize cleanly with zero
+  CloudFormation validation warnings. A real warning was caught and
+  fixed during this process — the sampling rule's `RuleName`
+  (`travel-planning-agent-full-sampling`, 35 characters) exceeded
+  X-Ray's 32-character limit; shortened to
+  `travel-agent-full-sampling` (27 characters).
+- Direct template inspection confirmed: `TracingConfig.Mode: Active` and
+  `RetentionInDays: 30` on both Lambda functions; the `AdotCollector`
+  container, `AWSXRayDaemonWriteAccess` policy attachment, and
+  `ALB_ACCESS_LOGS` delivery source all present in `WebStack`'s
+  synthesized template; the `Custom::LogRetention` resource in
+  `RuntimeStack` with a correctly-resolved `LogGroupName` (via
+  `Fn::Join`/`Fn::GetAtt` on `agent_runtime_id`); `FixedRate: 1`/
+  `Priority: 1` on the `AWS::XRay::SamplingRule` resource.
+- Not yet deployed/verified live as of this writing — all verification
+  for this phase is synth-time and unit-test-time; a live deploy would
+  additionally need to confirm the ADOT collector sidecar actually
+  starts and forwards traces successfully (container health/logs), and
+  that a real request produces a visible, complete trace in the X-Ray
+  console — neither of which synth or unit tests can exercise.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

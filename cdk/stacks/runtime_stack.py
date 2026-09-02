@@ -109,9 +109,6 @@ from constructs import Construct
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_DIR = REPO_ROOT / "agent"
 
-# Matches the model ID used as the default in agent/agent.py.
-DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-5"
-
 # The Runtime's own base name (before AWS appends its random "-XXXXXXXXXX"
 # suffix to form the actual agent_runtime_id/workload-identity name) — see
 # the OBO IAM grant below for why this is needed as a wildcard prefix
@@ -130,11 +127,13 @@ class RuntimeStack(Stack):
         *,
         gateway: agentcore.IGateway,
         memory: agentcore.IMemory,
+        model_id: str,
         runtime_oidc_discovery_url: str | None = None,
         runtime_oidc_allowed_audience: list[str] | None = None,
         runtime_oidc_allowed_clients: list[str] | None = None,
         runtime_oidc_allowed_scopes: list[str] | None = None,
         gateway_oauth2_credential_provider: agentcore.CfnOAuth2CredentialProvider | None = None,
+        gateway_inference_url: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -237,7 +236,17 @@ class RuntimeStack(Stack):
                 "GATEWAY_URL": gateway.gateway_url or "",
                 "MEMORY_ID": memory.memory_id,
                 "AWS_REGION": self.region,
-                "MODEL_ID": DEFAULT_MODEL_ID,
+                "MODEL_ID": model_id,
+                # Gateway's inference target base URL (see
+                # GatewayStack._add_inference_target()) — always wired
+                # (the target always exists), but agent.py only actually
+                # routes model calls through it when this is set to a
+                # non-empty value at the caller's discretion, mirroring
+                # GATEWAY_URL's own "empty string means not configured"
+                # convention rather than gating this on a separate
+                # boolean env var. Rate limiting/RBAC policy on this
+                # target is a deliberate fast-follow, not wired here.
+                "GATEWAY_INFERENCE_URL": gateway_inference_url or "",
                 # Required alongside the opentelemetry-instrument entrypoint
                 # wrapper (see agent_runtime_artifact above) for ADOT to
                 # activate AgentCore's GenAI-specific span processing and

@@ -1489,6 +1489,107 @@ mid-implementation deviation from the original plan (classic X-Ray SDK
   that a real request produces a visible, complete trace in the X-Ray
   console — neither of which synth or unit tests can exercise.
 
+## Phase 16 — Gateway-routed inference for centralized governance (added 2026-09-01)
+
+See DESIGN.md §2i (decisions #106-114) for the full design rationale.
+The originally-implemented approach (a hand-rolled `provider`-type
+inference target against `bedrock-runtime`) was abandoned after two
+successive live-deploy failures and replaced with the built-in
+`bedrock-mantle` connector — decisions #106-110 record the full failure
+sequence and why each fix was chosen, not just the final answer, per
+this project's own documentation convention.
+
+### What was built
+- `cdk/app.py`: added a single `model_id` variable (from the `MODEL_ID`
+  env var, same default as before) threaded into both `GatewayStack`
+  and `RuntimeStack` — replacing `runtime_stack.py`'s own
+  `DEFAULT_MODEL_ID` module constant, which the README had flagged as
+  needing to stay in sync with `agent/agent.py`'s own `MODEL_ID` default
+  (now one source of truth instead of two).
+- `cdk/stacks/gateway_stack.py`: added a fourth Gateway target,
+  `InferenceTargetV2` (`agentcore.CfnGatewayTarget` with
+  `InferenceTargetConfigurationProperty(connector=...)`,
+  `connector_id="bedrock-mantle"`, name `bedrock-inference-v2`) —
+  `...V2` because AWS's API rejects an in-place `provider`→`connector`
+  target-type change (decision #109), forcing a real resource
+  replacement of the original `InferenceTarget`/`bedrock-inference`.
+  `_grant_bedrock_inference_invoke()` now grants
+  `bedrock:InvokeModel`/`InvokeModelWithResponseStream` (scoped to the
+  exact `inference-profile/{model_id}` ARN) plus
+  `bedrock-mantle:ListModels`/`CreateInference` (scoped to
+  `project/default`) and `bedrock-mantle:CallWithBearerToken` (decision
+  #107) — returns an `AddToPrincipalPolicyResult` so the target's
+  creation can be made to explicitly depend on the grant via
+  `.policy_dependable` (decision #108: found live that CloudFormation
+  doesn't otherwise guarantee the IAM policy propagates before the
+  target's own creation-time `ListModels` call runs). Exposes
+  `self.inference_url` (the Gateway's own base URL, built from
+  `gateway_id` + region — NOT by string-splitting `gateway.gateway_url`,
+  which is an unresolved CDK token at synth time, confirmed by a real
+  deployed value coming back wrong as `.../mcp/inference`).
+- `cdk/stacks/runtime_stack.py`: accepts `model_id` and
+  `gateway_inference_url` constructor params; wires a new
+  `GATEWAY_INFERENCE_URL` environment variable.
+- `agent/agent.py`: added `build_model()`, replacing the inline
+  `BedrockModel(...)` construction in `invoke()`. Returns the existing
+  `BedrockModel` unchanged when `GATEWAY_INFERENCE_URL` is empty
+  (default, byte-for-byte the same behavior as before this phase). When
+  set, returns `strands.models.anthropic.AnthropicModel` with
+  `client_args={"auth_token": <OBO token>, "base_url":
+  GATEWAY_INFERENCE_URL}` and `model_id=GATEWAY_INFERENCE_MODEL_ID` — a
+  new constant that strips a literal `"us."` prefix from `MODEL_ID` if
+  present (decision #110: found live that the Gateway-routed path needs
+  the bare foundation-model ID `anthropic.claude-sonnet-5`, not
+  `MODEL_ID`'s own cross-region-inference-profile-prefixed
+  `us.anthropic.claude-sonnet-5`, which returned a real Anthropic 404).
+  Reuses the exact same OBO-cached Gateway token `build_mcp_client()`
+  already obtains for tool calls. Both branches configure the identical
+  adaptive-thinking request shape, just under each provider's own
+  parameter name (`additional_request_fields` for `BedrockModel`,
+  `params` for `AnthropicModel`).
+- `agent/requirements.txt`: `strands-agents==1.52.0` →
+  `strands-agents[anthropic]==1.52.0` (same pinned version, adds the
+  `anthropic>=0.21.0,<1.0.0` extra).
+- `tests/test_agent.py`: added `BuildModelTests` (4 tests), mirroring
+  `BuildMcpClientTests`' own setUp/tearDown/patching conventions —
+  covers the default-`BedrockModel` path, the missing-workload-token
+  error path, the `AnthropicModel`-via-Gateway path (asserting the
+  actual `auth_token`/`base_url`/`model_id` reached the underlying
+  Anthropic client, including that `GATEWAY_INFERENCE_MODEL_ID` differs
+  from `MODEL_ID`), and that `build_model()` and `build_mcp_client()`
+  share the same OBO token cache entry for one caller.
+
+### Verified — live, end-to-end, not just deployed
+This phase went through several rounds of real live-deploy failures
+before reaching a working state — each one diagnosed from real error
+messages (a Coral `UnknownOperationException`, a real Anthropic `401`
+then `404`, two distinct CloudFormation `UPDATE_FAILED`/clean-rollback
+events for immutable-property and IAM-ordering issues), not guessed at
+from docs alone. A temporary raw-`httpx` debug probe was added to
+`agent.py` twice during this process (to see the Gateway's actual raw
+response body, bypassing Strands/the Anthropic SDK's own SSE parsing)
+and removed both times before this phase's final state.
+
+- **Final live confirmation** (the actual bar for "done" on this
+  phase): a real user turn through the web UI produced a real,
+  non-empty assistant response. Its X-Ray trace shows
+  `gen_ai.request.model: "anthropic.claude-sonnet-5"`, real non-zero
+  token usage (`input_tokens: 4249`, `output_tokens: 352`,
+  `total_tokens: 4601`), a genuine multi-second `chat` span (`chat` span
+  duration ~5.9s, `time_to_first_token: 1369ms`), and a
+  `POST .../inference/v1/messages` call from the Runtime to the Gateway
+  returning `200`, with `HasFault: false`/`HasError: false` throughout
+  the whole trace.
+- `cdk synth --all`/`cdk deploy`: clean at every stage after each fix;
+  each live-deploy failure produced a clean `UPDATE_ROLLBACK_COMPLETE`
+  with no partial state, confirmed via `describe-stack-events` and
+  `get-gateway-target` before proceeding to the next fix.
+- `python -m pytest tests/ web/tests/`: 179/179 passing throughout.
+- Deployed and left live with `GATEWAY_INFERENCE_URL` set (this test
+  environment's explicit choice — production-grade caution about
+  reverting on first failure was deliberately relaxed here in favor of
+  reaching a genuinely diagnosed and fixed root cause).
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

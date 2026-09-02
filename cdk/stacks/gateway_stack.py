@@ -57,6 +57,40 @@ Search must be enabled once per account/region for X-Ray to actually land
 spans in CloudWatch — see README's Observability section), and a
 CfnDelivery connecting each source to its destination.
 
+Gateway-routed inference (a fourth target, added alongside the three tool
+targets above): a `bedrock-mantle` connector inference target — the
+route to a hand-rolled `provider`-type target against `bedrock-runtime`
+(the originally-attempted approach; still findable in this file's git
+history) was abandoned after two successive live-deploy failures: (1) a
+Coral `UnknownOperationException` from an incorrect `providerPath`
+(`bedrock-runtime`'s Anthropic-native route is
+`/anthropic/v1/messages`, not `/v1/messages`, which is `bedrock-mantle`'s
+own convention that every documented provider-target example happens to
+use), then (2) once that path was corrected, a real Anthropic `401`
+("Credential should be scoped to correct service: 'bedrock'") — this
+Gateway's `GATEWAY_IAM_ROLE` outbound SigV4 signing has no way to know it
+should sign as service `bedrock` for that specific route, and every one
+of AWS's own documented examples for `bedrock-runtime`'s Anthropic-native
+path use a Bedrock API key, not a hand-signed SigV4 request through a
+generic HTTP proxy. Rather than provisioning a new Bedrock API key +
+AgentCore Identity `API_KEY` credential provider (a new secret/credential
+to manage, changing this feature's security posture), switched to the
+built-in `bedrock-mantle` connector (`connector_id="bedrock-mantle"`):
+AWS's own purpose-built integration handles the endpoint/path/auth
+wiring internally instead of this project hand-rolling it. This does
+still need its own, distinct IAM grant — a `bedrock-mantle` connector
+target genuinely calls `bedrock-mantle:ListModels`/`CreateInference`/
+`CallWithBearerToken` (confirmed against AWS's own
+`AmazonBedrockMantleInferenceAccess` managed policy, granted here as
+individually-listed actions rather than that policy's wildcards) on top
+of the `bedrock:InvokeModel`/`InvokeModelWithResponseStream` grant this
+target always needed — this Gateway's role had zero Bedrock permissions
+of any kind before this. This target is additive and always created;
+agent.py's own use of it is opt-in via GATEWAY_INFERENCE_URL (see
+agent.py and DESIGN.md's Gateway-routed-inference decision) — rate
+limiting/RBAC policy on top of this target is deliberately deferred to a
+fast-follow, not part of this pass.
+
 OAuth2 credential provider (Phase 3, added when Gateway JWT auth is
 configured): a CfnOAuth2CredentialProvider resource ("CustomOauth2" vendor)
 pointing at a dedicated Okta "API Services" app configured for the Token
@@ -117,6 +151,7 @@ class GatewayStack(Stack):
         *,
         weather_function: lambda_.IFunction,
         places_function: lambda_.IFunction,
+        model_id: str,
         gateway_oidc_discovery_url: str | None = None,
         gateway_oidc_allowed_audience: list[str] | None = None,
         gateway_oidc_allowed_clients: list[str] | None = None,
@@ -184,6 +219,48 @@ class GatewayStack(Stack):
         )
 
         self._configure_observability()
+
+        # Grant IAM permissions BEFORE creating the target — the target's
+        # own creation synchronously calls bedrock-mantle:ListModels to
+        # discover available models (confirmed live: CREATE_FAILED with
+        # "GatewayTarget ... failed to stabilize ... 403 ... no
+        # identity-based policy allows the bedrock-mantle:ListModels
+        # action" when the target and the IAM grant were created in the
+        # same deploy without an explicit ordering dependency — creating
+        # both resources in one CloudFormation changeset doesn't
+        # guarantee the IAM policy attaches before the target's own
+        # creation-time model-discovery call runs). Depends on
+        # policy_dependable specifically (not just self.gateway.role) —
+        # the role resource itself existing doesn't guarantee its policy
+        # attachment has finished; policy_dependable is the actual
+        # construct CDK's own AddToPrincipalPolicyResult recommends for
+        # this exact ordering guarantee.
+        inference_grant = self._grant_bedrock_inference_invoke(model_id)
+        self.inference_target = self._add_inference_target(model_id)
+        self.inference_target.node.add_dependency(inference_grant.policy_dependable)
+        # Gateway's inference targets are reachable at
+        # {gatewayUrl}/inference/{path} — gateway_url above is the MCP
+        # endpoint (".../mcp"), so this is the Gateway's own base HTTPS
+        # URL with "/inference" appended, not a value AWS's Gateway
+        # construct exposes directly. Always computed (this target always
+        # exists) — agent.py treats an *unset* GATEWAY_INFERENCE_URL env
+        # var as "don't use it", not this stack as the on/off switch (see
+        # RuntimeStack/agent.py for the actual opt-in).
+        #
+        # Built from gateway_id + region, NOT by string-splitting
+        # self.gateway.gateway_url — found via a live deploy that
+        # self.gateway.gateway_url is a CDK token (resolved only at
+        # CloudFormation deploy time, not a real Python string at synth
+        # time), so calling .rsplit('/mcp', 1) on it is a no-op against
+        # the token's placeholder representation, not the real resolved
+        # URL: the deployed value came back as ".../mcp/inference", not
+        # ".../inference" (confirmed via a live get-agent-runtime call
+        # after deploying). gateway_id is used the same token-safe way
+        # for gateway_identifier= elsewhere in this file.
+        self.inference_url = (
+            f"https://{self.gateway.gateway_id}.gateway.bedrock-agentcore."
+            f"{self.region}.amazonaws.com/inference"
+        )
 
         self.oauth2_credential_provider = None
         if gateway_oidc_discovery_url and gateway_oidc_client_id and gateway_oidc_client_secret:
@@ -393,6 +470,148 @@ class GatewayStack(Stack):
                                 parameter_values={},
                             ),
                         ],
+                    ),
+                ),
+            ),
+            credential_provider_configurations=[
+                agentcore.CfnGatewayTarget.CredentialProviderConfigurationProperty(
+                    credential_provider_type="GATEWAY_IAM_ROLE",
+                ),
+            ],
+        )
+
+    def _grant_bedrock_inference_invoke(self, model_id: str) -> iam.AddToPrincipalPolicyResult:
+        """Grant the Gateway's own service role permission to invoke the
+        Bedrock model behind the inference target, scoped to the exact
+        model/inference-profile ARN — not a wildcard across all Bedrock
+        models, matching this project's existing narrow-scoping precedent
+        (the Lambda targets above are scoped to their exact function
+        ARNs, not lambda:InvokeFunction on "*").
+
+        Both InvokeModel and InvokeModelWithResponseStream are granted,
+        plus bedrock-mantle:ListModels and bedrock-mantle:CreateInference
+        (scoped to this account/region's default Bedrock Mantle project)
+        and bedrock-mantle:CallWithBearerToken — the exact action set
+        AWS's own AmazonBedrockMantleInferenceAccess managed policy
+        grants for bedrock-mantle inference, used here as individually
+        -listed actions (not that policy's Get*/List* wildcards) to keep
+        this scoped no more broadly than what's actually needed, matching
+        this project's existing narrow-scoping precedent (the Lambda
+        targets above are scoped to their exact function ARNs, not
+        lambda:InvokeFunction on "*"). `model_id` (e.g.
+        "us.anthropic.claude-sonnet-5") is a cross-region inference
+        profile ID, not a plain foundation-model ID — its ARN uses the
+        `inference-profile` resource type, not `foundation-model`
+        (confirmed against AWS's own IAM policy examples for inference
+        profiles). ListModels/CreateInference need the account's default
+        Bedrock Mantle project ARN
+        (arn:aws:bedrock-mantle:{region}:{account}:project/default,
+        confirmed against AWS's own "Projects (OpenAI-compatible)" doc
+        example) — CallWithBearerToken has no resource-level scoping
+        available (its own managed-policy example uses Resource: "*").
+
+        Returns the last statement's AddToPrincipalPolicyResult so the
+        caller can make the inference target's creation explicitly
+        depend on it via .policy_dependable — see this method's call
+        site for why that ordering guarantee is required.
+        """
+        self.gateway.role.add_to_principal_policy(
+            iam.PolicyStatement(
+                sid="InvokeBedrockInferenceModel",
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                ],
+                resources=[
+                    f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/{model_id}",
+                ],
+            )
+        )
+        self.gateway.role.add_to_principal_policy(
+            iam.PolicyStatement(
+                sid="BedrockMantleInference",
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "bedrock-mantle:ListModels",
+                    "bedrock-mantle:CreateInference",
+                ],
+                resources=[
+                    f"arn:aws:bedrock-mantle:{self.region}:{self.account}:project/default",
+                ],
+            )
+        )
+        return self.gateway.role.add_to_principal_policy(
+            iam.PolicyStatement(
+                sid="BedrockMantleCallWithBearerToken",
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock-mantle:CallWithBearerToken"],
+                resources=["*"],
+            )
+        )
+
+    def _add_inference_target(self, model_id: str) -> agentcore.CfnGatewayTarget:
+        """Add a bedrock-mantle connector inference target.
+
+        Switched from a hand-rolled bedrock-runtime provider target
+        (endpoint + explicit operations/provider_path) after two
+        successive live-deploy failures with that approach: (1) the
+        provider_path needed to reach bedrock-runtime's Anthropic-native
+        route is "/anthropic/v1/messages", not "/v1/messages"
+        (bedrock-mantle's own convention, which every documented
+        provider-target example happens to use) — found via a live Coral
+        com.amazon.coral.service#UnknownOperationException; (2) once the
+        path was corrected, the actual call failed with a real Anthropic
+        401 "Credential should be scoped to correct service: 'bedrock'"
+        — GATEWAY_IAM_ROLE's generic SigV4 signing has no way to know it
+        should sign as service "bedrock" for this specific route, and
+        every one of AWS's own documented examples for bedrock-runtime's
+        Anthropic-native path use an API key, not a hand-signed SigV4
+        request through a generic HTTP proxy. Rather than provisioning a
+        new Bedrock API key + AgentCore Identity API_KEY credential
+        provider (a real new secret/credential to manage, changing this
+        feature's security posture), switched to the built-in
+        bedrock-mantle connector: AWS's own purpose-built integration
+        handles the endpoint/path/auth wiring internally rather than
+        this project hand-rolling it, and it correctly reports its own
+        model list via the same ListModels call that failed on the first
+        live-deploy attempt this session (which is what surfaces here as
+        a straightforward, fixable IAM gap rather than another
+        undocumented path/auth mismatch to reverse-engineer).
+
+        connector_id="bedrock-mantle" auto-configures endpoint, path
+        rewriting, and model-ID-prefix stripping — no explicit
+        endpoint/operations/provider_path needed, unlike the provider
+        target this replaces. `model_id` is still passed as an explicit
+        models allowlist on this account's Gateway-side rate-limiting/
+        RBAC surface even though the connector itself does its own model
+        discovery — matching decision #92's ECS-task-role precedent of
+        no unnecessary broad access (this agent only ever calls exactly
+        one model).
+        """
+        return agentcore.CfnGatewayTarget(
+            self,
+            # "...V2" — forces a fresh AWS::BedrockAgentCore::GatewayTarget
+            # replacement rather than an in-place update. AWS's own API
+            # rejects an in-place provider->connector target-type change
+            # ("Target configuration cannot be updated from provider to
+            # connector") — confirmed live: the first deploy attempt at
+            # this logical ID hit exactly that error and cleanly rolled
+            # back (UPDATE_ROLLBACK_COMPLETE, no partial state). Same
+            # replace-via-logical-ID-change pattern already used elsewhere
+            # in this file for the Gateway resource itself and its log-
+            # delivery sources, for the analogous authorizerType
+            # immutability constraint.
+            "InferenceTargetV2",
+            name="bedrock-inference-v2",
+            description="Routes agent model calls through the Gateway for centralized governance.",
+            gateway_identifier=self.gateway.gateway_id,
+            target_configuration=agentcore.CfnGatewayTarget.TargetConfigurationProperty(
+                inference=agentcore.CfnGatewayTarget.InferenceTargetConfigurationProperty(
+                    connector=agentcore.CfnGatewayTarget.InferenceConnectorTargetConfigurationProperty(
+                        source=agentcore.CfnGatewayTarget.InferenceConnectorSourceProperty(
+                            connector_id="bedrock-mantle",
+                        ),
                     ),
                 ),
             ),

@@ -26,7 +26,14 @@ Stack wiring:
                   variables are present, independently of whether WebStack
                   itself is being deployed this run (RuntimeStack has no
                   hard dependency on WEB_CERTIFICATE_ARN/WEB_OIDC_* — see
-                  WebStack's own note below).
+                  WebStack's own note below). agent.py's own
+                  GATEWAY_INFERENCE_URL env var (always wired from
+                  GatewayStack's new inference target, but only actually
+                  used by the agent when opted into — see agent.py) routes
+                  model calls through the Gateway's inference target
+                  instead of calling bedrock-runtime directly, for
+                  centralized governance/rate-limiting (DESIGN.md's
+                  Gateway-routed-inference decision).
   WebStack     -> hosts the web UI on ECS Fargate behind a plain
                   (non-OIDC) ALB (see DESIGN.md's Phase 1 auth
                   rearchitecture decision, superseding decision #37/#38's
@@ -94,6 +101,16 @@ app = cdk.App()
 
 env = cdk.Environment(region="us-east-1")
 
+# Single source of truth for the Bedrock model ID, replacing what used to
+# be two independently-hardcoded copies (agent/agent.py's own MODEL_ID
+# default and runtime_stack.py's DEFAULT_MODEL_ID module constant — see
+# the README's own "must stay in sync" warning about that duplication).
+# Threading it through here means a model version bump is a one-line
+# change in exactly one place, including the new Gateway inference
+# target/IAM scoping below (DESIGN.md's Gateway-routed-inference decision)
+# rather than a third place this string could silently drift.
+model_id = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
+
 tools_stack = ToolsStack(app, "TravelAgentToolsStack", env=env)
 
 # GatewayStack's JWT authorizer is optional and independent of WebStack —
@@ -128,6 +145,7 @@ gateway_stack = GatewayStack(
     env=env,
     weather_function=tools_stack.weather_function,
     places_function=tools_stack.places_function,
+    model_id=model_id,
     gateway_oidc_discovery_url=gateway_oidc_discovery_url,
     gateway_oidc_allowed_audience=gateway_oidc_allowed_audience,
     gateway_oidc_allowed_clients=gateway_oidc_allowed_clients,
@@ -186,11 +204,13 @@ runtime_stack = RuntimeStack(
     env=env,
     gateway=gateway_stack.gateway,
     memory=memory_stack.memory,
+    model_id=model_id,
     runtime_oidc_discovery_url=runtime_oidc_discovery_url,
     runtime_oidc_allowed_audience=runtime_oidc_allowed_audience,
     runtime_oidc_allowed_clients=runtime_oidc_allowed_clients,
     runtime_oidc_allowed_scopes=runtime_oidc_allowed_scopes,
     gateway_oauth2_credential_provider=gateway_stack.oauth2_credential_provider,
+    gateway_inference_url=gateway_stack.inference_url,
 )
 runtime_stack.add_dependency(gateway_stack)
 runtime_stack.add_dependency(memory_stack)

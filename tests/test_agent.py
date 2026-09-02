@@ -647,5 +647,114 @@ class BuildMcpClientTests(unittest.TestCase):
             self.assertEqual(fake_get_token.await_count, 2)
 
 
+class BuildModelTests(unittest.TestCase):
+    """Covers build_model()'s BedrockModel/AnthropicModel branch — see
+    DESIGN.md's Gateway-routed-inference decision. Mirrors
+    BuildMcpClientTests' setUp/tearDown/patching conventions, since both
+    functions read the same module-level OBO config and token cache.
+    """
+
+    def setUp(self):
+        self._orig_gateway_inference_url = travel_agent.GATEWAY_INFERENCE_URL
+        self._orig_obo_provider_name = travel_agent.GATEWAY_OBO_PROVIDER_NAME
+
+    def tearDown(self):
+        travel_agent.GATEWAY_INFERENCE_URL = self._orig_gateway_inference_url
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = self._orig_obo_provider_name
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("")
+        travel_agent.BedrockAgentCoreContext.set_request_headers({})
+        travel_agent._GATEWAY_OBO_TOKEN_CACHE.clear()
+
+    def test_returns_bedrock_model_by_default(self):
+        travel_agent.GATEWAY_INFERENCE_URL = ""
+
+        model = asyncio_run(travel_agent.build_model())
+
+        self.assertIsInstance(model, travel_agent.BedrockModel)
+
+    def test_raises_when_inference_url_set_but_no_workload_token(self):
+        travel_agent.GATEWAY_INFERENCE_URL = "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("")
+
+        with self.assertRaises(RuntimeError):
+            asyncio_run(travel_agent.build_model())
+
+    def test_returns_anthropic_model_via_gateway_when_inference_url_set(self):
+        travel_agent.GATEWAY_INFERENCE_URL = (
+            "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
+        )
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+
+        fake_get_token = AsyncMock(return_value="fake-gateway-jwt")
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls:
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            model = asyncio_run(travel_agent.build_model())
+
+            self.assertIsInstance(model, travel_agent.AnthropicModel)
+            # Gateway-routed calls need the bare foundation-model ID
+            # (e.g. "anthropic.claude-sonnet-5"), not MODEL_ID's own
+            # "us."-prefixed cross-region-inference-profile form — found
+            # live: routing "us.anthropic.claude-sonnet-5" through the
+            # Gateway's bedrock-mantle connector target returned a real
+            # 404 ("Model ... not found on any target"), since that
+            # prefix is a bedrock-runtime/Converse-specific concept the
+            # connector's own model routing doesn't resolve.
+            self.assertEqual(model.config["model_id"], travel_agent.GATEWAY_INFERENCE_MODEL_ID)
+            self.assertNotEqual(model.config["model_id"], travel_agent.MODEL_ID)
+            # AnthropicModel stores client_args on its underlying client
+            # rather than exposing them directly — confirm the Bearer
+            # token and base_url actually reached the Anthropic client
+            # instance via its httpx client's configured auth/base_url,
+            # which is the only externally-observable proof they were
+            # passed through correctly.
+            anthropic_client = model.client
+            self.assertEqual(str(anthropic_client.base_url).rstrip("/"), travel_agent.GATEWAY_INFERENCE_URL)
+            self.assertEqual(
+                anthropic_client.auth_token,
+                "fake-gateway-jwt",
+            )
+            fake_get_token.assert_awaited_once_with(
+                provider_name="travel-planning-agent-gateway-obo",
+                scopes=[travel_agent.GATEWAY_OBO_SCOPE],
+                audiences=[travel_agent.GATEWAY_OBO_AUDIENCE],
+                agent_identity_token="fake-workload-token",
+                auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+                custom_parameters={
+                    "subject_token_type": travel_agent.GATEWAY_OBO_SUBJECT_TOKEN_TYPE
+                },
+            )
+
+    def test_reuses_cached_obo_token_across_mcp_client_and_model(self):
+        """Question 1 of this feature's design interview: build_model()
+        and build_mcp_client() must share the same OBO token cache entry
+        for the same caller, not perform two independent exchanges.
+        Requires a real request-header sub claim to resolve a cache key
+        at all — mirrors BuildMcpClientTests.test_obo_token_is_cached_per_sub_across_calls()'s
+        exact setup for that reason."""
+        travel_agent.GATEWAY_URL = "https://example-gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+        travel_agent.GATEWAY_INFERENCE_URL = (
+            "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
+        )
+        travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
+        travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
+        travel_agent.BedrockAgentCoreContext.set_request_headers(
+            {"Authorization": f"Bearer {GetActorIdTests._fake_jwt('alice@example.com')}"}
+        )
+
+        fake_get_token = AsyncMock(return_value=BuildMcpClientTests._fake_gateway_jwt(3600))
+        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls, \
+                patch.object(travel_agent, "streamablehttp_client"):
+            fake_identity_client_cls.return_value.get_token = fake_get_token
+
+            asyncio_run(travel_agent.build_mcp_client())
+            asyncio_run(travel_agent.build_model())
+
+            # Only the first call (build_mcp_client()) actually
+            # exchanges — build_model()'s call is a cache hit.
+            fake_get_token.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()

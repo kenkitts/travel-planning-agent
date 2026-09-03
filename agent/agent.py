@@ -116,7 +116,7 @@ from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
-from strands.types.exceptions import MaxTokensReachedException
+from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
 
 from prompts import build_system_prompt
@@ -418,6 +418,16 @@ async def stream_agent_turn(agent: Agent, user_message: str):
     "text" events) is followed by a final "error" event with a cut-off note,
     instead of letting the exception propagate out of the AgentCore Runtime
     entrypoint as an opaque failure.
+
+    Also handles strands.types.exceptions.ModelThrottledException: Strands'
+    own ModelRetryStrategy already retries a throttled model call
+    transparently, so this only fires once retries are exhausted (sustained
+    throttling, not a brief burst) — e.g. a Gateway-side token-per-minute
+    rate limit (see DESIGN.md) being hit consistently. There's no partial
+    response to preserve here (the failure is at the model-call layer,
+    before any tokens for that attempt are yielded), so this yields a plain
+    "error" event with a retry-later note rather than propagating the
+    exception out of the entrypoint as an opaque failure.
     """
     seen_tool_use_ids: set[str] = set()
     try:
@@ -493,6 +503,23 @@ async def stream_agent_turn(agent: Agent, user_message: str):
             "where I left off."
         )
         yield {"type": "error", "data": {"partial_text": partial_text, "note": note}}
+    except ModelThrottledException:
+        # Strands' own ModelRetryStrategy already retries a throttled model
+        # call transparently (exponential backoff, 6 attempts by default —
+        # see strands.event_loop._retry.ModelRetryStrategy), so this only
+        # fires once every retry has been exhausted, i.e. sustained
+        # throttling rather than a brief burst. Relevant now that Gateway-
+        # routed inference (see build_model()) can be capped by a
+        # CfnGatewayRateLimit TPM budget (DESIGN.md's rate-limiting
+        # decision) — without this handler, the exception propagated out
+        # of the AgentCore Runtime entrypoint uncaught, surfacing to the
+        # web UI as an opaque stream failure rather than a legible message.
+        logger.warning("Model call throttled after exhausting retries")
+        note = (
+            "I'm getting rate-limited right now — please try again in a "
+            "minute or two."
+        )
+        yield {"type": "error", "data": {"note": note}}
 
 
 def parse_session_id(runtime_session_id: Optional[str]) -> str:

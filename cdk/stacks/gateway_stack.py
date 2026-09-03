@@ -140,6 +140,14 @@ GATEWAY_LOG_GROUP_NAME = "/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_
 # variables — see cdk/app.py) when performing the OBO token exchange.
 GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
 
+# Default per-user token-per-minute budget for the inference target. A
+# starting value, not a load-tested ceiling — see _add_inference_rate_limit()
+# for the rationale. AWS's own Gateway rate-limit docs note token limits use
+# budget-based enforcement (estimated pre-call, reconciled post-call against
+# actual usage), so this is a soft, best-effort cap, not a hard per-request
+# guarantee.
+INFERENCE_TOKENS_PER_MINUTE_PER_USER = 50_000
+
 
 class GatewayStack(Stack):
     """AgentCore Gateway with Web Search + weather + places targets."""
@@ -237,8 +245,7 @@ class GatewayStack(Stack):
         # this exact ordering guarantee.
         inference_grant = self._grant_bedrock_inference_invoke(model_id)
         self.inference_target = self._add_inference_target(model_id)
-        self.inference_target.node.add_dependency(inference_grant.policy_dependable)
-        # Gateway's inference targets are reachable at
+        self.inference_target.node.add_dependency(inference_grant.policy_dependable)        # Gateway's inference targets are reachable at
         # {gatewayUrl}/inference/{path} — gateway_url above is the MCP
         # endpoint (".../mcp"), so this is the Gateway's own base HTTPS
         # URL with "/inference" appended, not a value AWS's Gateway
@@ -262,6 +269,25 @@ class GatewayStack(Stack):
             f"{self.region}.amazonaws.com/inference"
         )
 
+        # Per-user token-per-minute budget on the inference target, added
+        # as a fast-follow to the deferred rate-limiting/RBAC decision
+        # above (DESIGN.md). Dimensioned on the caller's JWT `sub` claim
+        # (not IAM principal) — this Gateway currently defaults to IAM
+        # auth (see _build_authorizer_configuration()), under which every
+        # caller through this project's own Runtime shares a single IAM
+        # principal, so a JWT-sub-scoped limit only takes effect once/if
+        # this Gateway's authorizer is switched to JWT (Phase 3's optional
+        # config). Kept JWT-scoped anyway rather than IAM-scoped, since
+        # per-*user* fairness (not just "this one Runtime's aggregate
+        # usage") is the actual goal here, and this is the dimension that
+        # achieves that once JWT auth is in place; a wildcard "*" entry
+        # still gives every distinct caller their own isolated budget in
+        # the meantime (or forever, if this Gateway stays IAM-only) rather
+        # than silently having no effect for unmatched callers (see AWS's
+        # own rate-limit best-practices doc on always including a
+        # catch-all entry).
+        self._add_inference_rate_limit(model_id)
+
         self.oauth2_credential_provider = None
         if gateway_oidc_discovery_url and gateway_oidc_client_id and gateway_oidc_client_secret:
             self.oauth2_credential_provider = self._add_oauth2_credential_provider(
@@ -269,6 +295,78 @@ class GatewayStack(Stack):
                 gateway_oidc_client_id,
                 gateway_oidc_client_secret,
             )
+
+    def _add_inference_rate_limit(self, model_id: str) -> agentcore.CfnGatewayRateLimit:
+        """Per-user TPM budget on the bedrock-mantle inference target.
+
+        dimensionKeys=["qualifiedModelId", "$.context.jwt.sub"]: scopes the
+        budget to one caller calling one model, so a single heavy user (or
+        a single expensive model, if more are ever added) can't exhaust a
+        budget shared across everyone/everything. qualifiedModelId comes
+        first and $.context.jwt.sub second (not the reverse) because AWS's
+        rate-limit API enforces that a wildcard ("*") may only appear in
+        trailing dimension positions — confirmed live: the first deploy
+        attempt at ["$.context.jwt.sub", "qualifiedModelId"] with
+        {sub: "*", qualifiedModelId: <concrete>} was rejected outright
+        ("Wildcard '*' may only appear at trailing positions. Found
+        non-wildcard value at position 1 after '*'", 400 InvalidRequest),
+        and CloudFormation rolled back cleanly. This entry uses a concrete
+        qualifiedModelId (this agent only ever calls exactly one model,
+        matching this file's own no-unnecessary-scope precedent elsewhere)
+        with sub="*" trailing, which is a valid ordering under that
+        constraint and still isolates each distinct caller into their own
+        budget bucket.
+
+        qualifiedModelId is asserted from AWS's own rate-limit example
+        payloads to be the bare foundation-model ID (e.g.
+        "anthropic.claude-fable-5"), not a `us.`-prefixed cross-region
+        inference-profile ID — the same bare-ID convention already found
+        live for bedrock-mantle's own model resolution (see
+        _add_inference_target()'s docstring and agent.py's
+        GATEWAY_INFERENCE_MODEL_ID). Strips the same "us." prefix here
+        rather than importing agent.py's constant, since this is
+        CDK-side/synth-time logic with no dependency on the agent package.
+
+        A single entry, not a specific-user + wildcard pair like AWS's
+        tiered-access example — this project has no user tiers (see
+        DESIGN.md; this agent has one flat user population), so every
+        caller gets the same, single per-user budget rather than needing a
+        named entry per person.
+
+        Depends on the inference target explicitly: this rate limit is
+        conceptually scoped to that target's model, and AWS's rate-limit
+        API needs the gateway (and, in practice, a stable target/model to
+        route against) to already exist — matching this file's existing
+        dependency-ordering precedent for the inference target itself.
+        """
+        bare_model_id = model_id[len("us.") :] if model_id.startswith("us.") else model_id
+        rate_limit = agentcore.CfnGatewayRateLimit(
+            self,
+            "InferenceRateLimit",
+            gateway_identifier=self.gateway.gateway_id,
+            rate_limit_id="inference-tpm-per-user",
+            description=(
+                f"Per-user token budget ({INFERENCE_TOKENS_PER_MINUTE_PER_USER} "
+                "TPM) on the bedrock-mantle inference target."
+            ),
+            dimension_keys=["qualifiedModelId", "$.context.jwt.sub"],
+            entries=[
+                agentcore.CfnGatewayRateLimit.LimitEntryProperty(
+                    dimensions={
+                        "qualifiedModelId": bare_model_id,
+                        "$.context.jwt.sub": "*",
+                    },
+                    tokens=[
+                        agentcore.CfnGatewayRateLimit.RateConfigProperty(
+                            rate=INFERENCE_TOKENS_PER_MINUTE_PER_USER,
+                            period="minute",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        rate_limit.node.add_dependency(self.inference_target)
+        return rate_limit
 
     @staticmethod
     def _build_authorizer_configuration(

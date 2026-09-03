@@ -64,12 +64,32 @@ SESSION_ID_SEPARATOR = "___"
 # cosmetic; it is not used for Memory scoping (see build_invoke_payload()).
 _SESSION_ID_PLACEHOLDER = "session"
 
-# Timeout for establishing the connection and receiving the first byte of
-# the streaming response — generous since real itinerary-generation turns
-# have taken up to ~56s in practice (see README's ALB idle-timeout note);
-# this is a per-attempt connect+first-byte timeout, not a total-response
-# timeout (streaming reads have no overall deadline once started).
-_REQUEST_TIMEOUT_SECONDS = 60.0
+# (connect, read) timeout tuple, not a single float. Connect stays tight
+# (5s — establishing the TCP/TLS connection to the Runtime should never
+# legitimately take long); read is generous (240s) since it is a
+# per-socket-read INACTIVITY timeout, re-armed on every byte received —
+# not a total-response deadline, but also not a "first byte only" one
+# either (an earlier version of this comment claimed the latter; that
+# was wrong, confirmed against requests' own documented behavior and a
+# live-reproduced failure below).
+#
+# 240s specifically covers agent.py's own worst-case silent gap: Strands'
+# ModelRetryStrategy (see agent.py's ModelThrottledException handling)
+# retries a throttled model call with exponential backoff up to 6
+# attempts (4s+8s+16s+32s+64s = 124s of pure sleep, during which
+# agent.py yields nothing — no SSE bytes flow to keep this socket look
+# "active"), plus real request/retry time on top. A live rate-limiting
+# test reproduced exactly this: a real, healthy turn that Strands
+# correctly retried and ultimately handled gracefully (a clean
+# {"type": "error"} SSE frame) was instead killed client-side with a
+# raw ReadTimeout partway through that silent window, before the
+# graceful frame could ever be delivered — confirmed via CloudWatch logs
+# showing agent.py's throttle handler firing successfully server-side
+# only after this timeout would already have fired client-side. Real
+# itinerary-generation turns otherwise take up to ~56s (see README's ALB
+# idle-timeout note) — comfortably under 240s regardless.
+_CONNECT_TIMEOUT_SECONDS = 5.0
+_READ_TIMEOUT_SECONDS = 240.0
 
 
 def build_runtime_session_id() -> str:
@@ -139,11 +159,13 @@ def stream_agent_events(
     itself check its validity/expiry.
 
     Raises RuntimeError with a user-facing message on any failure (a
-    network/HTTP failure, a non-2xx response, or a malformed SSE frame).
-    Does not raise on an in-band {"type": "error"} event from the agent
-    itself — that's a normal part of the stream (e.g. the
-    MaxTokensReachedException cutoff case) and callers should handle it
-    like any other event, not treat it as a transport failure.
+    network/HTTP failure — including one that occurs mid-stream, after
+    the initial connection succeeded — a non-2xx response, or a
+    malformed SSE frame). Does not raise on an in-band {"type": "error"}
+    event from the agent itself — that's a normal part of the stream
+    (e.g. the MaxTokensReachedException/ModelThrottledException cutoff
+    cases) and callers should handle it like any other event, not treat
+    it as a transport failure.
     """
     url = _build_invocation_url(agent_runtime_arn, region, qualifier)
     payload = build_invoke_payload(prompt, actor_id)
@@ -160,39 +182,48 @@ def stream_agent_events(
             headers=headers,
             data=json.dumps(payload).encode("utf-8"),
             stream=True,
-            timeout=_REQUEST_TIMEOUT_SECONDS,
+            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
         )
+
+        if not response.ok:
+            # Mirrors boto3's ClientError-on-non-2xx behavior — the response
+            # body for an error is JSON, not an SSE stream, so read it
+            # directly rather than treating it as a streaming body.
+            try:
+                detail = response.text
+            except Exception:  # noqa: BLE001 - best-effort error detail only
+                detail = "<no response body>"
+            raise RuntimeError(f"Failed to invoke agent ({response.status_code}): {detail}")
+
+        content_type = response.headers.get("content-type", "")
+        if "text/event-stream" not in content_type:
+            raise RuntimeError(
+                f"Agent did not return a streaming response (contentType={content_type!r})"
+            )
+
+        for raw_line in response.iter_lines():
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                continue
+            data_str = line[len("data: "):]
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Agent returned a malformed SSE frame: {data_str!r}") from e
+            if not isinstance(event, dict) or "type" not in event:
+                raise RuntimeError(f"Agent event missing 'type' field: {event!r}")
+            yield event
     except requests.RequestException as e:
+        # Covers both the initial connect/POST (a dead endpoint, DNS
+        # failure, etc.) and a failure raised mid-iteration by
+        # response.iter_lines() — a ReadTimeout/ConnectionError from the
+        # read side is exactly as much a "failed to invoke agent" case
+        # as one from the connect side, and must convert to the same
+        # RuntimeError contract this function's own docstring promises;
+        # a bare try/except around only the requests.post() call (this
+        # function's own prior shape) let a mid-stream timeout escape
+        # as a raw, uncaught requests exception instead.
         raise RuntimeError(f"Failed to invoke agent: {e}") from e
-
-    if not response.ok:
-        # Mirrors boto3's ClientError-on-non-2xx behavior — the response
-        # body for an error is JSON, not an SSE stream, so read it
-        # directly rather than treating it as a streaming body.
-        try:
-            detail = response.text
-        except Exception:  # noqa: BLE001 - best-effort error detail only
-            detail = "<no response body>"
-        raise RuntimeError(f"Failed to invoke agent ({response.status_code}): {detail}")
-
-    content_type = response.headers.get("content-type", "")
-    if "text/event-stream" not in content_type:
-        raise RuntimeError(
-            f"Agent did not return a streaming response (contentType={content_type!r})"
-        )
-
-    for raw_line in response.iter_lines():
-        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-        if not line:
-            continue
-        if not line.startswith("data: "):
-            continue
-        data_str = line[len("data: "):]
-        try:
-            event = json.loads(data_str)
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"Agent returned a malformed SSE frame: {data_str!r}") from e
-        if not isinstance(event, dict) or "type" not in event:
-            raise RuntimeError(f"Agent event missing 'type' field: {event!r}")
-        yield event
 

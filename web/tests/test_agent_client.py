@@ -197,6 +197,60 @@ class StreamAgentEventsTests(unittest.TestCase):
 
         self.assertIn("Failed to invoke agent", str(ctx.exception))
 
+    def test_raises_runtime_error_on_mid_stream_read_timeout(self):
+        # Regression test: a live rate-limiting test found that a
+        # ReadTimeout raised partway through response.iter_lines() (e.g.
+        # once agent.py's own retry-backoff silence exceeds the read
+        # timeout) previously escaped as a raw, uncaught
+        # requests.exceptions.ReadTimeout — only the initial
+        # requests.post() call was wrapped in a try/except, not the
+        # iteration loop that consumes the streaming body. That bypassed
+        # this function's own documented RuntimeError contract and,
+        # downstream, web/server.py's `except RuntimeError` handling,
+        # surfacing to the browser as a generic NetworkError instead of
+        # the graceful in-band {"type": "error"} SSE frame agent.py had
+        # already produced server-side by the time this fired.
+        import requests
+
+        response = _make_response([])
+
+        def _raising_iter_lines(*args, **kwargs):
+            yield b'data: {"type": "text", "data": "partial"}'
+            raise requests.exceptions.ReadTimeout("Read timed out.")
+
+        response.iter_lines.side_effect = _raising_iter_lines
+
+        with patch("agent_client.requests.post", return_value=response):
+            with self.assertRaises(RuntimeError) as ctx:
+                list(
+                    agent_client.stream_agent_events(
+                        "arn:...", "us-east-1", "session-id", "hi", "ken", "test-jwt"
+                    )
+                )
+
+        self.assertIn("Failed to invoke agent", str(ctx.exception))
+
+    def test_sends_connect_and_read_timeout_tuple(self):
+        response = _make_response([b'data: {"type": "done", "data": "ok"}'])
+
+        with patch("agent_client.requests.post", return_value=response) as mock_post:
+            list(
+                agent_client.stream_agent_events(
+                    "arn:...", "us-east-1", "session-id", "hi", "ken", "test-jwt"
+                )
+            )
+
+        sent_timeout = mock_post.call_args.kwargs["timeout"]
+        self.assertEqual(
+            sent_timeout,
+            (agent_client._CONNECT_TIMEOUT_SECONDS, agent_client._READ_TIMEOUT_SECONDS),
+        )
+        # The read timeout must comfortably exceed Strands' worst-case
+        # silent retry-backoff gap (124s of pure sleep across 6 attempts,
+        # see agent.py's ModelThrottledException handling) — this is the
+        # exact live-reproduced failure mode this timeout value fixes.
+        self.assertGreater(agent_client._READ_TIMEOUT_SECONDS, 124)
+
     def test_raises_on_non_2xx_response(self):
         response = _make_response([], ok=False, status_code=401)
         response.text = "Unauthorized: invalid or expired bearer token"

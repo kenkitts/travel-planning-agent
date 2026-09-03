@@ -1590,6 +1590,107 @@ and removed both times before this phase's final state.
   reverting on first failure was deliberately relaxed here in favor of
   reaching a genuinely diagnosed and fixed root cause).
 
+## Phase 17 — Gateway token rate limiting + graceful throttle handling (added 2026-09-02)
+
+See DESIGN.md §2i (decisions #115-118) for the full design rationale.
+The fast-follow decision #112 explicitly deferred from Phase 16 — landed
+now that Phase 16's base routing path is genuinely verified working
+end-to-end, per that same decision's own stated trigger condition.
+
+### What was built
+- `cdk/requirements.txt`: `aws-cdk-lib` bumped `2.265.0` → `2.268.0` —
+  the minimum version containing `CfnGatewayRateLimit`, found by
+  checking 2.266.0 and 2.267.0 directly rather than assuming (decision
+  #118). `cdk synth --all` and the full test suite re-verified clean
+  immediately after the bump, before adding any new resource.
+- `cdk/stacks/gateway_stack.py`: added `_add_inference_rate_limit()`, a
+  `CfnGatewayRateLimit` (`rate_limit_id="inference-tpm-per-user"`)
+  dimensioned on `["qualifiedModelId", "$.context.jwt.sub"]` with one
+  entry (`50,000` TPM, concrete `qualifiedModelId` first, wildcard `sub`
+  trailing — decision #116's live-discovered ordering constraint), a
+  new `INFERENCE_TOKENS_PER_MINUTE_PER_USER` module constant, called
+  right after `self.inference_url` is computed, with an explicit
+  `node.add_dependency(self.inference_target)`.
+- `agent/agent.py`: `stream_agent_turn()` gained
+  `except ModelThrottledException`, yielding a plain
+  `{"type": "error", "data": {"note": "...rate-limited..."}}` event
+  (decision #117) — imported alongside the pre-existing
+  `MaxTokensReachedException`.
+- `tests/test_agent.py`: added
+  `test_model_throttled_after_retries_exhausted_yields_error_event` to
+  `StreamAgentTurnTests`, mirroring the existing
+  `test_max_tokens_reached_with_empty_partial_text` pattern (a
+  `_RaisingAgent` subclass raising the exception with no prior yields).
+
+### Verified — live, not just deployed
+- First `GatewayStack` deploy attempt failed live exactly as decision
+  #116 describes (`Wildcard '*' may only appear at trailing positions`,
+  400 `InvalidRequest`) — CloudFormation rolled back cleanly
+  (`UPDATE_ROLLBACK_COMPLETE`, `DELETE_COMPLETE` on the failed resource,
+  zero partial state), confirmed via the deploy's own event log before
+  fixing the dimension order and redeploying.
+- Second deploy attempt: `CREATE_COMPLETE` on `InferenceRateLimit`.
+  Confirmed live via a direct `boto3` `get_gateway_rate_limit` call (the
+  sandbox's standalone `aws` CLI binary lacks this operation entirely —
+  same gap independently re-confirmed as when this same class of API
+  was first investigated) — `status: "ACTIVE"`,
+  `dimensionKeys: ["qualifiedModelId", "$.context.jwt.sub"]`,
+  `entries: [{qualifiedModelId: "anthropic.claude-sonnet-5", sub: "*"}]`,
+  `tokens: [{rate: 50000.0, period: "minute"}]` — exactly as designed.
+- `TravelAgentRuntimeStack`'s redeploy (the `ModelThrottledException`
+  handler) stalled once mid-bundling after an interrupted tool call;
+  confirmed via `describe-stacks` that no partial CloudFormation
+  operation was in flight, killed the stale process, and redeployed
+  cleanly with `disown` (to survive a shell/tool interruption) —
+  `UPDATE_COMPLETE` in 35.99s on retry.
+- `python -m pytest tests/ web/tests/`: 180/180 passing throughout (179
+  from Phase 16 + 1 new throttle-handling test).
+- `cdk synth --all`: clean at every stage (only the pre-existing,
+  unrelated cross-stack-reference-strength warning).
+
+### Live activation test found a real, separate bug — `web/agent_client.py`'s streaming timeout
+
+See DESIGN.md decision #119 for the full rationale. After the above was
+deployed, decision #115's rate limit was deliberately, temporarily
+lowered to 500 TPM to force real throttling on an ordinary test turn
+(rather than trust design-time reasoning that the feature works) —
+this immediately surfaced a genuine, previously-latent bug that had
+nothing to do with the rate limiter's own correctness:
+
+- **First live test**: the browser reported `Request failed: NetworkError
+  when attempting to fetch resource` — not the graceful message decision
+  #117 was built to produce. CloudWatch logs for the same trace ID showed
+  the server-side code working exactly as designed: real `429` responses
+  from the Gateway, the Anthropic SDK's fast internal retries, Strands'
+  own slower exponential backoff between attempts, and
+  `agent.py:517 | Model call throttled after exhausting retries` firing
+  correctly — the graceful SSE frame was genuinely produced server-side.
+- Root cause: `web/agent_client.py`'s `requests.post(..., timeout=60.0)`
+  is a per-socket-read *inactivity* timeout for a streaming request, not
+  a total-response deadline — confirmed against `requests`' own
+  documented behavior, contradicting this module's own prior comment.
+  Strands' retry backoff yields nothing to the client for up to 124s
+  across 6 attempts; that silence alone tripped the 60s timeout before
+  the graceful frame could ever be delivered. A second, compounding bug:
+  only the initial `requests.post()` call was wrapped in
+  `try/except requests.RequestException` — a `ReadTimeout` raised later,
+  mid-iteration, escaped as a raw, uncaught exception instead of
+  `agent_client.py`'s own documented `RuntimeError` contract.
+- **Fix**: `timeout=(5.0, 240.0)` (connect, read) tuple, and the whole
+  `requests.post()` + `response.iter_lines()` block wrapped in one
+  `try/except requests.RequestException`. Two new regression tests added
+  (`test_raises_runtime_error_on_mid_stream_read_timeout`,
+  `test_sends_connect_and_read_timeout_tuple` — 182/182 passing).
+- **Second live test, after the fix**: reproduced the exact same
+  `NetworkError` once more (confirming it wasn't a one-off network blip),
+  then deployed the fix to `TravelAgentWebStack` and tested a third time
+  — the browser correctly showed decision #117's friendly rate-limited
+  message this time, closing the loop.
+- Rate limit reverted to the real `50_000` TPM default and redeployed
+  immediately after the fix was confirmed — verified live via
+  `get_gateway_rate_limit` showing `rate: 50000.0` before considering this
+  phase done.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

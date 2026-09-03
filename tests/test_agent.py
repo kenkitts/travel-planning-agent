@@ -485,6 +485,25 @@ class StreamAgentTurnTests(unittest.TestCase):
         self.assertEqual(events[0]["data"]["partial_text"], "")
         self.assertIn("cut off", events[0]["data"]["note"])
 
+    def test_model_throttled_after_retries_exhausted_yields_error_event(self):
+        # Strands' own ModelRetryStrategy retries a throttled model call
+        # transparently; this exception only reaches stream_agent_turn()
+        # once all retries are exhausted, so there's no partial text to
+        # preserve — the whole call failed, not a mid-stream cutoff.
+        class _RaisingAgent(_FakeAgent):
+            async def stream_async(self, _user_message):
+                raise travel_agent.ModelThrottledException("rate limit exceeded")
+                yield  # pragma: no cover - unreachable, makes this an async generator
+
+        fake_agent = _RaisingAgent([])
+
+        events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a trip"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "error")
+        self.assertIn("rate-limited", events[0]["data"]["note"])
+        self.assertNotIn("partial_text", events[0]["data"])
+
 
 class BuildMcpClientTests(unittest.TestCase):
     def setUp(self):

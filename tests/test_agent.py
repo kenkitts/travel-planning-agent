@@ -64,7 +64,7 @@ class _FakeAgent:
         self._events = events
         self.messages = messages or []
 
-    async def stream_async(self, _user_message):
+    async def stream_async(self, _user_message, **_kwargs):
         for event in self._events:
             yield event
 
@@ -434,12 +434,61 @@ class StreamAgentTurnTests(unittest.TestCase):
     def test_streams_done_event_with_final_text(self):
         class _FakeResult:
             message = {"role": "assistant", "content": [{"text": "Final answer."}]}
+            stop_reason = "end_turn"
 
         fake_agent = _FakeAgent([{"data": "Final "}, {"result": _FakeResult()}])
 
         events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a trip"))
 
         self.assertEqual(events[-1], {"type": "done", "data": "Final answer."})
+
+    def test_passes_turns_limit_to_stream_async(self):
+        captured_kwargs = {}
+
+        class _CapturingAgent(_FakeAgent):
+            async def stream_async(self, _user_message, **kwargs):
+                captured_kwargs.update(kwargs)
+                yield {"data": "hi"}
+
+        fake_agent = _CapturingAgent([])
+
+        _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a trip"))
+
+        self.assertEqual(
+            captured_kwargs.get("limits"), {"turns": travel_agent.AGENT_MAX_TURNS}
+        )
+
+    def test_turns_limit_reached_yields_error_event_with_partial_text(self):
+        # Regression test: a non-converging agent loop (repeated tool calls
+        # that never reach a final answer) is bounded by
+        # Limits(turns=AGENT_MAX_TURNS) — Strands ends the loop gracefully
+        # with stop_reason "limit_turns" rather than raising, so this must
+        # be handled explicitly in the "result" branch, not via an
+        # exception handler like the two cutoff cases above it.
+        class _FakeResult:
+            message = {"role": "assistant", "content": [{"text": "Partial answer so far."}]}
+            stop_reason = "limit_turns"
+
+        fake_agent = _FakeAgent([{"data": "Partial "}, {"result": _FakeResult()}])
+
+        events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a huge trip"))
+
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1]["data"]["partial_text"], "Partial answer so far.")
+        self.assertIn("more steps", events[-1]["data"]["note"])
+
+    def test_turns_limit_reached_with_empty_partial_text(self):
+        class _FakeResult:
+            message = {"role": "assistant", "content": []}
+            stop_reason = "limit_turns"
+
+        fake_agent = _FakeAgent([{"result": _FakeResult()}])
+
+        events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a huge trip"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "error")
+        self.assertEqual(events[0]["data"]["partial_text"], "")
 
     def test_ignores_lifecycle_events(self):
         fake_agent = _FakeAgent(
@@ -452,7 +501,7 @@ class StreamAgentTurnTests(unittest.TestCase):
 
     def test_max_tokens_reached_yields_error_event_with_partial_text(self):
         class _RaisingAgent(_FakeAgent):
-            async def stream_async(self, _user_message):
+            async def stream_async(self, _user_message, **_kwargs):
                 yield {"data": "Here's your partial itinerary..."}
                 raise travel_agent.MaxTokensReachedException("truncated")
 
@@ -472,7 +521,7 @@ class StreamAgentTurnTests(unittest.TestCase):
 
     def test_max_tokens_reached_with_empty_partial_text(self):
         class _RaisingAgent(_FakeAgent):
-            async def stream_async(self, _user_message):
+            async def stream_async(self, _user_message, **_kwargs):
                 raise travel_agent.MaxTokensReachedException("truncated")
                 yield  # pragma: no cover - unreachable, makes this an async generator
 
@@ -491,7 +540,7 @@ class StreamAgentTurnTests(unittest.TestCase):
         # once all retries are exhausted, so there's no partial text to
         # preserve — the whole call failed, not a mid-stream cutoff.
         class _RaisingAgent(_FakeAgent):
-            async def stream_async(self, _user_message):
+            async def stream_async(self, _user_message, **_kwargs):
                 raise travel_agent.ModelThrottledException("rate limit exceeded")
                 yield  # pragma: no cover - unreachable, makes this an async generator
 

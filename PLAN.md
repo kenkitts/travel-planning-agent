@@ -1691,6 +1691,68 @@ nothing to do with the rate limiter's own correctness:
   `get_gateway_rate_limit` showing `rate: 50000.0` before considering this
   phase done.
 
+## Phase 18 — Agent loop iteration limit (added 2026-09-02)
+
+See DESIGN.md decision #120 for the full rationale.
+
+### What was built
+- `agent/agent.py`: added `AGENT_MAX_TURNS` (default 30, env-overridable
+  via `AGENT_MAX_TURNS`, same pattern as the existing `MAX_OUTPUT_TOKENS`)
+  and passed `limits=Limits(turns=AGENT_MAX_TURNS)` to the
+  `agent.stream_async()` call in `stream_agent_turn()`.
+- Added an explicit `stop_reason == "limit_turns"` branch in the
+  `"result" in event` handling — Strands ends the loop gracefully (not via
+  exception) when the cap trips, so this needed its own check rather than
+  a new `except` block like the two existing cutoff handlers
+  (`MaxTokensReachedException`, `ModelThrottledException`). Yields the same
+  `{"type": "error", "data": {"partial_text": ..., "note": ...}}` shape,
+  with a note suggesting the user break the request into smaller pieces.
+- `tests/test_agent.py`: fixed 12 pre-existing test fixtures
+  (`_FakeAgent`/`_RaisingAgent` subclasses) whose `stream_async` mocks
+  didn't accept the new `limits=` keyword argument, and one `_FakeResult`
+  fixture missing a `stop_reason` attribute the new code now reads
+  unconditionally. Added 4 new tests: `stream_async` is called with the
+  correct `Limits(turns=AGENT_MAX_TURNS)` value; the graceful-cutoff path
+  yields an error event with partial text; the same path with no partial
+  text yet (cap tripped before any text was written); confirmed the
+  `stop_reason` value string (`"limit_turns"`) against Strands' actual
+  `StopReason` type definition rather than assuming it.
+
+### Sizing the limit — revised mid-implementation, not a first guess
+The first estimate (15) was based on a real 3-day sample of live
+CloudWatch tool-call telemetry (71 `strands.tool.call_count` events over
+the prior 3 days, showing a typical mix of `weather-tool`, `places-tool`,
+and `web-search-tool` calls per turn) but no turn-count-per-request
+breakdown, since the log data had no request/trace correlation to group
+by. Before implementing, a check of this codebase's own prior history
+(PLAN.md's post-Phase-7 `MaxTokensReachedException` fix) surfaced a real,
+already-documented production case that would have left 15 with no real
+margin: a 3-day, multi-stop itinerary that made 13 tool calls before
+writing its final answer. Revised to 30 — comfortable headroom over that
+documented case even under the conservative assumption that tool calls
+were mostly sequential (no live per-cycle breakdown confirms the actual
+turn-to-tool-call ratio, and Claude often batches independent tool calls
+per turn, so the true count for that case was likely lower than 13) —
+rather than leave a limit sized close to evidence already on hand that it
+could trip on a legitimate request.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 185/185 passing (182 existing + 4
+  new — after fixing the 13 broken fixtures above; all fixture fixes were
+  mechanical signature updates, not behavior changes, confirmed by the
+  fact that no assertions needed to change).
+- `Limits.turns`'s exact mechanics (checked at the top of each loop
+  iteration so an in-flight tool call always finishes; `stop_reason`
+  literal value `"limit_turns"`) confirmed by reading Strands' own source
+  directly (`strands/types/agent.py`, `strands/event_loop/event_loop.py`,
+  `strands/types/event_loop.py`) rather than assumed from the docstring
+  alone.
+- Deployed via `cdk deploy TravelAgentRuntimeStack` (no CDK/infra changes
+  needed — `AGENT_MAX_TURNS` follows `MAX_OUTPUT_TOKENS`'s existing
+  pattern of a Python-level env-var default with nothing set from CDK).
+  Confirmed live via `aws cloudformation describe-stacks`:
+  `StackStatus: UPDATE_COMPLETE`.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

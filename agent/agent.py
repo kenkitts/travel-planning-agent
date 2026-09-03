@@ -116,6 +116,7 @@ from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
+from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
 
@@ -221,6 +222,30 @@ GATEWAY_INFERENCE_MODEL_ID = (
 # to complete; MAX_TOKENS_REACHED is still handled gracefully in invoke()
 # below in case an even longer response exceeds this.
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
+
+# Backstop against an agent loop that never converges — e.g. the model
+# repeatedly alternating tool calls without making progress toward an
+# answer. Strands' `Limits(turns=...)` counts agent-loop iterations (one
+# model call plus any tool execution that follows), checked at the top of
+# each iteration so a tool call already in flight always finishes first;
+# when tripped, the loop stops gracefully with stop_reason "limit_turns"
+# (no exception — handled explicitly in stream_agent_turn() below).
+#
+# 30 is deliberately generous, not a tight cap: a real, already-documented
+# production turn (see PLAN.md's post-Phase-7 MaxTokensReachedException
+# fix) made 13 tool calls before writing its final answer for a 3-day,
+# multi-stop itinerary. Tool calls that are independent (e.g. weather for
+# several days, multiple place searches) are often batched several-per-
+# turn by Claude, so that request's actual turn count was likely well
+# under 13 — but there's no live per-cycle breakdown confirming the exact
+# ratio, so 30 is sized to clear that documented case with real margin
+# under the conservative assumption that tool calls could be mostly
+# sequential, rather than picked as a round number. This is independent of,
+# and a much tighter ceiling than, the ~15-minute Runtime invocation
+# timeout and the Gateway's token-per-minute rate limit (DESIGN.md) — a
+# loop of cheap, low-token tool calls could iterate many times without
+# ever tripping the token budget, which is the gap this closes.
+AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "30"))
 
 # Namespace patterns must match those configured on the Memory resource in
 # cdk/stacks/memory_stack.py.
@@ -428,10 +453,21 @@ async def stream_agent_turn(agent: Agent, user_message: str):
     before any tokens for that attempt are yielded), so this yields a plain
     "error" event with a retry-later note rather than propagating the
     exception out of the entrypoint as an opaque failure.
+
+    Also passes limits=Limits(turns=AGENT_MAX_TURNS) to stream_async() as a
+    backstop against a non-converging agent loop (see AGENT_MAX_TURNS).
+    Unlike the two exceptions above, a tripped turns cap is not an
+    exception — Strands ends the loop gracefully and the final "result"
+    event carries stop_reason == "limit_turns", checked explicitly below
+    and translated into the same "error" event shape as the other two
+    cutoff cases, with whatever partial answer the model had already
+    written (there's no separate exception handler needed for this path).
     """
     seen_tool_use_ids: set[str] = set()
     try:
-        async for event in agent.stream_async(user_message):
+        async for event in agent.stream_async(
+            user_message, limits=Limits(turns=AGENT_MAX_TURNS)
+        ):
             if event.get("reasoning") and event.get("reasoningText"):
                 yield {"type": "reasoning", "data": event["reasoningText"]}
             elif "data" in event:
@@ -493,7 +529,30 @@ async def stream_agent_turn(agent: Agent, user_message: str):
                             }
             elif "result" in event:
                 result = event["result"]
-                yield {"type": "done", "data": extract_response_text(result.message)}
+                if result.stop_reason == "limit_turns":
+                    # Graceful cutoff, not an exception — see AGENT_MAX_TURNS.
+                    # agent.messages already has whatever the model wrote up
+                    # to the last completed turn (if it had started writing
+                    # a final answer when the cap tripped); surface that as
+                    # partial text alongside the cutoff note, the same shape
+                    # as the MaxTokensReachedException handler below.
+                    logger.warning(
+                        "Agent loop hit turns cap (%d) without converging",
+                        AGENT_MAX_TURNS,
+                    )
+                    partial_text = extract_response_text(result.message)
+                    note = (
+                        "That request needed more steps than I'm allowed to "
+                        "take in one go — try breaking it into smaller "
+                        "requests (e.g. one destination or a shorter date "
+                        "range at a time)."
+                    )
+                    yield {
+                        "type": "error",
+                        "data": {"partial_text": partial_text, "note": note},
+                    }
+                else:
+                    yield {"type": "done", "data": extract_response_text(result.message)}
     except MaxTokensReachedException:
         logger.warning("Model hit max_tokens mid-response; ending stream with partial reply")
         partial_text = extract_response_text(agent.messages[-1])

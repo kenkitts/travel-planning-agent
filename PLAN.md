@@ -16,13 +16,18 @@ travel-planning-agent/
 │   ├── requirements.txt
 │   └── stacks/
 │       ├── tools_stack.py        # Lambdas: weather, places
-│       ├── gateway_stack.py      # AgentCore Gateway + 3 targets
+│       ├── gateway_stack.py      # AgentCore Gateway + 4 targets (web search,
+│       │                         # weather, places, bedrock-mantle inference)
 │       ├── memory_stack.py       # AgentCore Memory (short+long term)
-│       └── runtime_stack.py      # AgentCore Runtime hosting the agent
+│       ├── runtime_stack.py      # AgentCore Runtime hosting the agent
+│       └── web_stack.py          # ECS Fargate + ALB hosting the web UI
 ├── agent/
 │   ├── agent.py                  # Strands Agent + BedrockAgentCoreApp entrypoint
 │   ├── requirements.txt
-│   └── prompts.py                # system prompt(s)
+│   ├── prompts.py                # system prompt(s)
+│   └── skills/
+│       └── trip-pacing/
+│           └── SKILL.md          # procedural itinerary-pacing knowledge
 ├── lambdas/
 │   ├── weather/
 │   │   ├── handler.py            # Open-Meteo wrapper
@@ -34,15 +39,17 @@ travel-planning-agent/
 │   ├── test_weather_handler.py
 │   ├── test_places_handler.py
 │   └── test_agent.py              # agent.py helper functions (no AWS calls)
-├── cli/
-│   ├── agent_client.py            # shared: session ID + InvokeAgentRuntime call
-│   └── chat.py                    # local REPL client
 └── web/
-    ├── server.py                  # local FastAPI backend, reuses agent_client
+    ├── server.py                  # FastAPI backend, hosted on ECS Fargate
+    ├── agent_client.py            # session ID + Runtime invocation (IAM or JWT)
+    ├── auth.py                    # Okta OIDC login flow + session cookie codec
     ├── requirements.txt
+    ├── Dockerfile
     ├── static/                    # index.html, app.js, style.css
     └── tests/
-        └── test_server.py
+        ├── conftest.py
+        ├── test_server.py
+        └── test_agent_client.py
 ```
 
 ## Phase 0 — Project Scaffolding

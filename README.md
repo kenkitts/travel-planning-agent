@@ -23,7 +23,18 @@ its own KMS-encrypted session cookie
    │  claim when present, or passed explicitly in the payload under
    │  IAM auth
    ▼
-AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock)
+AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock,
+   │                                   │      or via the Gateway's inference target —
+   │                                   │      see below — when GATEWAY_INFERENCE_URL is set)
+   │                                   │
+   │                                   ├─▶ AgentCore Code Interpreter (real Python
+   │                                   │    sandbox for itinerary arithmetic/date
+   │                                   │    math — called directly, not via Gateway)
+   │                                   │
+   │                                   ├─▶ Strands AgentSkills plugin (procedural
+   │                                   │    itinerary-pacing knowledge, loaded
+   │                                   │    on demand from agent/skills/ — in-process,
+   │                                   │    no AWS infrastructure of its own)
    │                                   │
    │                                   ├─▶ AgentCore Memory (short-term events +
    │                                   │    long-term traveler preferences /
@@ -36,12 +47,21 @@ AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet 
    │                                        exchange — see "Authentication")
    │                                          ├─ Web Search (managed connector)
    │                                          ├─ Weather Lambda (Open-Meteo)
-   │                                          └─ Places Lambda (Amazon Location Service)
+   │                                          ├─ Places Lambda (Amazon Location Service)
+   │                                          └─ Inference target (bedrock-mantle
+   │                                             connector) — optional, opt-in via
+   │                                             GATEWAY_INFERENCE_URL, routes model
+   │                                             calls through the Gateway for
+   │                                             centralized per-user token-per-
+   │                                             minute rate limiting instead of
+   │                                             calling Bedrock directly
 ```
 
 Five CDK stacks (deployed in this order):
 - `TravelAgentToolsStack` — the weather and places Lambda functions
-- `TravelAgentGatewayStack` — the AgentCore Gateway and its three targets
+- `TravelAgentGatewayStack` — the AgentCore Gateway and its four targets
+  (Web Search, weather, places, and an optional Bedrock inference target
+  for centralized model-call rate limiting)
 - `TravelAgentMemoryStack` — the AgentCore Memory resource
 - `TravelAgentRuntimeStack` — the AgentCore Runtime hosting the agent
 - `TravelAgentWebStack` — hosts the web UI on ECS Fargate behind a plain
@@ -355,11 +375,15 @@ The agent reads its configuration from environment variables, set by
 |---|---|---|
 | `GATEWAY_URL` | `GatewayStack` | MCP endpoint for tool discovery/invocation |
 | `MEMORY_ID` | `MemoryStack` | AgentCore Memory resource ID |
-| `AWS_REGION` | `RuntimeStack.region` | Region for the Memory client |
-| `MODEL_ID` | `RuntimeStack.DEFAULT_MODEL_ID` | Bedrock model ID (Claude Sonnet) |
+| `AWS_REGION` | `RuntimeStack.region` | Region for the Memory client and Code Interpreter |
+| `MODEL_ID` | `cdk/app.py`'s `model_id` (env var `MODEL_ID`, default `us.anthropic.claude-sonnet-5`) | Bedrock model ID (Claude Sonnet) — single source of truth, passed into both `GatewayStack` (inference-target IAM scoping) and `RuntimeStack` |
+| `GATEWAY_OBO_PROVIDER_NAME` | `RuntimeStack` | Set only when the Gateway's JWT authorizer is configured — enables the On-Behalf-Of token exchange path in `build_mcp_client()` |
+| `GATEWAY_INFERENCE_URL` | `RuntimeStack` | Set only when routing model calls through the Gateway's `bedrock-mantle` inference target instead of calling Bedrock directly — see `build_model()` |
+| `MAX_OUTPUT_TOKENS` | Code-level default in `agent/agent.py` (8192) | Not currently wired as a CDK-set env var — override manually if ever needed |
+| `AGENT_MAX_TURNS` | Code-level default in `agent/agent.py` (30) | Caps agent-loop iterations per turn (`Limits.turns`); not currently wired as a CDK-set env var |
 
 `MODEL_ID` and the namespace strings in `agent/agent.py` must stay in sync
-with the corresponding constants in `cdk/stacks/runtime_stack.py` and
+with the corresponding constants in `cdk/app.py` and
 `cdk/stacks/memory_stack.py` respectively if either is changed.
 
 This project's own `.env` (see "Hosting the Web UI" above) is unrelated to

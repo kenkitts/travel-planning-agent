@@ -876,6 +876,32 @@ class BuildSkillsPluginTests(unittest.TestCase):
         self.assertIn("Cap outdoor activity count per day", result)
 
 
+class BuildCodeInterpreterToolTests(unittest.TestCase):
+    """Covers build_code_interpreter_tool() — the AgentCore Code Interpreter
+    tool wiring (see prompts.py step 5 and DESIGN.md for the "compute, don't
+    guess" rationale). Only constructs the tool object and inspects its
+    Strands-generated metadata; does not exercise a real code-execution
+    call, which would need live AWS credentials and a running sandbox.
+    """
+
+    def test_builds_a_code_interpreter_tool_named_code_interpreter(self):
+        tool = travel_agent.build_code_interpreter_tool()
+
+        self.assertEqual(tool.tool_spec["name"], "code_interpreter")
+
+    def test_uses_the_aws_managed_sandbox_identifier(self):
+        from strands_tools.code_interpreter import AgentCoreCodeInterpreter
+
+        interpreter = AgentCoreCodeInterpreter(region=travel_agent.AWS_REGION)
+
+        # The AWS-managed sandbox identifier — not a CDK-provisioned
+        # CodeInterpreterCustom resource. Confirms build_code_interpreter_tool()
+        # doesn't need (and doesn't rely on) a custom identifier being passed,
+        # matching the IAM policy granted in runtime_stack.py, which covers
+        # both this account's code-interpreter/* and the :aws: managed one.
+        self.assertEqual(interpreter.identifier, "aws.codeinterpreter.v1")
+
+
 def _skills_for(plugin, agent):
     """Load an AgentSkills plugin's filesystem skills for `agent` and
     return the resulting {name: Skill} map — mirrors what the plugin does

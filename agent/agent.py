@@ -120,6 +120,7 @@ from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
 from strands.vended_plugins.skills import AgentSkills
+from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
 from prompts import build_system_prompt
 
@@ -261,6 +262,33 @@ SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 def build_skills_plugin() -> AgentSkills:
     """Build the AgentSkills plugin, loading every skill under SKILLS_DIR."""
     return AgentSkills(skills=[SKILLS_DIR])
+
+
+def build_code_interpreter_tool():
+    """Build the AgentCore Code Interpreter tool for itinerary-related arithmetic.
+
+    Gives the agent a real Python sandbox (AWS's AWS-managed
+    "aws.codeinterpreter.v1" Code Interpreter, not a custom-provisioned one
+    — no CDK resource needed beyond the IAM permissions granted to the
+    Runtime execution role) instead of doing date/duration/budget math in
+    its own reasoning. Directly targets a real, previously-observed failure
+    class: this project's own history (see PLAN.md's post-Phase-7 fix) is
+    full of long, multi-day, multi-stop itineraries where arithmetic
+    mistakes (day counts, running totals) are a plausible failure mode that
+    bounding tool-call loops or output tokens does not fix.
+
+    Region is read from AWS_REGION (already set by RuntimeStack for the
+    AgentCore Memory client) rather than left to fall back on the
+    library's own default-region resolution, for the same reason the rest
+    of this module always passes region explicitly.
+
+    The returned .code_interpreter tool already catches AWS/session errors
+    itself and returns a graceful {"status": "error", ...} tool result
+    (confirmed by reading strands_tools' own
+    agent_core_code_interpreter.py) rather than raising — no additional
+    wrapper needed here, unlike a hand-rolled tool would require.
+    """
+    return AgentCoreCodeInterpreter(region=AWS_REGION).code_interpreter
 
 # Namespace patterns must match those configured on the Memory resource in
 # cdk/stacks/memory_stack.py.
@@ -1038,6 +1066,7 @@ async def invoke(payload: dict, context: Any = None):
     if mcp_client is None:
         agent = Agent(
             model=model,
+            tools=[build_code_interpreter_tool()],
             system_prompt=system_prompt,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
@@ -1053,7 +1082,7 @@ async def invoke(payload: dict, context: Any = None):
 
         agent = Agent(
             model=model,
-            tools=tools,
+            tools=[build_code_interpreter_tool()] + tools,
             system_prompt=system_prompt,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),

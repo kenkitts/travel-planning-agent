@@ -1810,6 +1810,64 @@ targets hardened/considered in earlier phases.
   Runtime deploy+verify cycle, since this phase was explicitly scoped as
   exploratory/learning rather than a production fix.
 
+## Phase 20 — AgentCore Code Interpreter tool (added 2026-09-03)
+
+See DESIGN.md decision #122 for the full rationale.
+
+### What was built
+- `agent/agent.py`: added `build_code_interpreter_tool()`, wrapping Strands'
+  `strands_tools.code_interpreter.AgentCoreCodeInterpreter(region=AWS_REGION)
+  .code_interpreter`, and added it to the `tools=` list at both `Agent(...)`
+  construction sites (the no-Gateway fallback, which previously had no
+  `tools=` at all, and the normal Gateway-tools path).
+- `agent/requirements.txt`: added
+  `strands-agents-tools[agent-core-code-interpreter]==0.8.7` — a separate
+  PyPI package from `strands-agents`, not previously installed.
+- `prompts.py`: added a 5th grounding step instructing the agent to use the
+  code interpreter for itinerary arithmetic/date math (trip length,
+  running budget totals, cost splitting, concrete calendar dates) rather
+  than computing it in its own reasoning.
+- `cdk/stacks/runtime_stack.py`: granted the Runtime execution role
+  `bedrock-agentcore:CreateCodeInterpreter` /
+  `StartCodeInterpreterSession` / `InvokeCodeInterpreter` /
+  `StopCodeInterpreterSession` / `GetCodeInterpreterSession` /
+  `ListCodeInterpreterSessions` on both `arn:...:code-interpreter/*` (this
+  account) and `arn:...:aws:code-interpreter/*` (the AWS-managed sandbox
+  identifier `AgentCoreCodeInterpreter` defaults to) — no
+  `CodeInterpreterCustom` CDK resource provisioned.
+- `tests/test_agent.py`: new `BuildCodeInterpreterToolTests` — constructs
+  the real tool (not a fake) and asserts its Strands-generated `tool_spec`
+  name and the underlying `AgentCoreCodeInterpreter`'s sandbox identifier,
+  since the actual code-execution call itself needs live AWS credentials
+  and isn't exercised in unit tests.
+
+### Why this, not the Browser tool or deeper Identity adoption
+Considered all of AgentCore's not-yet-adopted capabilities (Code
+Interpreter, Browser tool, deeper Identity, GenAI Observability
+dashboards) before picking this one. Browser doesn't fit this agent's
+scope — `web-search-tool` already covers destination research, and this
+agent is explicitly non-booking (DESIGN.md), so there's no interactive-
+navigation use case. Deeper Identity adoption (beyond the OBO exchange
+already in place for Gateway auth) would only matter if a tool needed to
+act on a third-party service on the user's behalf, which nothing in this
+agent's scope does today. Code Interpreter was the one with a concrete,
+already-documented failure class behind it.
+
+### Verified
+- `strands-agents-tools[agent-core-code-interpreter]==0.8.7` installed
+  cleanly in the local venv; confirmed against its real source (not
+  assumed from the docstring) that `init_session`/`execute_code` already
+  catch AWS/session errors and return a graceful error dict rather than
+  raising, so no extra error-handling wrapper was needed around the tool.
+- `python -m pytest tests/ web/tests/`: 191/191 passing (189 existing + 2
+  new).
+- `cdk synth --all`: clean (only the pre-existing cross-stack-reference
+  warning); inspected the synthesized `TravelAgentRuntimeStack` template
+  directly to confirm the new `AllowCodeInterpreterSandbox` IAM statement
+  has both required resource ARN patterns before deploying.
+- Deployed via `cdk deploy TravelAgentRuntimeStack`. Confirmed live via
+  `aws cloudformation describe-stacks`: `StackStatus: UPDATE_COMPLETE`.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

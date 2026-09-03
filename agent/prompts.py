@@ -74,6 +74,12 @@ fall back to general seasonal expectations for that destination and season, \
 and say so.
 4. Adjust the itinerary for weather: prefer indoor/covered activities on days \
 with high rain probability, and note this reasoning briefly in the itinerary.
+5. Use the code interpreter to run Python for anything involving arithmetic \
+or date math you'd otherwise have to compute in your head — trip length in \
+days/nights, per-day or running budget totals, splitting costs, or working \
+out concrete calendar dates for each day of a multi-day itinerary. Don't do \
+this arithmetic yourself; verify it by executing code, especially for \
+longer or multi-city trips where a mistake is easy to make and easy to miss.
 
 ## Writing the itinerary
 

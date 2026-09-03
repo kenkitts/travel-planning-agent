@@ -326,6 +326,35 @@ class RuntimeStack(Stack):
         # AgentCore Memory (short-term events + long-term retrieval).
         memory.grant_full_access(self.runtime)
 
+        # Grant the Runtime's execution role permission to use the
+        # AWS-managed AgentCore Code Interpreter sandbox (see agent.py's
+        # build_code_interpreter_tool()) — no CodeInterpreterCustom CDK
+        # resource is provisioned; AgentCoreCodeInterpreter defaults to the
+        # built-in "aws.codeinterpreter.v1" identifier, whose ARN lives
+        # under the ":aws:" account rather than this account, so both
+        # resource patterns below are needed (confirmed via AWS's own docs
+        # for the AWS-managed sandbox, cross-checked against a real CDK
+        # construct in another repo hardening the same execution-role gap
+        # for the same AWS-managed sandbox).
+        self.runtime.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="AllowCodeInterpreterSandbox",
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "bedrock-agentcore:CreateCodeInterpreter",
+                    "bedrock-agentcore:StartCodeInterpreterSession",
+                    "bedrock-agentcore:InvokeCodeInterpreter",
+                    "bedrock-agentcore:StopCodeInterpreterSession",
+                    "bedrock-agentcore:GetCodeInterpreterSession",
+                    "bedrock-agentcore:ListCodeInterpreterSessions",
+                ],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:code-interpreter/*",
+                    f"arn:aws:bedrock-agentcore:{self.region}:aws:code-interpreter/*",
+                ],
+            )
+        )
+
         # Phase 3: grant permission to perform the OBO token exchange
         # against GatewayStack's credential provider — see this module's
         # docstring for why this replaces gateway.grant_invoke()'s IAM

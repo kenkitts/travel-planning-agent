@@ -119,6 +119,7 @@ from strands.models.anthropic import AnthropicModel
 from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.vended_plugins.skills import AgentSkills
 
 from prompts import build_system_prompt
 
@@ -246,6 +247,20 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
 # loop of cheap, low-token tool calls could iterate many times without
 # ever tripping the token budget, which is the gap this closes.
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "30"))
+
+# Procedural-knowledge skills (see agent/skills/), loaded via Strands'
+# AgentSkills plugin: lightweight metadata for each skill is injected into
+# the system prompt on every invocation, and the model loads a skill's full
+# instructions on demand via the plugin's own "skills" tool — not injected
+# upfront, to avoid bloating every request's token cost with instructions
+# most turns don't need. Resolved relative to this file (not CWD) since
+# agent/ is bundled and run as a flat directory.
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+
+
+def build_skills_plugin() -> AgentSkills:
+    """Build the AgentSkills plugin, loading every skill under SKILLS_DIR."""
+    return AgentSkills(skills=[SKILLS_DIR])
 
 # Namespace patterns must match those configured on the Memory resource in
 # cdk/stacks/memory_stack.py.
@@ -1026,6 +1041,7 @@ async def invoke(payload: dict, context: Any = None):
             system_prompt=system_prompt,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
+            plugins=[build_skills_plugin()],
         )
         async for event in stream_agent_turn(agent, user_message):
             yield event
@@ -1041,6 +1057,7 @@ async def invoke(payload: dict, context: Any = None):
             system_prompt=system_prompt,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
+            plugins=[build_skills_plugin()],
         )
         async for event in stream_agent_turn(agent, user_message):
             yield event

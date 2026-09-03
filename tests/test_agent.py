@@ -824,5 +824,71 @@ class BuildModelTests(unittest.TestCase):
             fake_get_token.assert_awaited_once()
 
 
+class BuildSkillsPluginTests(unittest.TestCase):
+    """Covers build_skills_plugin() — the AgentSkills plugin wiring for
+    agent/skills/. Exercises the real Strands AgentSkills/Agent classes
+    (no fakes) since the behavior under test is genuine Strands plugin
+    machinery (skill discovery/validation, system-prompt injection, the
+    "skills" activation tool) — not agent.py's own logic, which is limited
+    to pointing the plugin at SKILLS_DIR.
+    """
+
+    def test_skills_dir_points_at_agent_skills_directory(self):
+        self.assertEqual(
+            travel_agent.SKILLS_DIR,
+            str(_AGENT_DIR / "skills"),
+        )
+
+    def test_loads_trip_pacing_skill(self):
+        from strands import Agent
+
+        plugin = travel_agent.build_skills_plugin()
+        agent = Agent(system_prompt="test", plugins=[plugin], callback_handler=None)
+
+        loaded = asyncio_run(_skills_for(plugin, agent))
+
+        self.assertIn("trip-pacing", loaded)
+        self.assertIn("day-by-day itinerary", loaded["trip-pacing"].description)
+
+    def test_injects_skill_metadata_into_system_prompt(self):
+        from strands import Agent
+        from strands.hooks.events import BeforeInvocationEvent
+
+        plugin = travel_agent.build_skills_plugin()
+        agent = Agent(system_prompt="Base prompt.", plugins=[plugin], callback_handler=None)
+
+        asyncio_run(plugin._on_before_invocation(BeforeInvocationEvent(agent=agent)))
+
+        self.assertIn("Base prompt.", agent.system_prompt)
+        self.assertIn("<name>trip-pacing</name>", agent.system_prompt)
+
+    def test_activating_skill_returns_full_instructions(self):
+        from strands import Agent
+        from strands.hooks.events import BeforeInvocationEvent
+
+        plugin = travel_agent.build_skills_plugin()
+        agent = Agent(system_prompt="Base prompt.", plugins=[plugin], callback_handler=None)
+        asyncio_run(plugin._on_before_invocation(BeforeInvocationEvent(agent=agent)))
+
+        tool_context = type("_FakeToolContext", (), {"agent": agent})()
+        result = asyncio_run(plugin.skills(skill_name="trip-pacing", tool_context=tool_context))
+
+        self.assertIn("Cap outdoor activity count per day", result)
+
+
+def _skills_for(plugin, agent):
+    """Load an AgentSkills plugin's filesystem skills for `agent` and
+    return the resulting {name: Skill} map — mirrors what the plugin does
+    internally in init_agent()/_on_before_invocation(), without depending
+    on the plugin's private per-agent cache attribute name directly.
+    """
+
+    async def _load():
+        await plugin._load_skill_paths(agent)
+        return plugin._skills_for(agent)
+
+    return _load()
+
+
 if __name__ == "__main__":
     unittest.main()

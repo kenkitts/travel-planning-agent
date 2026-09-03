@@ -1753,6 +1753,63 @@ could trip on a legitimate request.
   Confirmed live via `aws cloudformation describe-stacks`:
   `StackStatus: UPDATE_COMPLETE`.
 
+## Phase 19 — Agent Skills (procedural knowledge, added 2026-09-03)
+
+See DESIGN.md decision #121 for the full rationale. Exploratory/learning-
+oriented, not driven by a bug report or production gap.
+
+### What was built
+- `agent/skills/trip-pacing/SKILL.md`: one skill encoding procedural
+  itinerary-pacing rules — cap outdoor activities per day based on that
+  day's weather forecast, insert a lighter buffer day after 3+ consecutive
+  high-activity days, sequence same-day stops geographically rather than
+  in mention-order, and briefly explain any pacing-driven change to the
+  traveler rather than silently reordering things.
+- `agent/agent.py`: added `SKILLS_DIR` (resolved relative to `agent.py`'s
+  own file path, not CWD) and `build_skills_plugin()`, which constructs
+  Strands' `AgentSkills` plugin pointed at that directory. Wired
+  `plugins=[build_skills_plugin()]` into both existing `Agent(...)`
+  construction sites (the no-Gateway fallback path and the normal
+  Gateway-tools path).
+- `tests/test_agent.py`: new `BuildSkillsPluginTests` class — loads the
+  real `trip-pacing` skill via a real `AgentSkills`/`Agent` pair (no
+  fakes, since the behavior under test is Strands' own plugin machinery),
+  and asserts on: skill discovery/metadata, system-prompt XML injection
+  via the plugin's `_on_before_invocation` hook, and full-instructions
+  retrieval via the plugin's own `skills` activation tool.
+
+### How it works
+Strands' `AgentSkills` plugin implements the AgentSkills.io progressive-
+disclosure pattern: lightweight per-skill metadata (name + description)
+is injected into the system prompt before every invocation, and the
+model loads a skill's full markdown instructions on demand by calling the
+`skills` tool the plugin registers — full instructions are never injected
+upfront, so turns that don't need a given skill don't pay its token cost.
+This is purely in-process (no Gateway involvement, no new infrastructure)
+and additive — it doesn't change existing tool-routing or the Gateway
+targets hardened/considered in earlier phases.
+
+### Verified
+- `strands-agents==1.52.0` (already pinned) includes this module —
+  confirmed by importing `strands.vended_plugins.skills` directly against
+  the pinned dependency version before writing any code, rather than
+  assuming compatibility.
+- Manually drove the plugin against a real `Agent` instance (not just
+  unit-tested against fakes): confirmed `trip-pacing` loads and validates
+  (name matches directory, frontmatter parses), confirmed the injected
+  `<available_skills>` XML block appears in `agent.system_prompt` after
+  firing the plugin's `_on_before_invocation` hook, and confirmed calling
+  `plugin.skills(skill_name="trip-pacing", ...)` returns the actual
+  `SKILL.md` body content.
+- `python -m pytest tests/ web/tests/`: 189/189 passing (185 existing + 4
+  new).
+- Not deployed live for this phase — treated as a self-contained,
+  low-risk addition (new optional tool the model may call; no change to
+  existing request/response behavior unless invoked) verified through
+  direct plugin exercise and unit tests rather than a full live AgentCore
+  Runtime deploy+verify cycle, since this phase was explicitly scoped as
+  exploratory/learning rather than a production fix.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

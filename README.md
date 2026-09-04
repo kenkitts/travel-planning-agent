@@ -11,51 +11,25 @@ there is no CLI or other standalone client.
 
 ## Architecture
 
-```
-Web UI (web/server.py), hosted on ECS Fargate behind a plain ALB —
-the server itself runs the OIDC login flow against Okta and issues
-its own KMS-encrypted session cookie
-   │  InvokeAgentRuntime (via web/agent_client.py) — IAM/SigV4 by
-   │  default, or a JWT bearer token (RFC 8693 token-exchanged from
-   │  the user's own Okta session) once TravelAgentRuntimeStack's
-   │  optional Okta config is set — see "Authentication" below.
-   │  actor_id is derived server-side from that JWT's verified `sub`
-   │  claim when present, or passed explicitly in the payload under
-   │  IAM auth
-   ▼
-AgentCore Runtime  ── hosts ──▶  Strands Agent (Python, Claude Sonnet via Bedrock,
-   │                                   │      or via the Gateway's inference target —
-   │                                   │      see below — when GATEWAY_INFERENCE_URL is set)
-   │                                   │
-   │                                   ├─▶ AgentCore Code Interpreter (real Python
-   │                                   │    sandbox for itinerary arithmetic/date
-   │                                   │    math — called directly, not via Gateway)
-   │                                   │
-   │                                   ├─▶ Strands AgentSkills plugin (procedural
-   │                                   │    itinerary-pacing knowledge, loaded
-   │                                   │    on demand from agent/skills/ — in-process,
-   │                                   │    no AWS infrastructure of its own)
-   │                                   │
-   │                                   ├─▶ AgentCore Memory (short-term events +
-   │                                   │    long-term traveler preferences /
-   │                                   │    session summaries, scoped by the
-   │                                   │    caller-supplied actor_id)
-   │                                   │
-   │                                   └─▶ AgentCore Gateway (MCP, IAM auth
-   │                                        by default, or a per-user JWT
-   │                                        via RFC 8693 On-Behalf-Of token
-   │                                        exchange — see "Authentication")
-   │                                          ├─ Web Search (managed connector)
-   │                                          ├─ Weather Lambda (Open-Meteo)
-   │                                          ├─ Places Lambda (Amazon Location Service)
-   │                                          └─ Inference target (bedrock-mantle
-   │                                             connector) — optional, opt-in via
-   │                                             GATEWAY_INFERENCE_URL, routes model
-   │                                             calls through the Gateway for
-   │                                             centralized per-user token-per-
-   │                                             minute rate limiting instead of
-   │                                             calling Bedrock directly
-```
+![Travel Planning Agent infrastructure diagram](TravelPlanningAgent_Architecture.png)
+
+The web UI (`web/server.py`, on ECS Fargate behind a plain ALB) runs the
+OIDC login flow against Okta itself and issues its own KMS-encrypted
+session cookie. It calls AgentCore Runtime via `web/agent_client.py` —
+IAM/SigV4 by default, or a JWT bearer token (RFC 8693 token-exchanged from
+the user's own Okta session) once `TravelAgentRuntimeStack`'s optional
+Okta config is set — see "Authentication" below. The Runtime hosts a
+Strands Agent (Claude Sonnet via Bedrock, or via the Gateway's inference
+target when `GATEWAY_INFERENCE_URL` is set), which calls AgentCore Memory
+(short-term events + long-term traveler preferences, scoped by
+`actor_id`) and AgentCore Gateway (MCP; IAM by default, or a per-user JWT
+via RFC 8693 On-Behalf-Of token exchange) for its three tool targets (Web
+Search, weather, places) and the optional inference target. Two more
+agent capabilities aren't AWS infrastructure and so don't appear in the
+diagram: an AgentCore Code Interpreter tool (a real Python sandbox for
+itinerary arithmetic/date math, called directly rather than via the
+Gateway) and a Strands AgentSkills plugin (procedural itinerary-pacing
+knowledge loaded on demand from `agent/skills/`, in-process).
 
 Five CDK stacks (deployed in this order):
 - `TravelAgentToolsStack` — the weather and places Lambda functions

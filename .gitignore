@@ -34,6 +34,7 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+.kiro/
 
 # Cache / generated artifacts (non-source, tool-specific)
 preflabel-iri-cache.json

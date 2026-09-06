@@ -54,6 +54,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_secretsmanager as secretsmanager
+from aws_cdk import aws_wafv2 as wafv2
 from constructs import Construct
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,16 @@ FARGATE_MEMORY_MIB = 1024  # 1 GB
 MIN_TASK_COUNT = 1
 MAX_TASK_COUNT = 3
 CPU_TARGET_UTILIZATION_PERCENT = 60
+
+# WAF rate-based rule threshold: requests per 5-minute sliding window per
+# source IP. 500 is AWS's own commonly-cited starting-point default —
+# real usage here is a small, known group of people running occasional
+# multi-turn chat sessions (including SSE streaming, see decision #20),
+# not high-frequency polling, so 500/5min gives real headroom for a
+# legitimate power user while still catching scraping/brute-force.
+# Flagged as a security-audit finding (2026-09-06): the ALB had no WAF
+# at all — no layer-7 protection against SQLi/XSS/bot abuse/rate spikes.
+WAF_RATE_LIMIT_PER_5MIN = 500
 
 CONTAINER_PORT = 8420
 
@@ -494,8 +505,19 @@ class WebStack(Stack):
             port=443,
             protocol=elbv2.ApplicationProtocol.HTTPS,
             certificates=[certificate],
+            # Modern TLS policy (TLS 1.2 minimum, TLS 1.3 supported, no
+            # weak ciphers) — the ALB's own default listener SSL policy
+            # (ELBSecurityPolicy-2016-08) still permits TLS 1.0/1.1 and
+            # weaker cipher suites, flagged as an outdated-TLS-policy
+            # security finding on a live audit of this stack.
+            # RECOMMENDED_TLS maps to ELBSecurityPolicy-TLS13-1-2-2021-06
+            # (confirmed against the aws_elasticloadbalancingv2 SslPolicy
+            # enum) — TLS 1.2/1.3 only.
+            ssl_policy=elbv2.SslPolicy.RECOMMENDED_TLS,
             default_action=elbv2.ListenerAction.forward([self.target_group]),
         )
+
+        self._add_waf()
 
         scaling = self.fargate_service.auto_scale_task_count(
             min_capacity=MIN_TASK_COUNT, max_capacity=MAX_TASK_COUNT
@@ -506,3 +528,99 @@ class WebStack(Stack):
 
         CfnOutput(self, "AlbDnsName", value=self.load_balancer.load_balancer_dns_name)
         CfnOutput(self, "AlbArn", value=self.load_balancer.load_balancer_arn)
+
+    def _add_waf(self) -> None:
+        """Attach a regional WAF WebACL to the ALB.
+
+        Flagged as a live security-audit finding (2026-09-06): this ALB
+        had no WAF at all — no layer-7 protection against common
+        exploit signatures, known-bad-input payloads, or rate-based
+        abuse for an internet-facing endpoint.
+
+        Scope, deliberately narrow rather than a full managed-rule
+        stack: AWSManagedRulesCommonRuleSet + AWSManagedRulesKnownBad
+        InputsRuleSet (the standard AWS baseline pair) plus one
+        rate-based rule. Matches this project's own repeatedly-stated
+        sizing philosophy (decision #43: "not a high-traffic-volume
+        design target"; decision #137's real live-metrics numbers: 1-7
+        Lambda invocations/day) — a fuller managed-rule stack (SQLi,
+        Linux/Unix-specific, Bot Control, IP reputation) would add real
+        ongoing cost and false-positive-friction risk with no
+        commensurate benefit at this traffic volume; revisit if real
+        abuse is ever observed, matching this project's existing
+        "add what's needed once evidence exists" pattern (decisions
+        #101-103, #123).
+
+        overrideAction=none on both managed rule groups means each
+        rule's own action (block, by default, for both of these groups)
+        applies — not count-only/observe-mode.
+        """
+        web_acl = wafv2.CfnWebACL(
+            self,
+            "WebAcl",
+            name="travel-agent-web-acl",
+            description="Baseline managed rules + rate limiting for the Travel Planning Agent ALB.",
+            scope="REGIONAL",
+            default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                cloud_watch_metrics_enabled=True,
+                metric_name="TravelAgentWebAcl",
+                sampled_requests_enabled=True,
+            ),
+            rules=[
+                wafv2.CfnWebACL.RuleProperty(
+                    name="AWS-AWSManagedRulesCommonRuleSet",
+                    priority=1,
+                    override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                            vendor_name="AWS",
+                            name="AWSManagedRulesCommonRuleSet",
+                        ),
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name="AWSManagedRulesCommonRuleSet",
+                        sampled_requests_enabled=True,
+                    ),
+                ),
+                wafv2.CfnWebACL.RuleProperty(
+                    name="AWS-AWSManagedRulesKnownBadInputsRuleSet",
+                    priority=2,
+                    override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                            vendor_name="AWS",
+                            name="AWSManagedRulesKnownBadInputsRuleSet",
+                        ),
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name="AWSManagedRulesKnownBadInputsRuleSet",
+                        sampled_requests_enabled=True,
+                    ),
+                ),
+                wafv2.CfnWebACL.RuleProperty(
+                    name="RateLimitPerIp",
+                    priority=3,
+                    action=wafv2.CfnWebACL.RuleActionProperty(block={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                            limit=WAF_RATE_LIMIT_PER_5MIN,
+                            aggregate_key_type="IP",
+                        ),
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name="RateLimitPerIp",
+                        sampled_requests_enabled=True,
+                    ),
+                ),
+            ],
+        )
+        wafv2.CfnWebACLAssociation(
+            self,
+            "WebAclAssociation",
+            resource_arn=self.load_balancer.load_balancer_arn,
+            web_acl_arn=web_acl.attr_arn,
+        )

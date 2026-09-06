@@ -207,6 +207,7 @@ class GatewayStack(Stack):
 
         self.web_search_target = self._add_web_search_target()
         self._grant_web_search_invoke()
+        self._harden_gateway_trust_policy()
         self.weather_target = self.gateway.add_lambda_target(
             "WeatherTarget",
             gateway_target_name="weather-tool",
@@ -541,6 +542,73 @@ class GatewayStack(Stack):
                 resources=[f"arn:aws:bedrock-agentcore:{self.region}:aws:tool/web-search.v1"],
             )
         )
+
+    def _harden_gateway_trust_policy(self) -> None:
+        """Remove the redundant, unconditioned sts:AssumeRole statement
+        the aws_bedrockagentcore.Gateway L2 construct adds by default to
+        its own service role's trust policy.
+
+        Confirmed live (via iam:GetRole against a deployed Gateway) that
+        this construct's generated AssumeRolePolicyDocument has TWO
+        statements for the bedrock-agentcore.amazonaws.com service
+        principal:
+          1. An unconditioned one — {"Effect": "Allow", "Principal":
+             {"Service": "bedrock-agentcore.amazonaws.com"}, "Action":
+             "sts:AssumeRole"} — with no aws:SourceAccount/aws:SourceArn
+             condition at all.
+          2. A correctly-scoped one, restricting the same principal to
+             this exact account + this Gateway's own ARN pattern via
+             aws:SourceAccount/aws:SourceArn ArnLike conditions.
+        Statement 1 is a classic confused-deputy gap: any
+        bedrock-agentcore.amazonaws.com caller (in principle, any AWS
+        Gateway resource anywhere that could name this specific role's
+        ARN) could assume this role, since nothing in that statement
+        restricts the source. Statement 2 alone is sufficient and
+        correct — flagged as a real, live security-audit finding
+        (2026-09-06), not a hypothetical.
+
+        This appears to be a default-behavior quirk of the L2 construct
+        itself, not anything this stack's own code configures — no prop
+        on agentcore.Gateway(...)/GatewayAuthorizer exposes control over
+        the generated trust policy's statement set. Reported upstream as
+        a CDK construct issue (aws/aws-cdk on GitHub); this method is the
+        local, reproducible-on-every-deploy fix in the meantime — it
+        overrides the role's AssumeRolePolicyDocument via the L1
+        CfnRole escape hatch (self.gateway.role is an L2 iam.Role;
+        .node.default_child is its underlying CfnRole) directly to the
+        single, already-correct scoped statement, rather than patching
+        IAM out-of-band after every deploy (which wouldn't survive a
+        redeploy that recreates or updates this role).
+
+        Fragile against upstream CDK changes by design: if a future
+        aws-cdk-lib version changes how aws_bedrockagentcore.Gateway
+        builds its role's trust policy (a different condition shape, a
+        third statement, etc.), this override would silently keep
+        replacing it with today's known-correct policy rather than
+        adapting — re-verify this method (via a live iam:GetRole check,
+        same as how the original finding was confirmed) after any
+        aws-cdk-lib upgrade that touches aws_bedrockagentcore.
+        """
+        cfn_role: iam.CfnRole = self.gateway.role.node.default_child
+        cfn_role.assume_role_policy_document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {"aws:SourceAccount": self.account},
+                        "ArnLike": {
+                            "aws:SourceArn": (
+                                f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:"
+                                "gateway/travel-planning-agent-gateway*"
+                            ),
+                        },
+                    },
+                },
+            ],
+        }
 
     def _add_web_search_target(self) -> agentcore.CfnGatewayTarget:
         """Add the AWS-managed Web Search connector as a Gateway target.

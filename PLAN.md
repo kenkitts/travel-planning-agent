@@ -2201,6 +2201,183 @@ confirmed live that `/static/app.js` and `/` now both send
 logout button correctly.
   files left in the repo.
 
+## Phase 25 — AWS DevOps Agent security audit + high-priority fixes (added 2026-09-06)
+
+Asked the AWS DevOps Agent (§2j, `TravelAgentDevOpsStack`) for concrete
+security recommendations across IAM, network exposure, secrets handling,
+and logging/monitoring. It ran a real, live review of the account (IAM
+roles/trust policies, ALB/ECS networking, Lambda configs, Secrets
+Manager, KMS, CloudTrail, alarms) — not a generic checklist — and
+returned a prioritized findings list. One finding (ALB access logging
+"disabled") was a false positive: the agent checked the ALB's older
+S3-based `access_logs.s3.enabled` attribute, not the newer
+CloudWatch-Logs-direct delivery pipeline this project actually uses
+(decision #100/#141) — confirmed live via `logs describe-deliveries`
+that the real pipeline is correctly configured and delivering.
+
+### What was found and fixed (🔴 high priority)
+
+1. **Gateway service role trust policy had an unconditioned
+   `sts:AssumeRole` statement.** Confirmed live via `iam:GetRole` that
+   the `aws_bedrockagentcore.Gateway` L2 construct generates **two**
+   trust-policy statements for the `bedrock-agentcore.amazonaws.com`
+   principal — one correctly scoped with `aws:SourceAccount`/
+   `aws:SourceArn`, and a second, redundant one with no condition at
+   all (a classic confused-deputy gap). No CDK prop exposes control
+   over this. Fixed with a new `_harden_gateway_trust_policy()` in
+   `gateway_stack.py`, overriding the role's `AssumeRolePolicyDocument`
+   via the L1 `CfnRole` escape hatch (`gateway.role.node.default_child`)
+   to keep only the scoped statement — a local, reproducible-on-every-
+   deploy patch, not a construct-level fix. Reported upstream:
+   [aws/aws-cdk#38780](https://github.com/aws/aws-cdk/issues/38780).
+2. **No WAF on the internet-facing ALB.** Added `_add_waf()` to
+   `web_stack.py`: a regional `WAFv2::WebACL` with
+   `AWSManagedRulesCommonRuleSet` + `AWSManagedRulesKnownBadInputsRuleSet`
+   (both `overrideAction: none`) plus a rate-based rule (500 req/5min
+   per IP — AWS's own commonly-cited starting-point default, sized for
+   this project's actual traffic profile per decision #137's real
+   numbers, not a fuller managed-rule stack that would add cost/false-
+   positive risk with no commensurate benefit at this volume),
+   associated with the ALB via `WAFv2::WebACLAssociation`.
+3. **Legacy ALB TLS policy.** The HTTPS listener had no explicit
+   `ssl_policy` at all, defaulting to `ELBSecurityPolicy-2016-08` (TLS
+   1.0/1.1 permitted). Set explicitly to
+   `elbv2.SslPolicy.RECOMMENDED_TLS` (`ELBSecurityPolicy-TLS13-1-2-2021-06`
+   — TLS 1.2/1.3 only, confirmed via `InternalCodeSearch` against real
+   CDK usage before assuming the enum member name).
+
+Verified via `cdk synth` (all 7 stacks clean, direct template inspection
+confirmed each fix's exact synthesized properties), the full test suite
+(199/199, unaffected — CDK/infra-only change, no application code
+touched), and a live `cdk deploy TravelAgentGatewayStack
+TravelAgentWebStack` (`UPDATE_COMPLETE` on both, 28.1s and 49.14s, no
+rollback). Confirmed live post-deploy: `iam:GetRole` shows only the
+scoped trust statement; `elbv2:DescribeListeners` shows
+`SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06`; `wafv2:ListResources
+ForWebACL` confirms the new WebACL is associated with the live ALB.
+
+### Known open security findings (deferred, not yet fixed)
+
+The rest of the DevOps Agent's findings, in the order it ranked them.
+Tracked here rather than fixed immediately — revisit before considering
+this audit fully closed out.
+
+**🔴 High**
+0. **WAF WebACL has no logging enabled** (found 2026-09-06, via a
+   follow-up re-check through the actual `@aws-devops-agent` MCP tool
+   after fixing its earlier missing-credentials issue — see below).
+   `wafv2:GetLoggingConfiguration` on `travel-agent-web-acl`
+   (`arn:aws:wafv2:us-east-1:800206160271:regional/webacl/travel-agent-web-acl/7c1b6e26-c516-41e1-bb97-a8ff26eb1c11`)
+   returns `WAFNonexistentItemException` — confirmed no log destination
+   (CloudWatch Logs/Kinesis Firehose/S3) is wired up for this WebACL.
+   The WAF added in this same phase (finding #2 above) is actively
+   blocking/allowing traffic with zero forensic visibility into which
+   requests matched which rule — no way to investigate a real attack or
+   tune a false positive after the fact; `SampledRequestsEnabled`/
+   `CloudWatchMetricsEnabled` alone don't provide request-level detail.
+   Fix: `wafv2:PutLoggingConfiguration` pointing at a new, retained
+   CloudWatch Logs log group (matching this project's existing
+   `RetentionDays.ONE_MONTH` convention from Phase 15/decision #99).
+
+**🟠 Medium**
+1. **`bedrock-mantle:CallWithBearerToken` granted on `Resource: "*"`** —
+   the only true wildcard-resource IAM grant in the whole workload
+   (`_grant_bedrock_inference_invoke()` in `gateway_stack.py`, added for
+   the Gateway-routed-inference feature, §2i). That function's own
+   docstring claims this action has no resource-level scoping support
+   in AWS's IAM reference — worth re-confirming directly against AWS's
+   current IAM action reference before accepting this as unfixable, in
+   case resource-level support was added since. **Re-confirmed still
+   accurate** by the 2026-09-06 re-check above (independently, via a
+   live IAM policy inspection) — no resource-level scoping exists yet
+   for this action.
+2. **AgentCore Gateway/Runtime network posture unverified by the
+   audit** — the DevOps Agent's own auditing role
+   (`DevOpsAgentRole-AgentSpace`) lacks `bedrock-agentcore:List*/Get*`,
+   so it couldn't directly confirm the Gateway's authorizer type or the
+   Runtime's network mode from the AgentCore control plane itself (it
+   inferred from CloudFormation/IAM instead). This project's own
+   DESIGN.md already documents these facts (Gateway: IAM by default,
+   JWT optional per decision #81; Runtime: JWT-configured per Phase 3),
+   so this is a gap in the *audit's* visibility, not a confirmed
+   problem — either grant read access or just cross-check directly via
+   CLI.
+3. **No CloudTrail data events for Lambda `Invoke`/S3 object-level** —
+   individual Gateway-triggered tool invocations aren't independently
+   auditable outside CloudWatch/X-Ray. Would need a new/modified
+   CloudTrail trail configuration (this account's existing trail,
+   `IsengardTrail-DO-NOT-DELETE`, only logs management events).
+4. **No VPC Flow Logs** on `TravelAgentWebStack`'s VPC (found
+   2026-09-06, same re-check as the WAF-logging finding above) —
+   `ec2:describe_flow_logs` returned empty for
+   `vpc-05f45d5cf9ca8a6f9`. Reduces network-level forensic visibility
+   for the ECS/ALB data plane specifically. Not urgent — CloudTrail
+   (confirmed both an org-wide Control Tower trail and an
+   account-level trail, both multi-region with log file validation) and
+   the WAF/ALB/ECS logs already provide layered coverage — but worth
+   closing for defense-in-depth if network-level audit trails are ever
+   needed (e.g. investigating a specific connection/IP after an
+   incident, not just an HTTP-layer WAF/ALB log).
+
+**🟡 Low / cleanup**
+5. OIDC issuer URLs, client IDs, and the session-cookie KMS key ID are
+   passed as ECS task-definition `command` args in plaintext (visible
+   via `ecs:DescribeTaskDefinition`) — not secret values themselves,
+   but useful recon for a lower-privileged attacker. Could move to
+   `secrets`/SSM SecureString injection instead of `command` args.
+   (Re-confirmed by the 2026-09-06 re-check: OIDC *secret values* are
+   correctly referenced by ARN only, not embedded as plaintext — this
+   finding is specifically about the non-secret config values like
+   issuer URLs/client IDs/key IDs still being visible as plain command
+   args, which is unchanged.)
+6. Secrets Manager secrets (`OidcClientSecret`, `RuntimeOidcClientSecret`)
+   use the AWS-managed key (`alias/aws/secretsmanager`), not a CMK — no
+   scoped key policy or independent per-secret decrypt audit trail.
+7. ECS task role's KMS action set on `SessionCookieKey`
+   (`Encrypt`+`Decrypt`+`GenerateDataKey*`+`ReEncrypt*`) is broader than
+   a session-cookie-envelope-encryption use case typically needs.
+8. `TravelAgentMemoryStack`'s Memory service role has zero attached
+   policies and has never been assumed (`RoleLastUsed` empty) — confirm
+   this is an intentional placeholder (required by the
+   `AWS::BedrockAgentCore::Memory` resource's own trust setup) rather
+   than dead/removable infrastructure.
+9. No Lambda Throttles alarms exist (only `Errors`, from Phase 22) —
+   concurrency exhaustion wouldn't trigger any alarm today.
+10. ECS deployment circuit breaker isn't tied to the Phase 22 CloudWatch
+    alarms for auto-rollback (`deploymentConfiguration.alarms.enable` is
+    `false` on the Fargate service) — a bad deploy only auto-rolls-back
+    on ECS's own task-failure detection, not on an app-level alarm firing
+    post-deploy.
+11. Runtime execution role's `bedrock:InvokeModel*` grant spans three
+    regions (`us-east-1`, `us-east-2`, `us-west-2`, from the original
+    Phase 5 cross-region-inference-profile fix) — confirm cross-region
+    inference is actually still in use before narrowing to fewer
+    regions.
+
+### Note: `@aws-devops-agent` MCP server had no credentials, silently unusable (found/fixed 2026-09-06)
+
+Separate from the security findings above — an operational gap in how
+this project's own tooling accesses the DevOps Agent. The
+`aws-devops-agent` MCP server entry in
+`.kiro/agents/travel-planning-agent.json` had no `env` block at all, so
+its `mcp-proxy-for-aws` subprocess had no AWS credentials to SigV4-sign
+requests to `connect.aidevops.us-east-1.api.aws` — it never actually
+initialized, and every prior "ask the DevOps Agent" request in this
+project silently fell back to a hand-rolled verification script instead
+of the real MCP tool, with no error surfaced to explain why. Fixed by
+adding `AWS_SHARED_CREDENTIALS_FILE`/`AWS_REGION` to the server's `env`,
+pointing at a freshly-obtained sandbox credentials file
+(`get_aws_creds`, account `800206160271`, role `Admin`) — confirmed live
+via `/mcp` showing the server initialized, then a real `chat` tool call
+that correctly enumerated all 7 stacks and returned accurate findings
+(the WAF-logging and VPC-Flow-Logs items above). **Caveat**: these are
+session-scoped, short-lived sandbox credentials, not a permanent fix —
+if the server stops responding in a future session, re-run
+`get_aws_creds` and update the `env` block's `AWS_SHARED_CREDENTIALS_FILE`
+path again.
+
+
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

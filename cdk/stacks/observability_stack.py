@@ -280,11 +280,20 @@ class ObservabilityStack(Stack):
             threshold=1,
             evaluation_periods=ERROR_ALARM_EVALUATION_PERIODS,
             comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
-            # No running tasks reporting a metric at all is itself a sign
-            # the service is down, not a benign gap — unlike the error-
-            # count alarms above, where "no data" genuinely means "no
-            # errors happened" and should not breach.
-            treat_missing_data=cloudwatch.TreatMissingData.BREACHING,
+            # Originally BREACHING, on the theory that no datapoints at
+            # all is itself a sign of an outage. Confirmed live (2026-09-
+            # 06) that's wrong in practice: this metric has genuine
+            # reporting gaps independent of service health — the alarm's
+            # own history shows a single ALARM transition caused entirely
+            # by "no datapoints were received for 1 period," while ECS's
+            # own DescribeServices (the ground truth for actual running
+            # tasks) reported runningCount=1 continuously through that
+            # exact window. Treating a metric-emission gap as a breach
+            # produces false alarms on a healthy service — matching the
+            # other alarms in this stack (see EcsCpuUtilizationAlarm
+            # below, and the ALB alarms above), missing data here means
+            # "no evidence of a problem," not "assume the worst."
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(self._alarm_action())
 
         cpu_utilization = fargate_service.metric_cpu_utilization(period=RESOURCE_ALARM_PERIOD)

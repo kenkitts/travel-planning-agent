@@ -2094,6 +2094,25 @@ new logs/traces have been used in practice") had clearly been met.
   confirmation SNS sends automatically).
 - Cleaned up: deleted the temporary deploy log after use — no scratch
 
+### Post-deploy fix: false alarm on RunningTaskCount (2026-09-06)
+
+`EcsRunningTaskCountAlarm` (this phase's own alarm) false-triggered on a
+genuinely healthy service. Verified live before making any change:
+`aws cloudwatch describe-alarm-history` showed exactly one ALARM
+transition ever, with the stated reason being solely "no datapoints
+were received for 1 period" — and `get-metric-statistics` for that
+exact window confirmed zero datapoints, not a real dip to 0. Cross-
+checked against `ecs describe-services`' event history for the same
+window: `runningCount` stayed at 1 throughout, and the service's routine
+~6-hour "reached a steady state" cycle (Fargate's own periodic task/
+platform refresh, not a code deployment) was the likely source of the
+metric gap, not an actual outage. See DESIGN.md §2l decision #146.
+
+Fixed by changing `treat_missing_data` from `BREACHING` to
+`NOT_BREACHING`, matching every sibling alarm in this stack. Verified
+via `cdk synth` (confirmed `"TreatMissingData": "notBreaching"` in the
+synthesized template) and the full test suite (199/199, unaffected).
+
 ## Phase 23 — Logout capability (added 2026-09-05)
 
 See DESIGN.md §2l (decisions #143-144) for the full tier comparison and

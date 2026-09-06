@@ -2146,6 +2146,40 @@ sufficient.
   attempting a revoke call).
 - `cdk synth` (all 7 stacks): clean — this phase is web-app code only,
   no CDK/infrastructure changes, confirmed no regression regardless.
+
+### Live deployment findings (2026-09-05)
+
+Deployed and confirmed the `/api/logout` route itself worked live (a
+curl against it returned 204 as expected) — but a real user reported the
+"Log out" button did nothing at all in their browser: no failed
+request, no console error, correct DOM element, no event listener
+showing in DevTools' Inspector. Root cause, confirmed by having the user
+download the exact `app.js` their browser had actually loaded and
+diffing it against the repo: their browser was silently still running
+the **pre-deploy** `app.js` (715 lines, no logout code), while every
+server-side check (`curl`, live route tests) was hitting a fresh copy.
+`/static/*` (FastAPI's `StaticFiles`) and `/`/`/favicon.ico`
+(`FileResponse`) had never set a `Cache-Control` header, leaving caching
+to browser heuristics — which kept serving the stale script even across
+a full browser restart, until the user disabled the browser cache in
+DevTools, which fixed it immediately (confirming the diagnosis).
+
+Fixed by adding `NoCacheStaticFiles` (a `StaticFiles` subclass forcing
+`Cache-Control: no-cache` on every response) for the `/static` mount,
+and setting the same header explicitly on `/`/`/favicon.ico`. `no-cache`
+(not `no-store`) keeps `ETag` revalidation working — an unchanged file
+after a redeploy still gets a fast `304`. Two regression tests
+(`StaticAssetCachingTests`) lock this in. See DESIGN.md §2l's "Live
+deployment findings" subsection (decision #145) for the full writeup —
+this is the first bug in this project that only a real user's real
+browser could have caught, not any server-side/live-AWS-state check.
+
+Verified: `python -m pytest tests/ web/tests/` — 199/199 passing (197
+baseline + 2 new `StaticAssetCachingTests`, plus a new assertion on the
+existing favicon test). Deployed via `cdk deploy TravelAgentWebStack`;
+confirmed live that `/static/app.js` and `/` now both send
+`Cache-Control: no-cache`, and that a fresh browser load picks up the
+logout button correctly.
   files left in the repo.
 
 ## Explicit Non-Goals (tracked, not built now)

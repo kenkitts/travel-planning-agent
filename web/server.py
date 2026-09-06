@@ -104,6 +104,37 @@ from auth import (
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that forces revalidation on every request.
+
+    FastAPI's default StaticFiles response carries Last-Modified/ETag but
+    no Cache-Control header at all — this leaves browser (and any
+    intermediate proxy) caching purely to heuristics, which was confirmed
+    live to cause a real bug: after deploying the logout feature, a
+    user's browser kept serving a pre-deploy app.js with no logout code
+    at all, with no visible error of any kind (no failed network
+    request, no console error — the button simply had no listener,
+    because the script that defined it was never the one that loaded).
+    Disabling the browser cache fixed it immediately, confirming this
+    exact mechanism.
+
+    Cache-Control: no-cache (not no-store) keeps ETag-based revalidation
+    working — an unchanged file after a redeploy still gets a fast 304,
+    only a genuinely changed file (new ETag) is ever served fresh. This
+    is a deliberate choice over a long max-age + versioned filenames
+    (the more common fix for this class of bug): it requires no build
+    step or filename-hashing infra in this project, at the cost of one
+    extra round-trip per static asset per page load — an acceptable
+    trade for this app's traffic volume (see DESIGN.md decision #137's
+    real-traffic numbers).
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 # Longest prompt fragment shown as a conversation's preview in the sidebar.
 PREVIEW_MAX_CHARS = 80
 
@@ -489,6 +520,7 @@ def create_app(
         # first Phase 1 deploy, not by the automated test suite.
         context = _resolve_auth(request)
         file_response = FileResponse(STATIC_DIR / "index.html")
+        file_response.headers["Cache-Control"] = "no-cache"
         apply_refreshed_cookie_if_needed(file_response, context, session_codec)
         return file_response
 
@@ -496,7 +528,9 @@ def create_app(
     def favicon() -> FileResponse:
         # Browsers request this path directly (independent of index.html's
         # own <link rel="icon">) before a page's markup is even parsed.
-        return FileResponse(STATIC_DIR / "favicon.ico")
+        response = FileResponse(STATIC_DIR / "favicon.ico")
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/api/config")
     def config() -> dict:
@@ -875,7 +909,7 @@ def create_app(
             session_id=session_id, deleted_events=deleted, failed_events=failed
         )
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
     return app
 
 

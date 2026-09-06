@@ -873,6 +873,29 @@ class ChatEndpointTests(_AppTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("image/", response.headers["content-type"])
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+
+
+class StaticAssetCachingTests(_AppTestCase):
+    """Regression tests: a deployed frontend change (the logout button)
+    was invisible to a real user because their browser kept serving a
+    pre-deploy app.js with no Cache-Control header at all to say
+    otherwise — no failed request, no console error, just a stale
+    script silently running instead of the new one. Confirmed live by
+    disabling the browser cache, which fixed it immediately. These tests
+    lock in the fix: every static asset must tell the browser to
+    revalidate on each request."""
+
+    def test_index_route_sends_no_cache(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+
+    def test_static_mount_sends_no_cache(self):
+        response = self.client.get("/static/app.js")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-cache")
 
 
 class WhoamiEndpointTests(_AppTestCase):

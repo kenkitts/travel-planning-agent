@@ -54,14 +54,30 @@ Stack wiring:
                   reads independently above; they must describe the same
                   Okta app/audience/scope for the exchanged token to be
                   accepted by the Runtime at all.
+  DevOpsStack  -> provisions an AWS DevOps Agent Space for on-demand
+                  monitoring/investigation of this account's resources
+                  (DESIGN.md §2j). Deliberately independent — no CDK
+                  dependency on, or resource references from, any of the
+                  other 4 stacks; its own read access is account-wide by
+                  design (see devops_stack.py's module docstring).
+  ObservabilityStack -> CloudWatch Alarms (SNS-notified) + a Dashboard
+                  covering Lambda, Gateway, Runtime, and (when WebStack
+                  is deployed) ALB/ECS resources (DESIGN.md's Phase 22
+                  section). Depends on ToolsStack, GatewayStack, and
+                  RuntimeStack always, and WebStack whenever it's part of
+                  this deploy — the opposite independence posture from
+                  DevOpsStack, since every alarm here watches one
+                  specific, named resource passed in directly.
 """
 import os
 from pathlib import Path
 
 import aws_cdk as cdk
 
+from stacks.devops_stack import DevOpsStack
 from stacks.gateway_stack import GatewayStack
 from stacks.memory_stack import MemoryStack
+from stacks.observability_stack import ObservabilityStack
 from stacks.runtime_stack import RuntimeStack
 from stacks.tools_stack import ToolsStack
 from stacks.web_stack import WebStack
@@ -273,6 +289,40 @@ if web_certificate_arn:
     )
     web_stack.add_dependency(runtime_stack)
     web_stack.add_dependency(memory_stack)
+
+# Independent of every other stack (DESIGN.md §2j) — no cross-stack
+# dependency, no imported resource ARNs. Unconditional (unlike WebStack)
+# since it has no external prerequisite comparable to an ACM certificate
+# or an Okta app registration; it only needs this AWS account itself.
+devops_stack = DevOpsStack(app, "TravelAgentDevOpsStack", env=env)
+
+# Alarms + dashboard fast-follow (DESIGN.md's Phase 22 section) — the
+# opposite dependency posture from DevOpsStack: every alarm here watches
+# one specific, named resource in another stack, passed in directly as a
+# real CDK object/property (matching how Gateway/Memory are already
+# threaded into RuntimeStack above), not a hardcoded string or an
+# SSM-parameter indirection. WebStack's ALB/ECS resources are optional
+# constructor arguments, since WebStack itself is conditionally
+# constructed above — those alarms/widgets are simply skipped when
+# WebStack isn't part of a given deploy.
+observability_stack = ObservabilityStack(
+    app,
+    "TravelAgentObservabilityStack",
+    env=env,
+    weather_function=tools_stack.weather_function,
+    places_function=tools_stack.places_function,
+    gateway_arn=gateway_stack.gateway.gateway_arn,
+    runtime_arn=runtime_stack.runtime.agent_runtime_arn,
+    web_load_balancer=web_stack.load_balancer if web_certificate_arn else None,
+    web_target_group=web_stack.target_group if web_certificate_arn else None,
+    web_cluster=web_stack.cluster if web_certificate_arn else None,
+    web_fargate_service=web_stack.fargate_service if web_certificate_arn else None,
+)
+observability_stack.add_dependency(tools_stack)
+observability_stack.add_dependency(gateway_stack)
+observability_stack.add_dependency(runtime_stack)
+if web_certificate_arn:
+    observability_stack.add_dependency(web_stack)
 
 # Applied to every taggable resource across all deployed stacks.
 cdk.Tags.of(app).add("auto-delete", "no")

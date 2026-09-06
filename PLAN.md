@@ -1875,6 +1875,226 @@ already-documented failure class behind it.
 - Deployed via `cdk deploy TravelAgentRuntimeStack`. Confirmed live via
   `aws cloudformation describe-stacks`: `StackStatus: UPDATE_COMPLETE`.
 
+## Phase 21 — AWS DevOps Agent integration for on-demand monitoring (added 2026-09-04)
+
+See DESIGN.md §2j (decisions #123-133) for the full design rationale and
+the 11-question clarifying-questions pass that shaped it before any code
+was written.
+
+### What was built
+- `cdk/stacks/devops_stack.py` (new): `DevOpsStack` — provisions an AWS
+  DevOps Agent Space scoped to this single account/region (`us-east-1`
+  only, decision #124). Two IAM roles matching AWS's own documented
+  CloudFormation reference pattern exactly:
+  - `AgentSpaceRole` (`DevOpsAgentRole-AgentSpace`): assumed by the
+    `aidevops.amazonaws.com` service principal, trust policy scoped with
+    confused-deputy `aws:SourceAccount`/`aws:SourceArn` conditions.
+    Attached with the AWS-managed `AIDevOpsAgentAccessPolicy` (read-only
+    by design, decision #127) plus one required inline statement
+    (`iam:CreateServiceLinkedRole`, scoped to the Resource Explorer
+    service-linked-role ARN).
+  - `OperatorAppRole` (`DevOpsAgentRole-WebappAdmin`): assumed by the
+    DevOps Agent operator app (the web app used to browse
+    investigations/topology), attached with `AIDevOpsOperatorAppAccessPolicy`,
+    configured for IAM auth (decision #128) via
+    `CfnAgentSpace.operator_app.iam`.
+  - `CfnAgentSpace` (name `travel-planning-agent`) and `CfnAssociation`
+    (`service_id="aws"`, `accountType="monitor"`) — the actual Agent
+    Space resource and its account association.
+  - `CfnBudget` (`DevOpsAgentCostBudget`): $100/month, filtered to the
+    `AWS DevOps Agent` Cost Explorer service dimension, two notification
+    thresholds (80% `FORECASTED`, 100% `ACTUAL`) both emailing
+    `kenkitts@amazon.com` directly via Budgets' native `EMAIL` subscriber
+    type — no SNS topic needed (decision #126).
+  - A `CfnOutput` (`AgentSpaceId`) for the created Agent Space's ID.
+- `cdk/app.py`: added the `DevOpsStack` import and construction —
+  unconditional (unlike `WebStack`, which gates on `WEB_CERTIFICATE_ARN`),
+  since this stack has no external prerequisite comparable to an ACM
+  certificate or Okta app registration. No `add_dependency()` calls —
+  deliberately independent of the other 5 stacks (decision #130).
+
+### Why this, not alternatives
+- **On-demand only, no alarm-triggered automation** (decision #123) —
+  this project has zero CloudWatch Alarms today (DESIGN.md decisions
+  #102/#103 explicitly deferred them); wiring an alarm to auto-trigger a
+  billed investigation before any alarm threshold has been validated
+  against real traffic risked spending real money on false positives with
+  no human in the loop. Revisit once the on-demand flow has been used
+  enough to trust it.
+- **CDK, not the console wizard or a one-off CLI script** (decision #125)
+  — the only option consistent with this project's existing "no manual
+  console clicking anywhere" convention (decision #11). Confirmed via
+  AWS's own CloudFormation reference doc that no manual prerequisite step
+  exists — CDK/CloudFormation alone can create a fully working Agent
+  Space from scratch.
+- **No third-party integrations** (decision #129) — Slack/PagerDuty/
+  ServiceNow/GitHub were all considered and explicitly deferred; nothing
+  currently pushes a proactive notification that would need a delivery
+  channel, since every interaction is on-demand and human-initiated.
+- **Independent stack, account-wide read scope** (decision #130) — not
+  scoped to only the other 5 stacks' resource ARNs, since the service's
+  own value (topology mapping across the whole account) would be
+  undercut by a fixed allowlist, and independence means this stack can be
+  deployed/updated/torn down without any ordering constraint.
+
+### Verified
+- `cdk synth TravelAgentDevOpsStack`: clean. Confirmed via direct
+  template inspection: `AgentSpaceRole` (managed policy +
+  `iam:CreateServiceLinkedRole` inline statement), `OperatorAppRole`,
+  `AWS::DevOpsAgent::AgentSpace`, `AWS::DevOpsAgent::Association` (with
+  `DependsOn: AgentSpace`), and `AWS::Budgets::Budget` (correct $100 USD
+  monthly limit, `SERVICE=AWS DevOps Agent` filter, both notification
+  thresholds) all present exactly as designed. Plain `cdk synth` (no
+  `--all` flag needed — synthesizes every stack by default in this CDK
+  version) confirmed all 6 stacks synthesize cleanly together, no
+  regressions to the existing 5.
+- Deployed via `cdk deploy TravelAgentDevOpsStack --require-approval
+  never` in account `800206160271`, region `us-east-1`. `CREATE_COMPLETE`
+  in 43.8s, all 8 resources created cleanly. Output:
+  `AgentSpaceId = 146b6d1c-dbd4-4f68-9c98-0eb216bbcb9a`.
+- **Live, end-to-end verification** (decision #133) — not just deployed,
+  actually exercised. AWS DevOps Agent's own control-plane CLI
+  (`aws devops-agent create-chat`) turned out to only create a chat
+  session record, with no CLI action to send an actual message into it
+  (decision #132) — real conversational interaction happens over a
+  separate MCP/A2A remote-server surface at
+  `https://connect.aidevops.{region}.api.aws`. Connected via the `/mcp`
+  endpoint, SigV4-signed with this session's own AWS credentials (no
+  access token provisioning needed), and called the `chat` tool with a
+  real question about `TravelAgentRuntimeStack`'s status. The agent
+  reasoned aloud in real time ("I'll check the account for CloudFormation
+  stacks... Calling `cloudformation.list_stacks`... Done"), then
+  correctly reported: `TravelAgentRuntimeStack` exists in account
+  `800206160271` (us-east-1), status `UPDATE_COMPLETE`, created
+  `2026-08-18`, last updated `2026-09-03 18:14 UTC` — every fact
+  independently verifiable and correct, confirming `AgentSpaceRole`'s
+  read permissions actually work against this real account's real
+  resources end to end, not just that the IAM policy document parses.
+  (The `/a2a/` endpoint was tried first per AWS's docs but consistently
+  returned `"SigV4 signature validation failed"` even after ruling out
+  client-library/body-encoding causes — not fully root-caused, since the
+  `/mcp` endpoint worked correctly on the first attempt using the exact
+  same signing code, removing the need to debug the A2A path further.)
+- Cleaned up: deleted the temporary verification script and all scratch
+  synth/deploy logs after use — no scratch files left in the repo.
+
+## Phase 22 — CloudWatch Alarms + Dashboard fast-follow (added 2026-09-05)
+
+See DESIGN.md §2k (decisions #134-142) for the full design rationale and
+the 8-question clarifying-questions pass that shaped it before any code
+was written. Triggered by a user-requested observability audit that
+re-confirmed decisions #102/#103's original deferral condition ("once the
+new logs/traces have been used in practice") had clearly been met.
+
+### What was built
+- `cdk/stacks/observability_stack.py` (new): `ObservabilityStack` —
+  provisions a single SNS topic (`travel-planning-agent-alarms`, email
+  subscription to `kenkitts@amazon.com` — the first SNS topic anywhere
+  in this project) and 9 CloudWatch Alarms, all wired to that topic:
+  - ALB `HTTPCode_Target_5XX_Count >= 1` and `UnHealthyHostCount >= 1`
+    (5-min windows, count-based)
+  - ECS `RunningTaskCount < 1` (service-down detection,
+    `TreatMissingData=BREACHING` — unlike every other alarm here, no
+    data at all is itself a bad sign for this one)
+  - ECS `CPUUtilization > 80%` and `MemoryUtilization > 80%` (3×5-min
+    datapoints, matching the AWS ECS/Fargate IDR alarming reference)
+  - Lambda `Errors >= 1` for both the weather and places tool functions
+  - AgentCore Runtime `SystemErrors >= 1` and Gateway `SystemErrors >= 1`
+    (namespace `AWS/Bedrock-AgentCore`, dimension `Resource`=the
+    resource's own ARN — confirmed as real, alarm-able metrics via AWS's
+    own docs before committing to include them)
+
+  Also provisions one CloudWatch Dashboard (`travel-planning-agent`)
+  with a widget per alarm's underlying metric, plus additional
+  volume/latency context widgets not tied to any alarm (ALB
+  `RequestCount`/`TargetResponseTime`, Lambda `Invocations`, AgentCore
+  `Invocations`/`Latency`) — all metrics that already existed with zero
+  new instrumentation required.
+
+  The 5 ALB/ECS alarms and 2 web-specific dashboard widgets are
+  conditional on `WebStack` actually being part of the deploy (matching
+  `cdk/app.py`'s existing `WEB_CERTIFICATE_ARN`-gated construction) —
+  skipped, not stubbed or erroring, when `WebStack` isn't deployed.
+
+- `cdk/stacks/web_stack.py`: promoted three previously-local variables
+  (`cluster`, `fargate_service`, `target_group`) to `self.` attributes,
+  so `ObservabilityStack` can reference them directly from `app.py` —
+  a small, purely mechanical refactor with no behavior change (confirmed
+  via the full test suite and a clean `cdk synth` before and after).
+
+- `cdk/app.py`: added the `ObservabilityStack` import and construction,
+  wired with direct CDK object/property references from `ToolsStack`,
+  `GatewayStack`, `RuntimeStack`, and (conditionally) `WebStack` —
+  matching this project's only existing precedent for this kind of need
+  (Gateway/Memory threaded into `RuntimeStack`'s constructor). Explicit
+  `add_dependency()` calls on all 3-4 referenced stacks — the opposite
+  dependency posture from `TravelAgentDevOpsStack`, deliberately, since
+  every alarm here watches one specific, named resource.
+
+### Why this, not alternatives
+- **Count-based thresholds, not percentage-based** (decision #137) — 
+  checked real live metrics before deciding (1-7 Lambda invocations/day,
+  ECS memory flat at ~6-10%): at this traffic volume, a percentage-rate
+  threshold is statistically meaningless (a single request can swing it
+  from 0% to 100%), so "any error at all in a 5-minute window" is both
+  the statistically correct framing and the most useful one. CPU/Memory
+  kept percentage thresholds since resource saturation isn't
+  volume-sensitive the same way.
+- **A dedicated stack, not alarms embedded in each owning stack**
+  (decision #135) — CloudWatch alarms attach by metric namespace +
+  dimension, not by CDK cross-stack reference, so they don't need to be
+  co-located with what they watch; one place to find every alarm in the
+  project, one SNS topic with no ARN-threading through 4 stacks.
+- **Direct CDK object passing, not hardcoded strings or SSM parameters**
+  (decision #136) — CDK's auto-generated resource-name suffixes aren't
+  stable across a stack teardown/recreate, so hardcoding them would
+  silently break the next time any referenced stack gets replaced; this
+  project has no existing precedent for either alternative to follow.
+- **Memory instrumentation deliberately deferred** (decision #140) — a
+  genuinely different kind of change (agent code via ADOT, not CDK
+  infrastructure) than everything else in this phase; kept out to keep
+  this phase's verification story clean, following the same reasoning
+  that motivated decisions #101-103's original deferral.
+
+### Verified
+- `cdk synth TravelAgentObservabilityStack`: clean. Confirmed via direct
+  template inspection: all 9 alarms present with correct `MetricName`/
+  `Namespace`/`Threshold`/`ComparisonOperator`/`TreatMissingData`
+  properties exactly as designed, plus the SNS topic, subscription, and
+  dashboard. Plain `cdk synth` (all 7 stacks) confirmed no regression to
+  any of the other 6.
+- `python -m pytest tests/ web/tests/`: 191/191 passing, unchanged —
+  this phase touched no application code, only CDK infrastructure and
+  one mechanical `web_stack.py` variable-promotion refactor.
+- **Live-checked (not assumed) before writing any code**: confirmed via
+  `aws cloudwatch describe-alarms` that this account had *zero* custom
+  alarms before this phase (only ECS's own `TargetTracking` autoscaling
+  alarms) and *zero* dashboards; confirmed Transaction Search was
+  already `ACTIVE`; confirmed via `aws cloudwatch get-metric-statistics`
+  the real traffic-volume numbers that drove decision #137; confirmed
+  via `aws logs describe-deliveries`/`get-delivery-destination` that the
+  ALB access-logs pipeline (decision #100) was already correctly
+  configured and delivering — the audit's initial suspicion of a gap
+  there was a false alarm from an incomplete tool-result listing, not a
+  real bug (decision #141).
+- Deployed via `cdk deploy TravelAgentObservabilityStack
+  --require-approval never` in account `800206160271`, region
+  `us-east-1`. `CREATE_COMPLETE` in 12.22s, all 14 resources created.
+- **Post-deploy verification** (decision #142 — deliberately not a
+  forced-trigger test, unlike decision #119): confirmed via
+  `aws cloudwatch describe-alarms` that all 9 alarms exist with the
+  exact intended dimensions (e.g. `Resource` = the real Gateway/Runtime
+  ARN, `ClusterName`/`ServiceName` = the real ECS resource names,
+  `LoadBalancer`/`TargetGroup` = the real ALB/target-group ARN suffixes)
+  and reached `INSUFFICIENT_DATA` (expected immediately post-creation,
+  before the first real evaluation cycle) with `ActionsEnabled=true` and
+  the correct SNS topic ARN as their alarm action. Confirmed via
+  `aws sns list-subscriptions-by-topic` that the email subscription to
+  `kenkitts@amazon.com` was created (pending the one-click email
+  confirmation SNS sends automatically).
+- Cleaned up: deleted the temporary deploy log after use — no scratch
+  files left in the repo.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

@@ -31,7 +31,7 @@ itinerary arithmetic/date math, called directly rather than via the
 Gateway) and a Strands AgentSkills plugin (procedural itinerary-pacing
 knowledge loaded on demand from `agent/skills/`, in-process).
 
-Five CDK stacks (deployed in this order):
+Five CDK stacks (deployed in this order), plus 2 more independent ones:
 - `TravelAgentToolsStack` — the weather and places Lambda functions
 - `TravelAgentGatewayStack` — the AgentCore Gateway and its four targets
   (Web Search, weather, places, and an optional Bedrock inference target
@@ -42,6 +42,14 @@ Five CDK stacks (deployed in this order):
   ALB (TLS termination/routing only — no auth logic of its own; see
   "Authentication" below). Required — this is the only supported way to
   use the agent. See "Hosting the Web UI" below.
+- `TravelAgentDevOpsStack` — provisions an AWS DevOps Agent Space for
+  on-demand monitoring/investigation of this account. Independent of the
+  other 5 (no deploy-order dependency); see "Observability" below.
+- `TravelAgentObservabilityStack` — CloudWatch Alarms (SNS-notified) +
+  a Dashboard covering Lambda, Gateway, Runtime, and (when `WebStack` is
+  deployed) ALB/ECS resources. Depends on the other stacks it monitors
+  (the opposite posture from `TravelAgentDevOpsStack`); see
+  "Observability" below.
 
 ## Repo layout
 
@@ -50,7 +58,7 @@ travel-planning-agent/
 ├── DESIGN.md              # design decisions + rationale
 ├── PLAN.md                # phased build plan, with completion notes
 ├── agent/                 # Strands agent + BedrockAgentCoreApp entrypoint
-├── cdk/                   # CDK app (Python) — 5 stacks, see cdk/stacks/
+├── cdk/                   # CDK app (Python) — 7 stacks, see cdk/stacks/
 ├── lambdas/                # weather + places tool Lambdas, with tests
 ├── tests/                  # unit tests for the Lambda handlers + agent helpers
 └── web/                    # the only client: server.py + agent_client.py +
@@ -148,7 +156,8 @@ cdk destroy --all
 ```
 
 This deletes every deployed stack and its resources (Lambdas, Gateway,
-Memory, Runtime, and — if deployed — the VPC/ALB/ECS resources from
+Memory, Runtime, the AWS DevOps Agent Space, the CloudWatch Alarms/
+Dashboard/SNS topic, and — if deployed — the VPC/ALB/ECS resources from
 `TravelAgentWebStack`). It does **not** delete the CDK bootstrap stack
 (`CDKToolkit`) or its S3 asset bucket.
 
@@ -394,6 +403,62 @@ across a time range) — before assuming the problem is in this repo's own
 code; several real failures have turned out to be inside AWS's own managed
 connector backends, visible in these logs but not fixable from this
 codebase.
+
+### CloudWatch Alarms + Dashboard
+
+`TravelAgentObservabilityStack` provisions 9 CloudWatch Alarms — ALB
+5xx/unhealthy-host counts, ECS running-task-count/CPU/memory, both tool
+Lambdas' error counts, and AgentCore Runtime/Gateway `SystemErrors` — all
+notifying a single SNS topic with an email subscription (confirm the
+one-click subscription-confirmation email after first deploying this
+stack, or alarm notifications won't actually arrive). Thresholds are
+count-based ("any error at all in a 5-minute window") rather than
+percentage-based for everything except ECS CPU/Memory, since this
+project's real traffic volume is low enough that an error-rate
+percentage would be statistically meaningless — see `DESIGN.md` §2k for
+the full rationale. A companion CloudWatch Dashboard
+(`travel-planning-agent`) adds request-volume and latency widgets not
+tied to any alarm.
+
+The ALB/ECS alarms and their dashboard widgets are only created when
+`TravelAgentWebStack` is part of the deploy (same `WEB_CERTIFICATE_ARN`
+gating as `WebStack` itself) — the Lambda and AgentCore alarms are
+always created.
+
+### AWS DevOps Agent (on-demand investigation)
+
+`TravelAgentDevOpsStack` provisions an AWS DevOps Agent Space scoped to
+this account/region — a separate, fully-managed AWS service (not
+something hosted by this repo) that can answer natural-language questions
+about this account's resources, grounded in real CloudWatch/X-Ray/
+CloudTrail data and resource inspection. Usage is on-demand only — no
+CloudWatch Alarm is wired to trigger it automatically (see `DESIGN.md`
+§2j for why).
+
+To ask it a question, connect to its MCP endpoint with your own AWS
+credentials (SigV4-signed, no access token needed) at
+`https://connect.aidevops.<region>.api.aws/mcp`, or use the AWS DevOps
+Agent console/web app directly. Example, via `uvx mcp-proxy-for-aws`:
+
+```bash
+uvx mcp-proxy-for-aws@latest \
+  https://connect.aidevops.us-east-1.api.aws/mcp \
+  --service aidevops --region us-east-1
+```
+
+Then call the `chat` tool (fast, conversational answers) or `investigate`
+tool (a deeper 5-8 minute root-cause analysis) with your question and the
+Agent Space ID from this stack's `AgentSpaceId` output
+(`aws cloudformation describe-stacks --stack-name TravelAgentDevOpsStack
+--query "Stacks[0].Outputs"`).
+
+**Cost note**: AWS DevOps Agent bills per second of active investigation
+time (~$0.0083/agent-second, roughly $30/hour) — a materially different
+cost profile from every other component in this stack, which cost
+fractions of a cent per call. A $100/month AWS Budget (with 80%
+forecasted and 100% actual alerts) is provisioned as a guardrail, but
+there is no hard spend cap — nothing blocks usage once the budget is
+exceeded.
 
 ## Known limitations
 

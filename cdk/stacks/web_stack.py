@@ -147,7 +147,7 @@ class WebStack(Stack):
             ],
         )
 
-        cluster = ecs.Cluster(self, "WebCluster", vpc=self.vpc)
+        self.cluster = ecs.Cluster(self, "WebCluster", vpc=self.vpc)
 
         # Task role: the container's own AWS credentials at runtime (ECS
         # injects these via the task metadata endpoint — no static keys in
@@ -450,10 +450,10 @@ class WebStack(Stack):
         # add-order going forward.
         task_definition.default_container = web_container
 
-        fargate_service = ecs.FargateService(
+        self.fargate_service = ecs.FargateService(
             self,
             "WebService",
-            cluster=cluster,
+            cluster=self.cluster,
             task_definition=task_definition,
             security_groups=[task_security_group],
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
@@ -472,13 +472,13 @@ class WebStack(Stack):
             min_healthy_percent=100,
         )
 
-        target_group = elbv2.ApplicationTargetGroup(
+        self.target_group = elbv2.ApplicationTargetGroup(
             self,
             "WebTargetGroup",
             vpc=self.vpc,
             port=CONTAINER_PORT,
             protocol=elbv2.ApplicationProtocol.HTTP,
-            targets=[fargate_service],
+            targets=[self.fargate_service],
             health_check=elbv2.HealthCheck(
                 path="/api/config",
                 healthy_http_codes="200",
@@ -494,10 +494,10 @@ class WebStack(Stack):
             port=443,
             protocol=elbv2.ApplicationProtocol.HTTPS,
             certificates=[certificate],
-            default_action=elbv2.ListenerAction.forward([target_group]),
+            default_action=elbv2.ListenerAction.forward([self.target_group]),
         )
 
-        scaling = fargate_service.auto_scale_task_count(
+        scaling = self.fargate_service.auto_scale_task_count(
             min_capacity=MIN_TASK_COUNT, max_capacity=MAX_TASK_COUNT
         )
         scaling.scale_on_cpu_utilization(

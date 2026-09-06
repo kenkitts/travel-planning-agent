@@ -447,6 +447,43 @@ class TokenExchangeTests(unittest.TestCase):
                 )
 
 
+class RevokeRefreshTokenTests(unittest.TestCase):
+    """Direct unit tests for auth.revoke_refresh_token() — independent of
+    the /api/logout route, which has its own tests (LogoutEndpointTests)
+    covering the cookie-clearing side of logout."""
+
+    def setUp(self):
+        self.okta_config = _make_okta_config()
+
+    def test_sends_refresh_token_type_hint_and_basic_auth(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            web_auth.revoke_refresh_token(self.okta_config, "a-real-refresh-token")
+
+        call_args, call_kwargs = mock_post.call_args
+        self.assertEqual(call_args[0], f"{self.okta_config.issuer}/v1/revoke")
+        self.assertEqual(call_kwargs["data"]["token"], "a-real-refresh-token")
+        self.assertEqual(call_kwargs["data"]["token_type_hint"], "refresh_token")
+        self.assertEqual(
+            call_kwargs["auth"], (self.okta_config.client_id, self.okta_config.client_secret)
+        )
+
+    def test_raises_auth_error_on_non_2xx(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = False
+            mock_post.return_value.status_code = 400
+            mock_post.return_value.text = "invalid_token"
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.revoke_refresh_token(self.okta_config, "a-real-refresh-token")
+
+    def test_raises_auth_error_on_network_failure(self):
+        import requests
+
+        with patch("auth.requests.post", side_effect=requests.RequestException("boom")):
+            with self.assertRaises(web_auth.AuthError):
+                web_auth.revoke_refresh_token(self.okta_config, "a-real-refresh-token")
+
+
 class OAuthFlowTests(unittest.TestCase):
     """Tests for the real OIDC redirect + /oauth2/callback flow — the
     401-vs-redirect split, PKCE/state round-trip, and code exchange."""
@@ -866,6 +903,53 @@ class WhoamiEndpointTests(_AppTestCase):
         response = unauthed_client.get("/api/whoami", headers={"sec-fetch-mode": "cors"})
 
         self.assertEqual(response.status_code, 401)
+
+
+class LogoutEndpointTests(_AppTestCase):
+    """Tests for POST /api/logout — revokes the refresh token at Okta,
+    then clears both cookies regardless of whether revocation succeeded."""
+
+    def test_revokes_refresh_token_and_clears_both_cookies(self):
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            response = self.client.post("/api/logout")
+
+        self.assertEqual(response.status_code, 204)
+        call_args, call_kwargs = mock_post.call_args
+        self.assertEqual(call_args[0], f"{self.okta_config.issuer}/v1/revoke")
+        self.assertEqual(call_kwargs["data"]["token"], "test-refresh-token")
+        self.assertEqual(call_kwargs["data"]["token_type_hint"], "refresh_token")
+        self.assertEqual(
+            call_kwargs["auth"], (self.okta_config.client_id, self.okta_config.client_secret)
+        )
+        set_cookie_headers = response.headers.get_list("set-cookie")
+        cleared_names = {h.split("=", 1)[0] for h in set_cookie_headers}
+        self.assertIn(web_auth.SESSION_COOKIE_NAME, cleared_names)
+        self.assertIn(web_auth.RUNTIME_TOKEN_COOKIE_NAME, cleared_names)
+
+    def test_still_clears_cookies_when_okta_revoke_call_fails(self):
+        # A logout must never leave the user stuck "logged in" just
+        # because Okta was unreachable — the browser-visible half of
+        # logout (clearing this app's own cookies) always succeeds.
+        import requests
+
+        with patch("auth.requests.post", side_effect=requests.RequestException("boom")):
+            response = self.client.post("/api/logout")
+
+        self.assertEqual(response.status_code, 204)
+        set_cookie_headers = response.headers.get_list("set-cookie")
+        cleared_names = {h.split("=", 1)[0] for h in set_cookie_headers}
+        self.assertIn(web_auth.SESSION_COOKIE_NAME, cleared_names)
+        self.assertIn(web_auth.RUNTIME_TOKEN_COOKIE_NAME, cleared_names)
+
+    def test_logout_with_no_session_cookie_still_succeeds(self):
+        unauthed_client = TestClient(self.app, base_url="https://testserver")
+
+        with patch("auth.requests.post") as mock_post:
+            response = unauthed_client.post("/api/logout")
+
+        mock_post.assert_not_called()
+        self.assertEqual(response.status_code, 204)
 
 
 def _conversational_event(role: str, text: str, timestamp=None) -> dict:

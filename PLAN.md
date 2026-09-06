@@ -2093,6 +2093,59 @@ new logs/traces have been used in practice") had clearly been met.
   `kenkitts@amazon.com` was created (pending the one-click email
   confirmation SNS sends automatically).
 - Cleaned up: deleted the temporary deploy log after use — no scratch
+
+## Phase 23 — Logout capability (added 2026-09-05)
+
+See DESIGN.md §2l (decisions #143-144) for the full tier comparison and
+rationale. Researched Okta's actual logout mechanics (RP-initiated
+logout's `/v1/logout`, and token revocation's `/v1/revoke`) before
+choosing a tier, rather than assuming cookie-clearing alone was
+sufficient.
+
+### What was built
+- `web/auth.py`: `revoke_refresh_token()` — POSTs to Okta's
+  `{issuer}/v1/revoke` with `token_type_hint=refresh_token` and HTTP
+  Basic client auth, invalidating both the refresh token and its
+  associated access token in one call. Best-effort: raises `AuthError`
+  on a genuine failure (network error, non-2xx), but the caller never
+  lets that block the user's own logout.
+- `web/server.py`: `POST /api/logout` — reads the session cookie
+  directly (not via `_resolve_auth()`, so an already-expired/missing
+  session still logs out cleanly with no 401/redirect), best-effort
+  revokes the refresh token, then always clears both
+  `travel_agent_session` and `travel_agent_runtime_token` cookies and
+  returns `204`.
+- `web/static/index.html`/`app.js`/`style.css`: a "Log out" button in
+  the header, next to "New conversation" — calls `POST /api/logout`,
+  clears the client-side `localStorage` session-ID key, then redirects
+  to `/` (which itself redirects to Okta login, since no session cookie
+  remains).
+
+### Why this, not alternatives
+- **Tier B (revoke + clear cookies), not Tier A (clear cookies only)**
+  (decision #143) — clearing cookies alone leaves the actual refresh
+  token valid and usable at Okta until it naturally expires (this
+  project's Okta app issues long-lived, non-rotating refresh tokens);
+  revoking it server-side is what makes "logout" actually mean the
+  credential is dead, not just hidden from one browser.
+- **Not Tier C (real Okta SSO sign-out via `/v1/logout`)** (decision
+  #144) — confirmed via Okta's own docs that this endpoint requires an
+  `id_token_hint` carrying a real ID token, which this app has never
+  requested (`openid offline_access` scope only, and
+  `exchange_code_for_tokens()` never reads an `id_token` field). Adding
+  that support for a single-app deployment with no other Okta-federated
+  apps to actually benefit from ending the shared SSO session wasn't
+  judged worth the new field/cookie-payload change.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 197/197 passing (191 baseline +
+  6 new — 3 `RevokeRefreshTokenTests` unit tests for
+  `revoke_refresh_token()` itself, 3 `LogoutEndpointTests` route tests
+  covering the happy path, an Okta-unreachable path that still clears
+  cookies, and a no-session-cookie path that still returns 204 without
+  attempting a revoke call).
+- `cdk synth` (all 7 stacks): clean — this phase is web-app code only,
+  no CDK/infrastructure changes, confirmed no regression regardless.
   files left in the repo.
 
 ## Explicit Non-Goals (tracked, not built now)

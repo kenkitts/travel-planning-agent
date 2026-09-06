@@ -89,6 +89,7 @@ from auth import (
     apply_refreshed_cookie_if_needed,
     apply_runtime_token_cookie_if_needed,
     clear_pending_login_cookie,
+    clear_runtime_token_cookie,
     clear_session_cookie,
     decode_pending_login,
     exchange_code_for_tokens,
@@ -96,6 +97,7 @@ from auth import (
     get_or_refresh_session,
     is_browser_navigation,
     redirect_to_login,
+    revoke_refresh_token,
     set_session_cookie,
 )
 
@@ -517,6 +519,52 @@ def create_app(
         context = _resolve_auth(request)
         apply_refreshed_cookie_if_needed(response, context, session_codec)
         return {"sub": context.sub, "actor_id": _sanitize_actor_id(context.sub)}
+
+    @app.post("/api/logout")
+    def logout(request: Request) -> Response:
+        """Log the caller out: revoke their refresh token at Okta, then
+        clear every cookie this server issues.
+
+        Deliberately does not call _resolve_auth() — an already-expired
+        or already-cleared session must still be logged out cleanly (no
+        401/redirect-to-Okta for someone who's just trying to leave), so
+        this reads the session cookie directly and treats a missing/
+        undecryptable one as "nothing to revoke," not an error.
+
+        Revocation (auth.revoke_refresh_token()) is what actually
+        invalidates the credential at Okta — clearing cookies alone only
+        removes the browser's copy, leaving the refresh token (and, by
+        extension, the ability to mint new access tokens with it) valid
+        at Okta until it naturally expires. A revocation failure (e.g.
+        Okta unreachable) is logged but never blocks the response: the
+        user-visible part of "logout" — this browser no longer being
+        signed in to this app — must succeed regardless, and revoking a
+        token that's already invalid/expired is itself a no-op 200 at
+        Okta's end (per its own docs), so this is not a "some cases
+        silently fail to revoke" gap in ordinary operation.
+
+        Does not redirect to Okta's own /v1/logout endpoint (i.e. this
+        app's own session ends, but any separate Okta SSO browser session
+        does not) — see DESIGN.md's logout decision for why real Okta
+        sign-out was scoped out of this pass (it needs an ID token this
+        app never currently requests, plus a new Okta app config step).
+        """
+        cookie_value = request.cookies.get("travel_agent_session")
+        if cookie_value:
+            try:
+                tokens = session_codec.decode(cookie_value)
+            except AuthError:
+                tokens = None
+            if tokens:
+                try:
+                    revoke_refresh_token(okta_config, tokens.refresh_token)
+                except AuthError as e:
+                    print(f"Logout: failed to revoke refresh token at Okta: {e}", file=sys.stderr)
+
+        response = Response(status_code=204)
+        clear_session_cookie(response)
+        clear_runtime_token_cookie(response)
+        return response
 
     @app.post("/api/chat")
     def chat(request: Request, response: Response, body: ChatRequest) -> StreamingResponse:

@@ -255,6 +255,42 @@ def exchange_code_for_tokens(config: OktaConfig, code: str, code_verifier: str) 
     return _session_tokens_from_token_response(response.json())
 
 
+def revoke_refresh_token(config: OktaConfig, refresh_token: str) -> None:
+    """Revoke a refresh token at Okta's /v1/revoke endpoint (logout).
+
+    Per Okta's docs, revoking a refresh token also revokes its associated
+    access token — a single call invalidates both halves of this user's
+    session server-side, not just the browser's copy of them. This is
+    what actually makes "logout" mean something: clearing the session
+    cookie alone (clear_session_cookie() below) only removes the
+    browser's copy — the refresh token itself would otherwise remain
+    valid at Okta until it naturally expires (which, per this project's
+    Okta app, could be a long time), so anyone who'd captured it earlier
+    (e.g. from a log leak or a compromised cookie) could still use it
+    right up until this call is made.
+
+    Best-effort by design: Okta returns 200 OK even for an already-
+    invalid/expired/revoked token (documented, to avoid information
+    leaks), so a non-2xx here means a genuine problem talking to Okta
+    (network error, bad client credentials) — logged by the caller but
+    never allowed to block the user's own logout, since the cookie clear
+    that follows this call already achieves "signed out of this app" on
+    this browser regardless of whether the revoke call itself succeeded.
+    """
+    try:
+        response = requests.post(
+            f"{config.issuer}/v1/revoke",
+            data={"token": refresh_token, "token_type_hint": "refresh_token"},
+            auth=(config.client_id, config.client_secret),
+            timeout=10.0,
+        )
+    except requests.RequestException as e:
+        raise AuthError(f"Token revocation request failed: {e}") from e
+
+    if not response.ok:
+        raise AuthError(f"Token revocation failed ({response.status_code}): {response.text}")
+
+
 def refresh_access_token(config: OktaConfig, refresh_token: str, sub: str) -> SessionTokens:
     """Use a refresh token to obtain a new access token.
 

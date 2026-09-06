@@ -35,6 +35,7 @@ const formEl = document.getElementById("chat-form");
 const inputEl = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 const newConversationBtn = document.getElementById("new-conversation-btn");
+const logoutBtn = document.getElementById("logout-btn");
 const sidebarEl = document.getElementById("sidebar");
 const conversationListEl = document.getElementById("conversation-list");
 const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
@@ -650,6 +651,20 @@ newConversationBtn.addEventListener("click", () => {
   messagesEl.innerHTML = "";
   inputEl.focus();
   refreshConversationList();
+});
+
+logoutBtn.addEventListener("click", async () => {
+  // Best-effort: even if the request itself fails (e.g. a network
+  // hiccup), reload anyway — a reload with no valid session cookie left
+  // client-side still lands back at Okta's login page via the server's
+  // own auth check on "/", so the user isn't stuck on a stale page
+  // either way.
+  try {
+    await fetch("/api/logout", { method: "POST" });
+  } finally {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.location.href = "/";
+  }
 });
 
 sidebarToggleBtn.addEventListener("click", () => setSidebarOpen(true));

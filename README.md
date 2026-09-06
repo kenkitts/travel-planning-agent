@@ -267,6 +267,14 @@ the calling request (`{"sub": ..., "actor_id": ...}`), behind the same
 auth as every other endpoint — useful for confirming who you're
 authenticated as without digging through logs.
 
+The header's **Log out** button calls `POST /api/logout`, which revokes
+the user's refresh token at Okta (invalidating it — and, per Okta's own
+behavior, its associated access token — server-side, not just clearing
+the browser's copy of it) and clears both of this app's cookies. This
+ends the session with this app; it does not sign the user out of any
+separate Okta SSO session they might have with other Okta-federated
+apps — see `DESIGN.md` §2l for why that's out of scope.
+
 ### Prerequisites for hosting
 
 - **A domain you control**, already pointed (CNAME/A record) at the

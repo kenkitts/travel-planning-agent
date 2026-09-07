@@ -36,6 +36,7 @@ const inputEl = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 const newConversationBtn = document.getElementById("new-conversation-btn");
 const logoutBtn = document.getElementById("logout-btn");
+const identityLabelEl = document.getElementById("identity-label");
 const sidebarEl = document.getElementById("sidebar");
 const conversationListEl = document.getElementById("conversation-list");
 const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
@@ -695,6 +696,32 @@ async function init() {
     appendMessage("error", `Could not load app config: ${err.message}`);
     return;
   }
+
+  // /api/whoami is a real, authenticated endpoint (unlike /api/config) —
+  // fetched unconditionally here (not gated on historyEnabled, unlike the
+  // conversation-history fetch below) so the "signed in as" label works
+  // regardless of that flag, and so this doubles as a real auth check
+  // even when history is disabled (previously there was none until the
+  // first chat message in that case). A non-401 failure here is treated
+  // as non-fatal — this is a "nice to know" display, not a critical
+  // path, so it fails silently and lets the rest of init() proceed.
+  try {
+    const res = await fetch("/api/whoami");
+    if (res.status === 401) {
+      handleAuthExpired();
+      return;
+    }
+    if (res.ok) {
+      const data = await res.json();
+      if (data.sub) {
+        identityLabelEl.textContent = `Signed in as ${data.sub}`;
+        identityLabelEl.hidden = false;
+      }
+    }
+  } catch (err) {
+    console.error("Could not load identity:", err);
+  }
+
   sessionId = loadOrCreateSession();
 
   if (historyEnabled) {

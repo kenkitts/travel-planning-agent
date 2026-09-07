@@ -241,6 +241,11 @@ body {
   user-select: none;
 }
 
+.identity-label {
+  font-size: 0.82rem;
+  color: #888;
+}
+
 .diagnostic-toggle input {
   cursor: pointer;
 }

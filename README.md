@@ -85,8 +85,10 @@ The web UI has no auth of its own and cannot run standalone —
 `web/server.py` runs the entire OAuth 2.0 Authorization Code + PKCE flow
 against a dedicated Okta application itself, storing the resulting tokens
 in a single, KMS-envelope-encrypted session cookie. An unauthenticated
-top-level page load is redirected straight to Okta; an unauthenticated
-`fetch()`/API call gets a clean `401`. If your access token expires, the
+top-level page load to `/` sees a themed landing page with a "Log in"
+link (`/login`), which starts the OIDC flow; any other unauthenticated
+route still redirects straight to Okta for a page load, or gets a clean
+`401` for a `fetch()`/API call. If your access token expires, the
 server transparently refreshes it (using the stored refresh token)
 in-line with the next request — no login interruption unless the refresh
 token itself has also expired, in which case you're sent back through the
@@ -252,8 +254,9 @@ design rationale.
 How it authenticates users: `web/server.py` itself runs the entire OAuth
 2.0 Authorization Code + PKCE flow against a dedicated Okta application —
 there is no auth logic in the ALB at all. An unauthenticated top-level
-page load is redirected straight to Okta; an unauthenticated `fetch()`/API
-call gets a clean `401`. On successful login, the server issues a single,
+page load to `/` sees a themed landing page with a "Log in" link
+instead of being redirected straight to Okta; an unauthenticated
+`fetch()`/API call still gets a clean `401`. On successful login, the server issues a single,
 KMS-envelope-encrypted session cookie carrying the Okta access/refresh
 tokens, and derives that person's `actor_id` from the verified `sub`
 claim — so every logged-in person gets their own conversation history and
@@ -264,8 +267,8 @@ interruption unless the refresh token itself has also expired.
 
 `GET /api/whoami` returns the identity the server actually resolved for
 the calling request (`{"sub": ..., "actor_id": ...}`), behind the same
-auth as every other endpoint — useful for confirming who you're
-authenticated as without digging through logs.
+auth as every other endpoint — the same identity is shown directly in
+the UI as a "Signed in as ..." label in the header, next to Log out.
 
 The header's **Log out** button calls `POST /api/logout`, which revokes
 the user's refresh token at Okta (invalidating it — and, per Okta's own

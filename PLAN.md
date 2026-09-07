@@ -2376,7 +2376,74 @@ if the server stops responding in a future session, re-run
 `get_aws_creds` and update the `env` block's `AWS_SHARED_CREDENTIALS_FILE`
 path again.
 
+## Phase 26 — Identity display + unauthenticated landing page (added 2026-09-06)
 
+See DESIGN.md §2m (decisions #147-157) for the full design rationale.
+Two independent features, both auth-adjacent, gathered via two separate
+`grill-me` clarifying-question passes before implementation.
+
+### What was built — identity label
+- `web/static/index.html`: added `<span id="identity-label" class="identity-label" hidden>`
+  in `.header-actions`, before the Diagnostics toggle.
+- `web/static/style.css`: added `.identity-label` (muted `#888`,
+  `0.82rem` — same size as the Diagnostics label, lower contrast, so it
+  reads as a label rather than a control).
+- `web/static/app.js`: added `identityLabelEl`; `init()` now fetches
+  `/api/whoami` unconditionally, right after `/api/config` — a 401
+  triggers `handleAuthExpired()` (same pattern as the existing
+  conversation-history fetch), a successful response sets
+  `"Signed in as {sub}"` and un-hides the element, any other failure
+  logs to console and lets `init()` continue (non-fatal — this is a
+  display feature, not a critical path).
+
+### What was built — landing page
+- `web/server.py`: `index()` no longer unconditionally calls
+  `_resolve_auth()` and lets a failure propagate as a redirect/401 —
+  it now catches both failure modes (`HTTPException` from the
+  fetch-style 401 path, `_RedirectToLogin` from the navigation-redirect
+  path) and serves `landing.html` instead in either case. New
+  `GET /login` route unconditionally calls the existing
+  `redirect_to_login(okta_config, "/")` — the landing page's "Log in"
+  link is a plain `<a href="/login">`, no JS needed.
+- `web/static/landing.html` (new): self-contained page, own inline
+  `<style>`, no shared markup with `index.html`. Full-bleed
+  `background-image: url("/static/landing-bg.webp")` with a dark
+  linear-gradient scrim (heaviest at the bottom, where the button
+  sits), neon-cyan glow-text title ("Travel Planning Agent"),
+  neon-magenta glow-text tagline ("Charting departures — Earthbound or
+  otherwise."), and a glowing cyan "Log in" button linking to `/login`.
+- `web/static/landing-bg.webp` (new, user-generated): checked in
+  following the same static-asset pattern as `gigi.webp`.
+- `web/tests/test_server.py`: two pre-existing tests
+  (`test_index_route_requires_auth`,
+  `test_index_route_returns_401_for_fetch_style_call_with_no_session`)
+  rewritten as
+  `test_index_route_serves_landing_page_when_unauthenticated_navigation`/
+  `test_index_route_serves_landing_page_for_fetch_style_call_with_no_session`
+  — the behavior they asserted (redirect/401 for both request types) no
+  longer exists. Three new tests added:
+  `test_login_route_redirects_to_okta`,
+  `test_login_route_sets_pending_login_cookie`,
+  `test_authenticated_index_route_serves_chat_ui_not_landing_page`.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 202/202 passing (199 baseline;
+  net +3 from the two rewrites plus three new tests).
+- Deployed via `cdk deploy TravelAgentWebStack` (`UPDATE_COMPLETE`,
+  182s, no rollback) — both features shipped in the same deploy.
+- Live `curl` immediately post-deploy confirmed: unauthenticated `GET /`
+  returns `200` with the landing page's title/tagline/login-link
+  present; `GET /login` returns a real `302` to the actual Okta
+  authorize URL with genuine `state`/`code_challenge` params;
+  `GET /static/landing-bg.webp` returns `200` (see DESIGN.md decision
+  #157 for a minor, non-functional `Content-Type` finding from this
+  same check).
+- **Live browser confirmation** (user-verified, 2026-09-06): visited the
+  real deployed URL logged out, saw the full themed landing page,
+  clicked "Log in," completed the real Okta flow, and landed back on
+  the authenticated chat UI with the new "Signed in as ..." label
+  visible in the header — both features confirmed working end-to-end
+  against real traffic, not just synth/unit-test/curl-level evidence.
 
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations

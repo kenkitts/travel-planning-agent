@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Travel Planning Agent</title>
+  <link rel="icon" href="/static/favicon.ico" />
+  <style>
+    :root {
+      --neon-cyan: #2dd4ff;
+      --neon-magenta: #ff2db0;
+      --bg-black: #05050a;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg-black);
+      color: #e8f6ff;
+    }
+
+    .landing {
+      position: relative;
+      height: 100vh;
+      width: 100%;
+      overflow: hidden;
+      background-image: url("/static/landing-bg.webp");
+      background-size: cover;
+      background-position: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Dark gradient scrim so the title/button stay legible over a busy,
+       neon-lit background image — heaviest at the bottom where the
+       button sits, lighter toward the top. */
+    .landing::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        to bottom,
+        rgba(5, 5, 10, 0.55) 0%,
+        rgba(5, 5, 10, 0.35) 40%,
+        rgba(5, 5, 10, 0.85) 100%
+      );
+    }
+
+    .landing-content {
+      position: relative;
+      z-index: 1;
+      text-align: center;
+      padding: 2rem;
+      max-width: 90vw;
+    }
+
+    .landing-title {
+      margin: 0;
+      font-size: clamp(2rem, 6vw, 4rem);
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #eafcff;
+      text-shadow:
+        0 0 8px var(--neon-cyan),
+        0 0 24px var(--neon-cyan),
+        0 0 48px rgba(45, 212, 255, 0.5);
+    }
+
+    .landing-tagline {
+      margin: 0.9rem 0 2.5rem 0;
+      font-size: clamp(0.95rem, 2vw, 1.25rem);
+      font-style: italic;
+      letter-spacing: 0.02em;
+      color: #ffd6f0;
+      text-shadow:
+        0 0 6px var(--neon-magenta),
+        0 0 18px rgba(255, 45, 176, 0.4);
+    }
+
+    .landing-login-btn {
+      display: inline-block;
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      text-decoration: none;
+      color: var(--bg-black);
+      background: var(--neon-cyan);
+      padding: 0.85rem 2.5rem;
+      border-radius: 4px;
+      box-shadow:
+        0 0 12px var(--neon-cyan),
+        0 0 32px rgba(45, 212, 255, 0.6);
+      transition: box-shadow 0.15s ease-out, transform 0.15s ease-out;
+    }
+
+    .landing-login-btn:hover {
+      box-shadow:
+        0 0 18px var(--neon-cyan),
+        0 0 48px rgba(45, 212, 255, 0.85);
+      transform: translateY(-1px);
+    }
+
+    .landing-login-btn:active {
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="landing">
+    <div class="landing-content">
+      <h1 class="landing-title">Travel Planning Agent</h1>
+      <p class="landing-tagline">Charting departures &mdash; Earthbound or otherwise.</p>
+      <a class="landing-login-btn" href="/login">Log in</a>
+    </div>
+  </div>
+</body>
+</html>

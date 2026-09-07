@@ -523,22 +523,60 @@ class OAuthFlowTests(unittest.TestCase):
         self.assertIn("code_challenge=", response.headers["location"])
         self.assertIn("state=", response.headers["location"])
 
-    def test_index_route_requires_auth(self):
-        # Regression test: the / route originally had no auth check at
-        # all (a real bug caught via a live curl check immediately after
-        # the first Phase 1 deploy, not by the test suite at the time) —
-        # under the old ALB model this didn't matter, since the ALB
-        # itself gated every request at the network edge before any of
-        # them reached the container; now the app must check for itself.
+    def test_index_route_serves_landing_page_when_unauthenticated_navigation(self):
+        # Supersedes the old test_index_route_requires_auth: / no longer
+        # redirects straight to Okta for an unauthenticated top-level page
+        # load — it serves the landing page (with its own "Log in" link
+        # to /login) instead, so a logged-out visitor actually sees
+        # something before being sent through the OIDC dance.
         response = self.client.get("/", headers={"sec-fetch-mode": "navigate"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Travel Planning Agent", response.content)
+        self.assertIn(b'href="/login"', response.content)
+
+    def test_index_route_serves_landing_page_for_fetch_style_call_with_no_session(self):
+        # Supersedes the old test_index_route_returns_401_for_fetch_style_call_with_no_session:
+        # / never 401s now regardless of request type — an unauthenticated
+        # caller always gets the landing page, not an API-style error.
+        response = self.client.get("/", headers={"sec-fetch-mode": "cors"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Travel Planning Agent", response.content)
+
+    def test_login_route_redirects_to_okta(self):
+        response = self.client.get("/login")
 
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["location"].startswith(self.okta_config.authorization_endpoint))
+        self.assertIn("code_challenge=", response.headers["location"])
+        self.assertIn("state=", response.headers["location"])
 
-    def test_index_route_returns_401_for_fetch_style_call_with_no_session(self):
-        response = self.client.get("/", headers={"sec-fetch-mode": "cors"})
+    def test_login_route_sets_pending_login_cookie(self):
+        response = self.client.get("/login")
 
-        self.assertEqual(response.status_code, 401)
+        self.assertIn("travel_agent_pending_login", response.cookies)
+
+    def test_authenticated_index_route_serves_chat_ui_not_landing_page(self):
+        redirect = self.client.get("/login")
+        import urllib.parse
+
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(redirect.headers["location"]).query)
+        state = qs["state"][0]
+
+        with patch("auth.requests.post") as mock_post:
+            mock_post.return_value.ok = True
+            mock_post.return_value.json.return_value = {
+                "access_token": _make_access_token("alice@example.com"),
+                "refresh_token": "fake-refresh-token",
+                "expires_in": 3600,
+            }
+            self.client.get(f"/oauth2/callback?code=fakecode&state={state}")
+
+        response = self.client.get("/", headers={"sec-fetch-mode": "navigate"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b'href="/login"', response.content)
 
     def test_navigation_without_sec_fetch_mode_falls_back_to_accept_header(self):
         response = self.client.get("/api/whoami", headers={"accept": "text/html"})

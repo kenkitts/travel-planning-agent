@@ -509,20 +509,42 @@ def create_app(
 
     @app.get("/")
     def index(request: Request) -> FileResponse:
-        # Must resolve auth here — unlike under the old ALB model, this
-        # container no longer sits behind a network-edge gate that checks
-        # every request before it arrives; this route (like every other
-        # protected one) has to check for itself. A missing/expired
-        # session sends a real page load straight into the OIDC redirect
-        # (see _resolve_auth()/is_browser_navigation()), matching decision
-        # #56's intent — this bug (the route originally had no auth check
-        # at all) was caught by a live curl check immediately after the
-        # first Phase 1 deploy, not by the automated test suite.
-        context = _resolve_auth(request)
+        # Unauthenticated top-level page load: serve the landing page
+        # (with its own "Log in" link to /login below) instead of
+        # redirecting straight to Okta — this is the one route where an
+        # unauthenticated visitor is expected and shown something, rather
+        # than being immediately bounced. Every other protected route
+        # still redirects/401s via _resolve_auth() as before; only this
+        # route's own auth check is inlined here (not via _resolve_auth())
+        # so a failed check falls through to landing.html instead of
+        # raising _RedirectToLogin.
+        try:
+            context = _resolve_auth(request)
+        except HTTPException:
+            # Can only be the fetch()-style 401 branch of _resolve_auth()
+            # in practice (is_browser_navigation() is true for a real
+            # GET / page load, so the redirect branch would raise
+            # _RedirectToLogin instead) — but treated the same as a
+            # missing session either way: serve the landing page.
+            return FileResponse(STATIC_DIR / "landing.html", headers={"Cache-Control": "no-cache"})
+        except _RedirectToLogin:
+            return FileResponse(STATIC_DIR / "landing.html", headers={"Cache-Control": "no-cache"})
         file_response = FileResponse(STATIC_DIR / "index.html")
         file_response.headers["Cache-Control"] = "no-cache"
         apply_refreshed_cookie_if_needed(file_response, context, session_codec)
         return file_response
+
+    @app.get("/login")
+    def login() -> RedirectResponse:
+        """Explicit login entry point for the landing page's button —
+        unconditionally starts the OIDC dance (state/PKCE/pending cookie,
+        redirect to Okta), same mechanics as _handle_redirect_to_login()
+        below uses for a session that expired mid-use. return_to is
+        always "/" here: this route only exists to be reached by a
+        logged-out visitor clicking "Log in" on the landing page, who
+        should land on the (now-authenticated) chat UI after completing
+        login, not wherever the ALB/OIDC dance happened to start from."""
+        return redirect_to_login(okta_config, "/")
 
     @app.get("/favicon.ico")
     def favicon() -> FileResponse:

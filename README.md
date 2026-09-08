@@ -19,8 +19,9 @@ session cookie. It calls AgentCore Runtime via `web/agent_client.py` —
 IAM/SigV4 by default, or a JWT bearer token (RFC 8693 token-exchanged from
 the user's own Okta session) once `TravelAgentRuntimeStack`'s optional
 Okta config is set — see "Authentication" below. The Runtime hosts a
-Strands Agent (Claude Sonnet via Bedrock, or via the Gateway's inference
-target when `GATEWAY_INFERENCE_URL` is set), which calls AgentCore Memory
+Strands Agent (Claude Sonnet, called exclusively through the Gateway's
+own inference target — there is no direct-Bedrock fallback), which calls
+AgentCore Memory
 (short-term events + long-term traveler preferences, scoped by
 `actor_id`) and AgentCore Gateway (MCP; IAM by default, or a per-user JWT
 via RFC 8693 On-Behalf-Of token exchange) for its three tool targets (Web
@@ -34,8 +35,8 @@ knowledge loaded on demand from `agent/skills/`, in-process).
 Five CDK stacks (deployed in this order), plus 2 more independent ones:
 - `TravelAgentToolsStack` — the weather and places Lambda functions
 - `TravelAgentGatewayStack` — the AgentCore Gateway and its four targets
-  (Web Search, weather, places, and an optional Bedrock inference target
-  for centralized model-call rate limiting)
+  (Web Search, weather, places, and a Bedrock inference target — the
+  agent's sole model-call path, for centralized governance/rate limiting)
 - `TravelAgentMemoryStack` — the AgentCore Memory resource
 - `TravelAgentRuntimeStack` — the AgentCore Runtime hosting the agent
 - `TravelAgentWebStack` — hosts the web UI on ECS Fargate behind a plain
@@ -99,19 +100,19 @@ to run `web/server.py` directly on your own machine as a standalone
 single-user tool without its own real Okta app configuration — see
 "Hosting the Web UI" below.
 
-The Runtime itself is IAM/SigV4-authenticated (`InvokeAgentRuntime`, via
-boto3) by default — there is no separate identity provider or bearer-
-token flow for the Runtime unless the optional `WEB_RUNTIME_OIDC_*`
-configuration is set (see "Hosting the Web UI" below), in which case the
-web server exchanges each logged-in user's own Okta access token for a
-Runtime-audienced JWT (RFC 8693 OAuth 2.0 Token Exchange) and presents
-that instead — AWS's own docs confirm a Runtime can accept either
-IAM/SigV4 or JWT bearer tokens, never both at once, so configuring this
-fully replaces IAM access to that Runtime, and boto3 can no longer be
-used to invoke it (`web/agent_client.py` makes a raw HTTPS call with an
-`Authorization: Bearer` header instead). Without that config,
-`TravelAgentWebStack`'s ECS task calls the Runtime with its own IAM role
-and there is no other caller.
+The Runtime itself is JWT Bearer Token authenticated only — there is no
+IAM/SigV4 option (AWS's own docs confirm a Runtime can accept either
+IAM/SigV4 or JWT bearer tokens, never both at once). `WEB_RUNTIME_OIDC_*`
+(see "Hosting the Web UI" below) is required: the web server exchanges
+each logged-in user's own Okta access token for a Runtime-audienced JWT
+(RFC 8693 OAuth 2.0 Token Exchange) and presents that on every call
+(`web/agent_client.py` makes a raw HTTPS call with an `Authorization:
+Bearer` header — boto3 cannot invoke a JWT-authorized Runtime at all).
+This is a hard architectural commitment, not a toggle: the agent's model
+calls also route exclusively through the Gateway's own inference target
+(see "Configuration" below), which itself depends on the Runtime's JWT
+identity for its RFC 8693 On-Behalf-Of token exchange — there is no
+configuration that restores IAM access to the Runtime.
 
 ## Setup
 
@@ -232,16 +233,15 @@ Scope/non-goals for the web UI:
   permanent (there is no undo, and no confirmation beyond the browser's
   own confirm prompt).
 
-You can also test the deployed Runtime directly from the **AgentCore
-console's test chat**, bypassing the web UI (and its OIDC-derived
-`actor_id`) entirely — useful for a quick sanity check that the Runtime
-itself is healthy. **This only works when the Runtime is IAM-authorized
-(the default)** — the console's test chat itself requires a valid JWT
-for console access, and AWS's own docs confirm a Runtime can only accept
-either IAM/SigV4 or JWT bearer tokens, never both. Once `WEB_RUNTIME_OIDC_*`
-is configured (see "Hosting the Web UI" below), this Runtime switches to
-JWT-only auth and the console's test chat stops working for it (confirmed
-live) — the web UI becomes the only way to exercise the Runtime.
+Testing the deployed Runtime directly from the **AgentCore console's test
+chat**, bypassing the web UI entirely, is **no longer possible**. The
+Runtime's inbound authorizer is JWT Bearer Token only (no IAM/SigV4
+option — see "Authentication" below), and AWS's own docs confirm the
+console's test chat requires a valid JWT for console access, which a
+Runtime configured this way cannot provide via the console (confirmed
+live). This is an accepted, permanent tradeoff of making Gateway-routed
+inference mandatory (see DESIGN.md): the web UI is the only way to
+exercise the Runtime.
 
 ## Hosting the Web UI
 
@@ -372,7 +372,7 @@ The agent reads its configuration from environment variables, set by
 | `AWS_REGION` | `RuntimeStack.region` | Region for the Memory client and Code Interpreter |
 | `MODEL_ID` | `cdk/app.py`'s `model_id` (env var `MODEL_ID`, default `us.anthropic.claude-sonnet-5`) | Bedrock model ID (Claude Sonnet) — single source of truth, passed into both `GatewayStack` (inference-target IAM scoping) and `RuntimeStack` |
 | `GATEWAY_OBO_PROVIDER_NAME` | `RuntimeStack` | Set only when the Gateway's JWT authorizer is configured — enables the On-Behalf-Of token exchange path in `build_mcp_client()` |
-| `GATEWAY_INFERENCE_URL` | `RuntimeStack` | Set only when routing model calls through the Gateway's `bedrock-mantle` inference target instead of calling Bedrock directly — see `build_model()` |
+| `GATEWAY_INFERENCE_URL` | `RuntimeStack` | Required — base URL of the Gateway's `bedrock-mantle` inference target. All model calls route through it; there is no direct-Bedrock fallback (see `build_model()`) |
 | `MAX_OUTPUT_TOKENS` | Code-level default in `agent/agent.py` (8192) | Not currently wired as a CDK-set env var — override manually if ever needed |
 | `AGENT_MAX_TURNS` | Code-level default in `agent/agent.py` (30) | Caps agent-loop iterations per turn (`Limits.turns`); not currently wired as a CDK-set env var |
 

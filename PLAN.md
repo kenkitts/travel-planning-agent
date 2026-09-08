@@ -2445,6 +2445,126 @@ Two independent features, both auth-adjacent, gathered via two separate
   visible in the header — both features confirmed working end-to-end
   against real traffic, not just synth/unit-test/curl-level evidence.
 
+## Phase 27 — Gateway-routed inference made mandatory; direct-Bedrock path removed (added 2026-09-07)
+
+See DESIGN.md §2n (decisions #158-163) for the full rationale. Unlike
+every other "make X mandatory" phase in this project's history, this one
+required **zero auth or infrastructure cutover** — both the Gateway and
+the Runtime were already confirmed live and JWT-only before any code was
+touched (`bedrock-agentcore-control:list-gateways`/`get-agent-runtime`),
+and `GATEWAY_INFERENCE_URL` was already non-empty on the deployed
+Runtime. This phase is pure code cleanup: delete the now-dead
+direct-`BedrockModel` branch and its associated IAM grant.
+
+### What was built
+- `agent/agent.py`: `build_model()` rewritten to a single code path —
+  the Gateway's `bedrock-mantle` inference target via `AnthropicModel`.
+  Removed the `strands.models.BedrockModel` import entirely. Removed the
+  `GATEWAY_INFERENCE_MODEL_ID` module constant; the `"us."`-prefix-
+  stripping logic it existed for is now a local variable
+  (`gateway_inference_model_id`) computed inline inside `build_model()`.
+  `build_model()` now raises `RuntimeError` immediately if
+  `GATEWAY_INFERENCE_URL` is empty (mirroring the existing
+  missing-workload-access-token check's own style exactly) before even
+  checking for a workload access token — there is no fallback path left
+  for either failure mode to fall through to. Updated the module
+  docstring and the `GATEWAY_INFERENCE_URL` env-var comment block to
+  describe it as required, not opt-in. Also fixed two other comments
+  that referenced the removed `BedrockModel` behavior in passing
+  (`MAX_OUTPUT_TOKENS`'s rationale comment, generalized to cover both
+  providers' `max_tokens` requirement).
+- `cdk/stacks/runtime_stack.py`: removed the `AllowBedrockModelInvocation`
+  IAM policy statement entirely (the `bedrock:InvokeModel`/
+  `InvokeModelWithResponseStream` grant across three regions plus the
+  in-region inference-profile grant) — the Runtime's execution role no
+  longer has any direct Bedrock invocation permission at all, since
+  `build_model()`'s only code path never calls `bedrock-runtime`
+  directly. `gateway_inference_url` changed from `str | None = None` to
+  a required `str` (no default) — `cdk/app.py`'s call site already
+  always passes a real value (`gateway_stack.inference_url`), so this is
+  a pure type-signature tightening with no behavior change at the call
+  site. Updated the module docstring and the `GATEWAY_INFERENCE_URL`
+  environment-variable comment block to match.
+- `tests/test_agent.py`: `BuildModelTests` rewritten — removed
+  `test_returns_bedrock_model_by_default` (tested now-deleted code);
+  added `test_raises_when_gateway_inference_url_unset` as a distinct
+  case from the pre-existing `test_raises_when_inference_url_set_but_no_workload_token`
+  (two different failure causes — CDK misconfiguration vs. Runtime
+  auth-mode misconfiguration — each gets its own explicit test, matching
+  this project's established testing granularity); the
+  Gateway-routed-`AnthropicModel` test and the
+  OBO-cache-shared-with-`build_mcp_client()` test both kept, with the
+  removed `GATEWAY_INFERENCE_MODEL_ID` reference replaced by an
+  inline-computed expected value matching `build_model()`'s own new
+  logic.
+- `README.md`: rewrote the Architecture paragraph, the Configuration
+  table's `GATEWAY_INFERENCE_URL` row, the AgentCore-console-testing
+  section, the Authentication section's Runtime-auth paragraph, and the
+  Gateway stack's bullet in the stack list — all previously described
+  Gateway-routed inference and Runtime JWT auth as optional/opt-in
+  (accurate for §2i's original ship, stale once both were confirmed
+  live-mandatory here). No change needed to the Bedrock-model-access
+  prerequisite line — that's still accurate regardless of which call
+  path (`bedrock-runtime` directly vs. the Gateway's `bedrock-mantle`
+  connector) ultimately invokes the model.
+- `DESIGN.md`: added §2n (decisions #158-163), formally superseding
+  decision #113 — per this project's established convention, the
+  original decision's table row is left unedited (it correctly records
+  what was true when §2i shipped); only prose describing current
+  system behavior was rewritten in place.
+
+### Why this, not alternatives
+- **No emergency-override fallback kept** (decision #158) — user's
+  explicit instruction was "all inference should go through the
+  Gateway," not "should route through the Gateway with a documented
+  escape hatch." Confirmed via this phase's own clarifying-questions
+  pass rather than assumed from the instruction's literal wording alone.
+- **Call-time `RuntimeError`, not import-time assertion** (decision
+  #159) — matches the existing code's own established pattern for
+  "required config missing" (the workload-access-token check already
+  works this way) rather than introducing a second failure-mode style.
+- **Full live-deploy verification bar, not synth-only** (decision #163)
+  — despite this being a no-op change from the deployed infrastructure's
+  perspective, this project's own repeatedly-confirmed pattern is that
+  "config accepted" and "actually works" are different questions — and
+  this specific change touches IAM permissions on the Runtime's
+  execution role, a genuinely load-bearing resource, so a live check
+  matters even though the code path itself isn't changing behavior.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: **202/202** passing.
+- `cdk synth` (full app, all 7 stacks): clean. Confirmed via direct JSON
+  inspection of the synthesized `TravelAgentRuntimeStack` template: zero
+  `AWS::IAM::Policy` statements anywhere with an `InvokeModel` action
+  (`AllowBedrockModelInvocation` confirmed absent at the template level),
+  `GATEWAY_INFERENCE_URL` still resolves correctly via
+  `Fn::Join`/`Fn::ImportValue` to the Gateway's real inference URL (a
+  required, non-empty value now, not an optional env var), `MODEL_ID`
+  unchanged.
+- Deployed live: `cdk deploy TravelAgentRuntimeStack` reached
+  `UPDATE_COMPLETE` in 52.57s (after killing one orphaned, stuck local
+  `cdk` process from an earlier cancelled attempt that had never reached
+  CloudFormation — confirmed via `describe-stack-events` that no partial
+  CloudFormation operation was ever in flight, so nothing needed
+  rolling back).
+- **IAM change confirmed directly against the live role**, not assumed
+  from the deploy succeeding: `iam:GetRolePolicy` on
+  `TravelAgentRuntimeStack-TravelAgentRuntimeExecution-CGGNDPzY4OPL`
+  shows zero `bedrock:InvokeModel*` statements of any kind — the
+  `AllowBedrockModelInvocation` statement present in the pre-deploy
+  policy (captured via `describe-stack-events` beforehand for
+  comparison) is genuinely gone from the live role.
+- **Real end-to-end chat turn confirmed live**, not just deployed: a new
+  CloudWatch log stream (session created after the deploy's completion
+  timestamp, ruling out AgentCore's per-session code-pinning — decision
+  #94 — showing stale pre-deploy behavior) shows a full successful turn:
+  Gateway OBO token exchange (MISS → STORED → HIT), Gateway MCP tool
+  calls (weather-tool, code_interpreter) all `200`/`202`, and — the
+  specific thing this phase changed — the Gateway-routed inference call
+  itself (`POST .../inference/v1/messages`) returning `200 OK` multiple
+  times across the conversation, producing a real, coherent assistant
+  response with correct tool use and zero errors/exceptions.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

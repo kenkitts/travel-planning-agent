@@ -716,10 +716,12 @@ class BuildMcpClientTests(unittest.TestCase):
 
 
 class BuildModelTests(unittest.TestCase):
-    """Covers build_model()'s BedrockModel/AnthropicModel branch — see
-    DESIGN.md's Gateway-routed-inference decision. Mirrors
-    BuildMcpClientTests' setUp/tearDown/patching conventions, since both
-    functions read the same module-level OBO config and token cache.
+    """Covers build_model()'s sole model-call path (Gateway-routed
+    AnthropicModel) — see DESIGN.md's "Gateway-routed inference mandatory"
+    decision, superseding the earlier opt-in design with a direct
+    BedrockModel fallback. Mirrors BuildMcpClientTests' setUp/tearDown/
+    patching conventions, since both functions read the same
+    module-level OBO config and token cache.
     """
 
     def setUp(self):
@@ -733,12 +735,16 @@ class BuildModelTests(unittest.TestCase):
         travel_agent.BedrockAgentCoreContext.set_request_headers({})
         travel_agent._GATEWAY_OBO_TOKEN_CACHE.clear()
 
-    def test_returns_bedrock_model_by_default(self):
+    def test_raises_when_gateway_inference_url_unset(self):
+        """No fallback path exists once GATEWAY_INFERENCE_URL is unset —
+        this is a deploy-time misconfiguration (RuntimeStack always wires
+        it from GatewayStack's inference target), distinct from the
+        missing-workload-token case below (a Runtime-auth-mode
+        misconfiguration), so each gets its own explicit test."""
         travel_agent.GATEWAY_INFERENCE_URL = ""
 
-        model = asyncio_run(travel_agent.build_model())
-
-        self.assertIsInstance(model, travel_agent.BedrockModel)
+        with self.assertRaises(RuntimeError):
+            asyncio_run(travel_agent.build_model())
 
     def test_raises_when_inference_url_set_but_no_workload_token(self):
         travel_agent.GATEWAY_INFERENCE_URL = "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
@@ -747,7 +753,7 @@ class BuildModelTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             asyncio_run(travel_agent.build_model())
 
-    def test_returns_anthropic_model_via_gateway_when_inference_url_set(self):
+    def test_returns_anthropic_model_via_gateway(self):
         travel_agent.GATEWAY_INFERENCE_URL = (
             "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
         )
@@ -768,8 +774,14 @@ class BuildModelTests(unittest.TestCase):
             # Gateway's bedrock-mantle connector target returned a real
             # 404 ("Model ... not found on any target"), since that
             # prefix is a bedrock-runtime/Converse-specific concept the
-            # connector's own model routing doesn't resolve.
-            self.assertEqual(model.config["model_id"], travel_agent.GATEWAY_INFERENCE_MODEL_ID)
+            # connector's own model routing doesn't resolve. Stripped
+            # inline in build_model() now (no separate module constant).
+            expected_gateway_model_id = (
+                travel_agent.MODEL_ID[len("us.") :]
+                if travel_agent.MODEL_ID.startswith("us.")
+                else travel_agent.MODEL_ID
+            )
+            self.assertEqual(model.config["model_id"], expected_gateway_model_id)
             self.assertNotEqual(model.config["model_id"], travel_agent.MODEL_ID)
             # AnthropicModel stores client_args on its underlying client
             # rather than exposing them directly — confirm the Bearer

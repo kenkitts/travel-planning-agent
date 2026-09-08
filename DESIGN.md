@@ -571,6 +571,37 @@ chat UI (if logged in) or Okta's own login page (if not).
 |---|---------|------------------------|-----------------|
 | 157 | `landing-bg.webp` serves with `Content-Type: application/octet-stream`, not `image/webp` | Confirmed via a live `curl` immediately after deploy — FastAPI's default `StaticFiles` MIME-type detection doesn't recognize `.webp` on this deployment's underlying Python/mimetypes configuration. Purely cosmetic: the image is referenced via CSS `background-image`, and browsers render it correctly from file content/magic bytes regardless of the declared `Content-Type` for that usage (confirmed — the live browser check, decision #156's stated verification bar, showed the image rendering correctly). Would only matter if this asset were ever used in a context that hard-checks `Content-Type` (e.g. an `<img>` tag's MIME sniffing under stricter browser security settings, or a CDN/cache layer keying on it). | Not fixed — no functional impact observed. If it ever becomes relevant, `mimetypes.add_type("image/webp", ".webp")` at app startup, or an explicit `Content-Type` override on this specific static path, would be the fix. |
 
+## 2n. Gateway-routed inference made mandatory; direct-Bedrock path removed (added 2026-09-07)
+
+Supersedes decision #113. §2i originally shipped Gateway-routed inference
+as an opt-in capability (`GATEWAY_INFERENCE_URL` empty by default,
+`build_model()` falling back to a direct `BedrockModel`/`bedrock-runtime`
+call) specifically to avoid a forced cutover while the feature was new
+and unverified. That caution is no longer warranted: both the Gateway
+and the Runtime have independently already been switched to JWT-only
+inbound auth (§2g/§2i's Phase 3/16 live deployments), and Gateway-routed
+inference has been running live in production since §2i's original
+deploy — the `GATEWAY_INFERENCE_URL` env var has been non-empty on every
+real deployment since. This change is purely a code-cleanup exercise
+(delete the now-dead direct-Bedrock branch and its associated IAM grant)
+with **zero auth or infrastructure cutover** — a materially different,
+much lower-risk change than every other "make X mandatory" decision in
+this document's history (e.g. §2f/§2g's Runtime/Gateway JWT cutovers),
+which each involved switching a live resource's actual authorizer type.
+Confirmed directly against live AWS state before any code was written
+(`bedrock-agentcore-control:list-gateways`/`get-agent-runtime`) rather
+than assumed from `RuntimeStack`'s own optional-parameter defaults, which
+describe what's possible to configure, not what's actually deployed.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 158 | Direct-Bedrock fallback removed entirely, no emergency override | `agent.py`'s `build_model()` now has a single code path: the Gateway's `bedrock-mantle` inference target via `AnthropicModel`. The `BedrockModel` branch, its import, and `GATEWAY_INFERENCE_MODEL_ID`'s separate module constant are all deleted — the `"us."`-prefix-stripping logic is now a local variable computed inline inside `build_model()`. No dormant/dead code path is kept behind an emergency env var for a fast manual revert. | User's explicit choice, given as a direct instruction ("all inference should go through the Gateway," not "should route through the Gateway with a documented escape hatch") — confirmed rather than assumed via this phase's own clarifying-questions pass. Once the Gateway path fails, the entire agent stops working with no code-level fallback; this is accepted as a hard architectural commitment, not a gap. |
+| 159 | `GATEWAY_INFERENCE_URL` unset is a call-time `RuntimeError`, not an import-time assertion | `build_model()` raises `RuntimeError` immediately if `GATEWAY_INFERENCE_URL` is empty, mirroring the existing missing-workload-access-token check's own style exactly (same function, same error-handling shape) — not a module-level assertion that would fail container startup instead. | Matches the existing code's own established pattern for "required config missing" rather than introducing a second failure-mode style for the same class of problem. A misconfigured deploy still fails clearly and immediately on the first real request, which is the practical bar that matters. |
+| 160 | `RuntimeStack.gateway_inference_url` becomes a required constructor parameter | Changed from `str \| None = None` to a required `str` (no default) — a pure type-signature tightening; `cdk/app.py`'s call site already always passes a real value (`gateway_stack.inference_url`, computed unconditionally in `GatewayStack.__init__`), so this is not a behavior change at the call site, only a stricter contract. | Consistent with this whole change's spirit of removing now-meaningless optionality — there is no longer any scenario where `RuntimeStack` should accept a missing inference URL and silently do something else. |
+| 161 | `AllowBedrockModelInvocation` IAM statement removed from `RuntimeStack`'s execution role | Deleted entirely — the Runtime's execution role no longer has `bedrock:InvokeModel`/`InvokeModelWithResponseStream` on any foundation-model or inference-profile ARN in any region. | Same dead-permission anti-pattern this project has already found and fixed twice (decision #78's `runtime.grant_invoke()` removal, decision #91's careful multi-resource-family precision) — once `build_model()` never calls `bedrock-runtime` directly, this grant authorizes an API call the Runtime's own code path can no longer make. Bedrock invocation permission needed for the Gateway's `bedrock-mantle` connector target already lives separately on the *Gateway's* service role (`gateway_stack.py`'s `_grant_bedrock_inference_invoke()`), unaffected by this change. |
+| 162 | Documentation treatment: supersede in place, don't delete | This section (§2n) formally supersedes decision #113 rather than editing it in place; prose describing current behavior (module docstrings, env-var comments, README's Architecture/Configuration/Authentication sections) is rewritten in place to describe only the new single-path reality, removing opt-in language entirely. | Matches this project's own established, repeatedly-applied convention (e.g. decision #37 superseding the earlier Okta-JWT Runtime cutover) — historical decision-table rows correctly record what was true at each point in time and are never rewritten; only current-state prose describing "how the system behaves today" gets updated in place. |
+| 163 | Verification bar: full live deploy, not synth-only | Despite this being a no-op change from the deployed infrastructure's perspective (Gateway-routed inference was already live), verification includes a real `cdk deploy TravelAgentRuntimeStack`, a real end-to-end chat turn afterward, and a direct IAM check confirming `AllowBedrockModelInvocation` is actually gone from the live execution role — not just `cdk synth` + template inspection. | This project's own repeatedly-confirmed pattern (decisions #88-96/#105-109/#116/#119/#132-133) is that "config accepted" and "actually works" are different questions requiring live verification to distinguish — applied here specifically because this change touches IAM permissions on a genuinely load-bearing resource (the Runtime's execution role), even though the code path itself isn't changing observed behavior. |
+
 
 2. Agent asks clarifying questions as needed: dates, trip length, budget,
    pace (relaxed/packed), interests, travelers/constraints. Uses short-term

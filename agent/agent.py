@@ -1,13 +1,14 @@
 """Travel Planning Agent — Strands Agent hosted on Amazon Bedrock AgentCore Runtime.
 
 Wires together:
-  - Claude Sonnet via Bedrock — either directly (strands.models.BedrockModel,
-    the default) or, when GATEWAY_INFERENCE_URL is set, via the Gateway's
-    own inference target (strands.models.anthropic.AnthropicModel, pointed
-    at the Gateway's /inference/v1/messages path instead of calling
-    bedrock-runtime directly) for centralized governance/rate-limiting —
-    see DESIGN.md's Gateway-routed-inference decision and build_model()
-    below. Uses the same OBO-cached Gateway token as the tools path.
+  - Claude Sonnet via the Gateway's own inference target
+    (strands.models.anthropic.AnthropicModel, pointed at the Gateway's
+    /inference/v1/messages path) — the sole model-call path, for
+    centralized governance/rate-limiting. There is no direct-bedrock-
+    runtime fallback: build_model() raises RuntimeError if the Gateway
+    path can't be used (see DESIGN.md's "Gateway-routed inference
+    mandatory" decision, superseding the earlier opt-in design). Uses the
+    same OBO-cached Gateway token as the tools path.
   - Tools from the AgentCore Gateway (Web Search + weather + places), over
     MCP — SigV4 (IAM) request signing by default, or a per-user JWT
     bearer token obtained via RFC 8693 On-Behalf-Of token exchange when
@@ -44,13 +45,10 @@ Configuration is read from environment variables set by RuntimeStack:
                               token exchange (see build_mcp_client() below); empty
                               string if GatewayStack's JWT authorizer isn't configured
   GATEWAY_INFERENCE_URL     - base URL of the Gateway's inference target
-                              (".../inference"); when non-empty, routes model calls
-                              through it (AnthropicModel) instead of calling
-                              bedrock-runtime directly (BedrockModel) — see
-                              build_model() below. Always wired by RuntimeStack
-                              (the target always exists); empty means "don't use it",
-                              not "not configured" — opting in is this env var's
-                              only job
+                              (".../inference"); required — build_model()
+                              raises RuntimeError if this is unset, since
+                              there is no other model-call path (see
+                              build_model() below)
 
 Auth, Runtime inbound: IAM/SigV4 by default (DESIGN.md decision #37), or JWT
 Bearer Token when RuntimeStack's Okta config is set (DESIGN.md's Phase 2
@@ -114,7 +112,6 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
-from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
 from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
@@ -194,28 +191,11 @@ GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS = 60
 # Sonnet is the design's chosen model (see DESIGN.md decision #7) for its
 # multi-step reasoning and tool-use reliability across the three Gateway tools.
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
-# The Gateway-routed path (build_model()'s AnthropicModel branch) needs
-# the bare foundation-model ID, not the "us." cross-region-inference-
-# profile-prefixed form MODEL_ID uses for the direct BedrockModel/
-# Converse path. Found live: routing a request for
-# "us.anthropic.claude-sonnet-5" through the Gateway's bedrock-mantle
-# connector target returned a real Anthropic-shaped 404 ("Model
-# 'us.anthropic.claude-sonnet-5' not found on any target") — confirmed
-# via `aws bedrock list-foundation-models` that the canonical model ID
-# is the bare "anthropic.claude-sonnet-5" (inferenceTypesSupported:
-# INFERENCE_PROFILE — the "us." prefix is specifically a cross-region-
-# inference-profile wrapper meaningful to bedrock-runtime's own
-# Converse/InvokeModel APIs, not a concept bedrock-mantle's model
-# routing resolves). Stripping the "us." prefix here (not a general
-# regex/split on MODEL_ID, since that would silently mis-strip a
-# differently-shaped future MODEL_ID) — this constant exists
-# specifically for this one known prefix on this one known model.
-GATEWAY_INFERENCE_MODEL_ID = (
-    MODEL_ID[len("us.") :] if MODEL_ID.startswith("us.") else MODEL_ID
-)
-# Bedrock's Converse API defaults to a fairly low per-model max output token
-# limit if maxTokens is omitted from the request (BedrockModel only sets it
-# when max_tokens is explicitly configured). A real multi-day, tool-grounded
+# Bedrock's Converse API (and, by the same token, the Gateway's own
+# bedrock-mantle-routed Anthropic Messages API path) defaults to a fairly
+# low per-model max output token limit if maxTokens is omitted from the
+# request — both BedrockModel and AnthropicModel only set it when
+# max_tokens is explicitly configured. A real multi-day, tool-grounded
 # itinerary response can be long — confirmed in production: a 3-day trip
 # request that made 13 tool calls before writing its answer hit
 # strands.types.exceptions.MaxTokensReachedException partway through the
@@ -695,78 +675,58 @@ def build_session_manager(actor_id: str, session_id: str) -> Optional[AgentCoreM
     )
 
 
-async def build_model() -> BedrockModel | AnthropicModel:
-    """Build this request's model provider.
+async def build_model() -> AnthropicModel:
+    """Build this request's model provider — the Gateway's inference target.
 
-    Default: BedrockModel calling bedrock-runtime directly (unchanged
-    behavior). When GATEWAY_INFERENCE_URL is set, returns an
-    AnthropicModel pointed at the Gateway's own inference target instead
-    — see this module's docstring and DESIGN.md's Gateway-routed-
-    inference decision for the full rationale (why bedrock-runtime over
-    bedrock-mantle, why the Anthropic Messages API path specifically).
+    The sole model-call path: routes through the Gateway's bedrock-mantle
+    inference target (AnthropicModel, pointed at the Gateway's own
+    /inference/v1/messages path) rather than calling bedrock-runtime
+    directly. There is no fallback — see DESIGN.md's "Gateway-routed
+    inference mandatory" decision (superseding the earlier opt-in design,
+    where GATEWAY_INFERENCE_URL being unset meant falling back to a
+    direct BedrockModel call).
 
-    Both paths configure the identical adaptive-thinking request shape
-    (see the shared _THINKING_REQUEST_FIELDS comment below) — Anthropic's
-    Messages API and Bedrock's Converse API accept the same
-    `{"type": "adaptive", "display": "summarized"}` value for this field
-    (confirmed against Anthropic's own docs), just under a different
-    Strands parameter name per provider (`additional_request_fields` for
-    BedrockModel, `params` for AnthropicModel, which merges directly into
-    the outgoing request body).
+    Raises RuntimeError if GATEWAY_INFERENCE_URL is unset — this is a
+    deploy-time misconfiguration (RuntimeStack always wires this from
+    GatewayStack's inference target), not something a request can recover
+    from, so failing loudly here is preferable to silently falling back
+    to a call path this project no longer supports.
 
-    The Gateway-routed path reuses the same OBO-cached Gateway token as
-    build_mcp_client() (Question 1 of this feature's design interview:
-    one token, one cache entry per caller, no separate exchange) — this
-    call is a second, independent cache lookup/exchange for the same
-    request, not a shared object with the MCP client's own call, but
+    Also raises RuntimeError (does not catch) if the Runtime's own
+    inbound authorizer isn't JWT-configured (no workload access token
+    available) — same fail-loud rationale as build_mcp_client()'s
+    identical check: that combination means the OBO exchange this path
+    depends on has no subject token to work from.
+
+    The Gateway-routed path needs the bare foundation-model ID, not the
+    "us." cross-region-inference-profile-prefixed form MODEL_ID carries
+    for bedrock-runtime's own Converse/InvokeModel APIs. Found live:
+    routing a request for "us.anthropic.claude-sonnet-5" through the
+    Gateway's bedrock-mantle connector target returned a real
+    Anthropic-shaped 404 ("Model 'us.anthropic.claude-sonnet-5' not found
+    on any target") — confirmed via `aws bedrock list-foundation-models`
+    that the canonical model ID is the bare "anthropic.claude-sonnet-5"
+    (inferenceTypesSupported: INFERENCE_PROFILE — the "us." prefix is
+    specifically a cross-region-inference-profile wrapper meaningful to
+    bedrock-runtime's own APIs, not a concept bedrock-mantle's model
+    routing resolves). Stripped inline below (not a general regex/split
+    on MODEL_ID, since that would silently mis-strip a differently-shaped
+    future MODEL_ID) — this handles specifically this one known prefix on
+    this one known model.
+
+    Reuses the same OBO-cached Gateway token as build_mcp_client() (one
+    token, one cache entry per caller, no separate exchange) — this call
+    is a second, independent cache lookup/exchange for the same request,
+    not a shared object with the MCP client's own call, but
     _get_cached_or_exchange_gateway_token()'s cache means only the first
     of the two actually round-trips to AgentCore Identity/Okta.
-
-    Raises (does not catch) if GATEWAY_INFERENCE_URL is set but no
-    workload access token is available — same fail-loud rationale as
-    build_mcp_client()'s identical check: that combination means the
-    Runtime's own inbound auth isn't actually JWT-configured to match.
     """
     if not GATEWAY_INFERENCE_URL:
-        return BedrockModel(
-            model_id=MODEL_ID,
-            region_name=AWS_REGION,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            # Enables the "reasoning" stream_agent_turn() event (Claude's
-            # extended-thinking content) for the diagnostic panel. Off by
-            # default on Bedrock — without this, Claude never emits
-            # reasoningContent at all, so the "reasoning" branch below has
-            # nothing to translate (confirmed live: a real turn produced
-            # tool_use/tool_result/text/done but zero reasoning events before
-            # this was added). Claude Sonnet 5 specifically requires the
-            # *adaptive* form — the older manual form
-            # (thinking: {"type": "enabled", "budget_tokens": N}) is removed on
-            # this model and returns a 400 error (confirmed against AWS's own
-            # Claude migration-guide docs); adaptive thinking lets the model
-            # decide per-request whether/how much to think, with no token
-            # budget to tune. This means some turns will now spend extra tokens
-            # (cost/latency) thinking that previously spent none — an accepted
-            # tradeoff for the diagnostic visibility this project wants.
-            #
-            # display="summarized" is required to get any reasoningText.text
-            # at all — confirmed by testing the raw Bedrock Converse API
-            # directly (bypassing Strands) on 2026-08-24: with just
-            # {"type": "adaptive"}, reasoningText.text came back as an empty
-            # string even on a turn that did produce a reasoningContent block —
-            # the actual thinking was locked in an opaque, non-text `signature`
-            # blob. Adding display="summarized" made the same kind of prompt
-            # return real, human-readable summarized reasoning text.
-            #
-            # REMAINING LIMITATION (still real, unaffected by display): Claude
-            # Sonnet 5 decides per-request whether to think at all — a
-            # tool-heavy, multi-step itinerary-planning turn produced zero
-            # reasoningContent blocks even with display="summarized" set, while
-            # a plain multi-step reasoning question did produce one. So the
-            # "reasoning" event in stream_agent_turn() will still be
-            # inconsistent turn-to-turn on this model; that's expected, not a
-            # bug — it now actually has text to show on the turns where the
-            # model chooses to think.
-            additional_request_fields={"thinking": {"type": "adaptive", "display": "summarized"}},
+        raise RuntimeError(
+            "GATEWAY_INFERENCE_URL is not set — the agent has no model-call "
+            "path without it (there is no direct-bedrock-runtime fallback). "
+            "RuntimeStack should always wire this from GatewayStack's "
+            "inference target; check the Runtime's environment variables."
         )
 
     workload_access_token = BedrockAgentCoreContext.get_workload_access_token()
@@ -780,6 +740,10 @@ async def build_model() -> BedrockModel | AnthropicModel:
         )
     gateway_token = await _get_cached_or_exchange_gateway_token(workload_access_token)
 
+    gateway_inference_model_id = (
+        MODEL_ID[len("us.") :] if MODEL_ID.startswith("us.") else MODEL_ID
+    )
+
     return AnthropicModel(
         client_args={
             # auth_token sends "Authorization: Bearer <token>" instead of
@@ -790,12 +754,21 @@ async def build_model() -> BedrockModel | AnthropicModel:
             "auth_token": gateway_token,
             "base_url": GATEWAY_INFERENCE_URL,
         },
-        model_id=GATEWAY_INFERENCE_MODEL_ID,
+        model_id=gateway_inference_model_id,
         max_tokens=MAX_OUTPUT_TOKENS,
-        # Same adaptive-thinking config as the BedrockModel path above,
-        # under AnthropicModel's own "params" passthrough (merged directly
-        # into the Messages API request body) rather than
-        # "additional_request_fields" — see this function's docstring.
+        # Enables the "reasoning" stream_agent_turn() event (Claude's
+        # extended-thinking content) for the diagnostic panel — same
+        # adaptive-thinking config previously used on the direct
+        # BedrockModel path, under AnthropicModel's own "params"
+        # passthrough (merged directly into the Messages API request
+        # body) rather than "additional_request_fields". display=
+        # "summarized" is required to get any reasoningText.text at all
+        # (confirmed by testing the raw Bedrock Converse API directly,
+        # bypassing Strands, on 2026-08-24: with just
+        # {"type": "adaptive"}, reasoningText.text came back empty even on
+        # a turn that did produce a reasoningContent block). Claude Sonnet
+        # 5 decides per-request whether to think at all, so this event
+        # will still be inconsistent turn-to-turn — expected, not a bug.
         params={"thinking": {"type": "adaptive", "display": "summarized"}},
     )
 

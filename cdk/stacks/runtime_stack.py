@@ -32,8 +32,15 @@ DESIGN.md's Phase 2 section for the full design.
 The agent process reads its Gateway URL and Memory ID from environment
 variables (GATEWAY_URL, MEMORY_ID) — this stack wires those from the
 GatewayStack and MemoryStack outputs, and grants the Runtime's execution
-role the permissions it needs to invoke the Bedrock model and call the
-Gateway.
+role the permissions it needs to call the Gateway. Model calls
+themselves go exclusively through the Gateway's own inference target
+(GATEWAY_INFERENCE_URL, required — see agent.py's build_model()) — the
+Runtime's execution role has no direct bedrock:InvokeModel* permission
+at all; that grant existed only for the direct-BedrockModel fallback
+path removed by DESIGN.md's "Gateway-routed inference mandatory"
+decision. Any Bedrock invocation permission needed for the Gateway's own
+bedrock-mantle connector target lives on the Gateway's service role
+instead (see gateway_stack.py's _grant_bedrock_inference_invoke()).
 
 Phase 3 (Gateway/OBO auth rearchitecture, added after Phase 2): the
 Runtime's execution role no longer has `gateway.grant_invoke()`'s IAM
@@ -133,7 +140,7 @@ class RuntimeStack(Stack):
         runtime_oidc_allowed_clients: list[str] | None = None,
         runtime_oidc_allowed_scopes: list[str] | None = None,
         gateway_oauth2_credential_provider: agentcore.CfnOAuth2CredentialProvider | None = None,
-        gateway_inference_url: str | None = None,
+        gateway_inference_url: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -238,15 +245,14 @@ class RuntimeStack(Stack):
                 "AWS_REGION": self.region,
                 "MODEL_ID": model_id,
                 # Gateway's inference target base URL (see
-                # GatewayStack._add_inference_target()) — always wired
-                # (the target always exists), but agent.py only actually
-                # routes model calls through it when this is set to a
-                # non-empty value at the caller's discretion, mirroring
-                # GATEWAY_URL's own "empty string means not configured"
-                # convention rather than gating this on a separate
-                # boolean env var. Rate limiting/RBAC policy on this
-                # target is a deliberate fast-follow, not wired here.
-                "GATEWAY_INFERENCE_URL": gateway_inference_url or "",
+                # GatewayStack._add_inference_target()) — required.
+                # agent.py's build_model() is the sole model-call path
+                # (no direct-bedrock-runtime fallback — see DESIGN.md's
+                # "Gateway-routed inference mandatory" decision) and
+                # raises RuntimeError if this is ever empty at request
+                # time. Rate limiting/RBAC policy on this target is
+                # configured separately in gateway_stack.py.
+                "GATEWAY_INFERENCE_URL": gateway_inference_url,
                 # Required alongside the opentelemetry-instrument entrypoint
                 # wrapper (see agent_runtime_artifact above) for ADOT to
                 # activate AgentCore's GenAI-specific span processing and
@@ -300,26 +306,6 @@ class RuntimeStack(Stack):
             "RuntimeLogRetention",
             log_group_name=f"/aws/bedrock-agentcore/runtimes/{self.runtime.agent_runtime_id}-DEFAULT",
             retention=logs.RetentionDays.ONE_MONTH,
-        )
-
-        # Claude Sonnet invocation for the agent's own reasoning. The "us."
-        # cross-region inference profile for Claude Sonnet 5 routes actual
-        # model invocations to us-east-1, us-east-2, and us-west-2 (confirmed
-        # via bedrock:GetInferenceProfile) — granting foundation-model
-        # access only in self.region is insufficient and causes
-        # AccessDeniedException on requests routed to the other regions.
-        CROSS_REGION_MODEL_REGIONS = ["us-east-1", "us-east-2", "us-west-2"]
-        self.runtime.add_to_role_policy(
-            iam.PolicyStatement(
-                sid="AllowBedrockModelInvocation",
-                effect=iam.Effect.ALLOW,
-                actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-                resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*"
-                    for region in CROSS_REGION_MODEL_REGIONS
-                ]
-                + [f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/*"],
-            )
         )
 
         # Grant the Runtime's execution role permission to read/write

@@ -1,14 +1,23 @@
 """Travel Planning Agent — Strands Agent hosted on Amazon Bedrock AgentCore Runtime.
 
 Wires together:
-  - Claude Sonnet via the Gateway's own inference target
+  - Claude Sonnet and Haiku via the Gateway's own inference target
     (strands.models.anthropic.AnthropicModel, pointed at the Gateway's
     /inference/v1/messages path) — the sole model-call path, for
     centralized governance/rate-limiting. There is no direct-bedrock-
-    runtime fallback: build_model() raises RuntimeError if the Gateway
-    path can't be used (see DESIGN.md's "Gateway-routed inference
-    mandatory" decision, superseding the earlier opt-in design). Uses the
-    same OBO-cached Gateway token as the tools path.
+    runtime fallback: build_model_router() raises RuntimeError if the
+    Gateway path can't be used (see DESIGN.md's "Gateway-routed
+    inference mandatory" decision). A Strands ModelRouter
+    (strands.models.routing) with a ClassifierStrategy picks between a
+    cheap Haiku serving candidate and the Sonnet serving candidate per
+    turn, based on whether the request looks like it needs tool use/
+    multi-step reasoning — see build_model_router()'s docstring for the
+    full design and DESIGN.md's model-routing decision. This is an
+    educational feature (exercising Strands' ModelRouter/ClassifierStrategy
+    API directly), not a load-bearing production capability. Both serving
+    candidates and the classifier itself route through the same Gateway
+    inference target, authenticated with the same OBO-cached Gateway
+    token as the tools path.
   - Tools from the AgentCore Gateway (Web Search + weather + places), over
     MCP — SigV4 (IAM) request signing by default, or a per-user JWT
     bearer token obtained via RFC 8693 On-Behalf-Of token exchange when
@@ -29,8 +38,8 @@ Wires together:
     default.
 
 The entrypoint (invoke()) is an async generator: it streams labeled
-diagnostic events (reasoning/text/tool_use/tool_result/done/error) as an
-SSE response, one per turn of agent.stream_async(). BedrockAgentCoreApp
+diagnostic events (reasoning/text/tool_use/tool_result/routing/done/error)
+as an SSE response, one per turn of agent.stream_async(). BedrockAgentCoreApp
 auto-detects the async-generator return and wraps it as a
 text/event-stream StreamingResponse — see stream_agent_turn() for the
 event-shape translation and MaxTokensReachedException handling.
@@ -40,15 +49,18 @@ Configuration is read from environment variables set by RuntimeStack:
   MEMORY_ID                 - the AgentCore Memory resource ID
   AWS_REGION                - region for the Memory client (falls back to boto3 default)
   MODEL_ID                  - Bedrock model ID for Claude Sonnet (has a sane default)
+  HAIKU_MODEL_ID            - Bedrock model ID for Claude Haiku, used as both the
+                              ModelRouter's cheap serving candidate and its
+                              classifier model (has a sane default)
   GATEWAY_OBO_PROVIDER_NAME - name of the AgentCore Identity OAuth2 credential
                               provider used for the Gateway's RFC 8693 On-Behalf-Of
                               token exchange (see build_mcp_client() below); empty
                               string if GatewayStack's JWT authorizer isn't configured
   GATEWAY_INFERENCE_URL     - base URL of the Gateway's inference target
-                              (".../inference"); required — build_model()
+                              (".../inference"); required — build_model_router()
                               raises RuntimeError if this is unset, since
                               there is no other model-call path (see
-                              build_model() below)
+                              build_model_router() below)
 
 Auth, Runtime inbound: IAM/SigV4 by default (DESIGN.md decision #37), or JWT
 Bearer Token when RuntimeStack's Okta config is set (DESIGN.md's Phase 2
@@ -83,7 +95,11 @@ endpoint) — here, AgentCore Identity performs the entire exchange
 server-side; agent.py never makes an HTTP call to Okta directly, and
 never touches the Okta client secret (held in Secrets Manager, read only
 by AgentCore Identity itself). See DESIGN.md's Phase 3 section for the
-full design.
+full design. build_model_router()'s two serving candidates and its
+classifier all reuse this exact same exchanged token — one exchange per
+caller, regardless of how many model roles ultimately consume it (see
+build_model_router()'s docstring for why this makes per-candidate
+token-fetching unnecessary).
 
 A fresh MCPClient and Agent are built per request (not shared globally),
 following the documented safe pattern for AgentCore Runtime: it avoids
@@ -112,7 +128,9 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
+from strands.hooks import AfterModelCallEvent
 from strands.models.anthropic import AnthropicModel
+from strands.models.routing import ClassifierStrategy, ModelRouter, RoutingCandidate
 from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
@@ -191,6 +209,48 @@ GATEWAY_OBO_TOKEN_REFRESH_SKEW_SECONDS = 60
 # Sonnet is the design's chosen model (see DESIGN.md decision #7) for its
 # multi-step reasoning and tool-use reliability across the three Gateway tools.
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
+# Cheap-tier serving candidate AND classifier model for the ModelRouter-
+# based tiered inference path (see build_model_router()) — one model
+# fills both roles, matching this project's decision to keep the
+# candidate/classifier model set minimal rather than adding a third,
+# even-cheaper model just for classification. Default confirmed live via
+# `aws bedrock get-inference-profile` as a real, ACTIVE, SYSTEM_DEFINED
+# cross-region inference profile in this account (same "us."-prefix
+# convention MODEL_ID's own default uses).
+HAIKU_MODEL_ID = os.environ.get(
+    "HAIKU_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+# Extends ClassifierStrategy's own built-in default system prompt (which
+# already implements a close variant of this policy — "select the least
+# capable candidate that can still deliver a complete and accurate
+# result") with explicit, this-agent-specific escalation signals. Written
+# proactively, not reactively: rather than shipping the bare default and
+# waiting to observe real misroutes, this names the concrete phrasing
+# patterns (weather/place/date/planning language) that should always
+# escalate to the capable candidate, since a bare complexity policy has
+# no way to know this agent's tools are the actual complexity signal that
+# matters here. Deliberately does NOT attempt to correct a misrouted turn
+# after the fact (ClassifierStrategy only picks the opening candidate and
+# never switches after a non-failure — see DESIGN.md's model-routing
+# decision for why building corrective mid-turn routing machinery was
+# explicitly rejected in favor of investing in this prompt instead).
+_ROUTING_POLICY_SYSTEM_PROMPT = (
+    "You are a model-routing classifier for a travel-planning assistant. Select exactly one "
+    "candidate for the latest user message. The two candidates differ only in cost/capability, "
+    "not in which tools they can call — either candidate CAN call tools if it decides to, but "
+    "routing a tool-requiring turn to the cheap candidate risks a worse or slower result. "
+    "Prefer the cheap candidate only for turns that are purely conversational and need no "
+    "grounding: greetings, small talk, answering from context already in the conversation (e.g. "
+    "\"what do you know about me\"), or simple clarifying-question exchanges about dates/budget/"
+    "interests/travelers with no research involved. Escalate to the capable candidate whenever "
+    "the message mentions or implies: weather or forecasts, specific places/points of interest/"
+    "things to do, specific dates or date math (trip length, \"next week\", calendar dates), "
+    "budget/cost arithmetic across multiple items, or generating/revising an itinerary — these "
+    "signal a turn is likely to need tool calls (weather, places, web search, code interpreter) "
+    "or multi-step reasoning, even if the message itself is phrased simply or conversationally. "
+    "When genuinely uncertain, prefer the capable candidate — a wrongly-escalated simple turn "
+    "costs more, but a wrongly-cheapened complex turn produces a worse answer for the traveler."
+)
 # Bedrock's Converse API (and, by the same token, the Gateway's own
 # bedrock-mantle-routed Anthropic Messages API path) defaults to a fairly
 # low per-model max output token limit if maxTokens is omitted from the
@@ -485,12 +545,49 @@ async def stream_agent_turn(agent: Agent, user_message: str):
     and translated into the same "error" event shape as the other two
     cutoff cases, with whatever partial answer the model had already
     written (there's no separate exception handler needed for this path).
+
+    Emits one "routing" event ({"type": "routing", "data": {"candidate":
+    "cheap" | "capable"}}) the first time this turn's ModelRouter
+    selection becomes observable, via an AfterModelCallEvent hook
+    registered on this agent — see _selected_candidate_name()'s docstring
+    for why this reads Strands' internal invocation_state rather than a
+    public API (none exists for this yet). Also logged via logger.info()
+    at the same point, matching this module's existing OBO-cache logging
+    convention, for durable/queryable evidence beyond the live diagnostic
+    panel. The hook is registered unconditionally, not gated on
+    isinstance(agent.model, ModelRouter) — found live (not assumed) that
+    Agent.__init__ immediately resolves agent.model to the router's
+    *default* candidate model, never the ModelRouter instance itself (its
+    own module docstring says as much: "routing applies to
+    InvokeModelStage, so agent.model stays the first declared
+    candidate"), so that isinstance check would silently never be true
+    even for a genuinely routed agent. _selected_candidate_name() already
+    returns None gracefully when there's no routing state to find (a
+    non-routed agent), so no "routing" event is ever emitted in that case
+    — this is intentionally silent, not an error.
     """
+    routing_state: dict[str, Optional[str]] = {"candidate": None, "emitted": False}
+
+    async def _on_after_model_call(event: AfterModelCallEvent) -> None:
+        if routing_state["candidate"] is None:
+            name = _selected_candidate_name(event)
+            if name is not None:
+                routing_state["candidate"] = name
+
+    agent.hooks.add_callback(AfterModelCallEvent, _on_after_model_call)
+
     seen_tool_use_ids: set[str] = set()
     try:
         async for event in agent.stream_async(
             user_message, limits=Limits(turns=AGENT_MAX_TURNS)
         ):
+            if not routing_state["emitted"] and routing_state["candidate"] is not None:
+                routing_state["emitted"] = True
+                logger.info(
+                    "ModelRouter selected candidate=%r for this turn",
+                    routing_state["candidate"],
+                )
+                yield {"type": "routing", "data": {"candidate": routing_state["candidate"]}}
             if event.get("reasoning") and event.get("reasoningText"):
                 yield {"type": "reasoning", "data": event["reasoningText"]}
             elif "data" in event:
@@ -675,16 +772,167 @@ def build_session_manager(actor_id: str, session_id: str) -> Optional[AgentCoreM
     )
 
 
-async def build_model() -> AnthropicModel:
-    """Build this request's model provider — the Gateway's inference target.
+def _bedrock_model_id_for_gateway(model_id: str) -> str:
+    """Map a bedrock-runtime-style model ID to its bedrock-mantle equivalent.
 
-    The sole model-call path: routes through the Gateway's bedrock-mantle
-    inference target (AnthropicModel, pointed at the Gateway's own
-    /inference/v1/messages path) rather than calling bedrock-runtime
-    directly. There is no fallback — see DESIGN.md's "Gateway-routed
-    inference mandatory" decision (superseding the earlier opt-in design,
-    where GATEWAY_INFERENCE_URL being unset meant falling back to a
-    direct BedrockModel call).
+    These are genuinely different ID namespaces, confirmed against AWS's
+    own per-model documentation (the "Programmatic Access" table on each
+    model's Bedrock model-card page) rather than assumed to be a single
+    shared transformation:
+      - Sonnet 5: bedrock-runtime is "anthropic.claude-sonnet-5" (no cross-
+        region prefix on the bare ID); bedrock-mantle is the SAME string,
+        "anthropic.claude-sonnet-5". Stripping MODEL_ID's "us." cross-
+        region-inference-profile prefix happens to be sufficient for this
+        one model — found live (decision "Gateway-routed inference
+        mandatory") — but that is a coincidence of this model's ID shape,
+        not a rule that generalizes.
+      - Haiku 4.5: bedrock-runtime is
+        "anthropic.claude-haiku-4-5-20251001-v1:0" (an older-style, date-
+        and-version-suffixed ID); bedrock-mantle is the SHORTER, DISTINCT
+        alias "anthropic.claude-haiku-4-5" — not a substring or prefix-
+        stripped form of the bedrock-runtime ID at all (the
+        "-20251001-v1:0" suffix is dropped entirely, not just a "us."
+        prefix). Found live: sending the bedrock-runtime-shaped ID through
+        this Gateway's bedrock-mantle connector target returned a real
+        Anthropic 400 ("Model ID contains invalid characters." — the
+        literal ":0" is what's rejected) from the classifier's forced-
+        tool-use call, which ClassifierStrategy silently caught and
+        treated as a classification failure, always falling back to the
+        router's default candidate — this is what made every real chat
+        turn route to "capable" regardless of message content, discovered
+        via a temporary raw-HTTP diagnostic probe added to
+        build_model_router() and removed once root-caused.
+
+    A single "strip a known prefix" rule cannot express both cases
+    correctly (Sonnet needs a prefix stripped; Haiku needs a suffix
+    stripped and is a categorically different ID shape) — so this is an
+    explicit per-model mapping, not a shared string transformation.
+    Raises ValueError for any model_id not in the mapping, rather than
+    silently guessing at a transformation for a model this project hasn't
+    verified against AWS's own docs — a wrong guess here fails the same
+    way this bug did (a real request rejected by bedrock-mantle), just
+    louder and sooner.
+    """
+    mapping = {
+        "us.anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
+        "anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic.claude-haiku-4-5",
+        "anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic.claude-haiku-4-5",
+    }
+    if model_id not in mapping:
+        raise ValueError(
+            f"model_id={model_id!r} has no known bedrock-mantle equivalent — "
+            "verify the correct mapping against this model's AWS Bedrock "
+            "model-card page (\"Programmatic Access\" table, bedrock-mantle "
+            "row) before adding it here; do not guess a string "
+            "transformation, since bedrock-mantle's aliasing convention "
+            "differs per model (see this function's own docstring)."
+        )
+    return mapping[model_id]
+
+
+def _build_gateway_anthropic_model(
+    model_id: str, gateway_token: str, *, max_tokens: int, enable_adaptive_thinking: bool = True
+) -> AnthropicModel:
+    """Build one Gateway-routed AnthropicModel candidate from an already-exchanged token.
+
+    Shared by every model role build_model_router() constructs (both
+    serving candidates and the classifier) — each is a stateless
+    AnthropicModel differing only in model_id, pointed at the same
+    Gateway inference target with the same auth_token. Candidates must
+    be stateless per ModelRouter's own construction guard (conversation
+    history lives on the Agent, not the model provider) — a plain
+    AnthropicModel already satisfies this, so no extra care is needed
+    here beyond not sharing one instance across two roles (ModelRouter
+    rejects duplicate model instances — see its own construction guards).
+
+    enable_adaptive_thinking defaults to True (matching this project's
+    original single-model behavior) but MUST be set False for any Haiku
+    4.5 construction — found live, the real root cause of a persistent
+    403 that survived the earlier model-ID-mapping fix: Claude Haiku 4.5
+    does not support extended/adaptive thinking at all, and Anthropic's
+    API correctly rejects any request carrying the "thinking" param with
+    "400 invalid_request_error: adaptive thinking is not supported on
+    this model" — surfaced through ClassifierStrategy as a caught,
+    silently-swallowed classification failure (only the exception's type
+    name is logged, not its message), which is why every real chat turn
+    kept routing to "capable" even after the model-ID mapping was fixed.
+    Confirmed via a temporary diagnostic that called
+    classifier_model.structured_output() directly and logged the real
+    exception body — removed once root-caused. The two serving
+    candidates keep adaptive thinking enabled (Sonnet does support it,
+    and it's what powers the "reasoning" stream_agent_turn() event for
+    the diagnostic panel); only the classifier construction passes
+    enable_adaptive_thinking=False, since its job is a one-field
+    structured-output decision that never needs to think out loud.
+    """
+    params = (
+        {
+            # display="summarized" is required to get any
+            # reasoningText.text at all (confirmed by testing the raw
+            # Bedrock Converse API directly, bypassing Strands, on
+            # 2026-08-24: with just {"type": "adaptive"},
+            # reasoningText.text came back empty even on a turn that did
+            # produce a reasoningContent block).
+            "thinking": {"type": "adaptive", "display": "summarized"},
+        }
+        if enable_adaptive_thinking
+        else None
+    )
+    return AnthropicModel(
+        client_args={
+            # auth_token sends "Authorization: Bearer <token>" instead of
+            # Anthropic's own "x-api-key" header — required here since the
+            # Gateway's inbound authorizer validates a JWT bearer token,
+            # not an Anthropic API key (confirmed against the Anthropic
+            # Python SDK's own client parameters).
+            "auth_token": gateway_token,
+            "base_url": GATEWAY_INFERENCE_URL,
+        },
+        model_id=_bedrock_model_id_for_gateway(model_id),
+        max_tokens=max_tokens,
+        # Enables the "reasoning" stream_agent_turn() event (Claude's
+        # extended-thinking content) for the diagnostic panel — see this
+        # function's own docstring for why this is conditional, not
+        # always applied.
+        params=params,
+    )
+
+
+async def build_model_router() -> ModelRouter:
+    """Build this request's model provider — a tiered ModelRouter over the Gateway's inference target.
+
+    Educational feature exercising Strands' ModelRouter/ClassifierStrategy
+    API directly (strands-agents>=1.54.0, the version that introduced
+    ClassifierStrategy — confirmed via a binary-search of PyPI wheels,
+    since 1.52.0/1.53.0 export no such class at all). Not a load-bearing
+    production capability — see DESIGN.md's model-routing decision for
+    the full rationale, including why a custom RoutingStrategy was
+    rejected in favor of the real built-in class.
+
+    Three model roles, all Gateway-routed AnthropicModel instances built
+    from the SAME already-exchanged OBO token (see invoke(), which fetches
+    it once via _get_cached_or_exchange_gateway_token() before calling
+    this function — not once per role): a cheap serving candidate
+    (HAIKU_MODEL_ID), the capable serving candidate (MODEL_ID, the
+    project's existing default model), and a dedicated classifier model
+    (also HAIKU_MODEL_ID, matching Strands' own docs example of using a
+    small/cheap/deterministic model purely for the routing decision, not
+    real answers). One token authenticates all three regardless of which
+    ends up serving the turn — the Gateway's OBO exchange is scoped to
+    the caller's identity, not to any one model, so this is not three
+    separate exchange costs the way a naive per-candidate implementation
+    might assume.
+
+    ClassifierStrategy(..., temperature/max_tokens/streaming kwargs are
+    NOT accepted directly by its constructor — those are properties of
+    the classifier Model instance itself, not the strategy) is configured
+    with a small max_tokens (64, matching Strands' own docs example: the
+    classifier's only job is a one-field structured-output decision, not
+    real generation) and this module's own _ROUTING_POLICY_SYSTEM_PROMPT
+    (extending ClassifierStrategy's built-in default policy with explicit
+    tool-triggering escalation signals specific to this agent — see that
+    constant's own docstring).
 
     Raises RuntimeError if GATEWAY_INFERENCE_URL is unset — this is a
     deploy-time misconfiguration (RuntimeStack always wires this from
@@ -698,28 +946,24 @@ async def build_model() -> AnthropicModel:
     identical check: that combination means the OBO exchange this path
     depends on has no subject token to work from.
 
-    The Gateway-routed path needs the bare foundation-model ID, not the
-    "us." cross-region-inference-profile-prefixed form MODEL_ID carries
-    for bedrock-runtime's own Converse/InvokeModel APIs. Found live:
-    routing a request for "us.anthropic.claude-sonnet-5" through the
-    Gateway's bedrock-mantle connector target returned a real
-    Anthropic-shaped 404 ("Model 'us.anthropic.claude-sonnet-5' not found
-    on any target") — confirmed via `aws bedrock list-foundation-models`
-    that the canonical model ID is the bare "anthropic.claude-sonnet-5"
-    (inferenceTypesSupported: INFERENCE_PROFILE — the "us." prefix is
-    specifically a cross-region-inference-profile wrapper meaningful to
-    bedrock-runtime's own APIs, not a concept bedrock-mantle's model
-    routing resolves). Stripped inline below (not a general regex/split
-    on MODEL_ID, since that would silently mis-strip a differently-shaped
-    future MODEL_ID) — this handles specifically this one known prefix on
-    this one known model.
-
-    Reuses the same OBO-cached Gateway token as build_mcp_client() (one
-    token, one cache entry per caller, no separate exchange) — this call
-    is a second, independent cache lookup/exchange for the same request,
-    not a shared object with the MCP client's own call, but
-    _get_cached_or_exchange_gateway_token()'s cache means only the first
-    of the two actually round-trips to AgentCore Identity/Okta.
+    A third, previously-confirmed 403 source for this path (distinct from
+    the model-ID-mapping and adaptive-thinking cases documented in
+    _build_gateway_anthropic_model()'s own docstring): ClassifierStrategy
+    copies the parent Agent's full system_prompt (prompts.py's
+    SYSTEM_PROMPT, not just _ROUTING_POLICY_SYSTEM_PROMPT above) verbatim
+    into every classifier call, and JSON-escapes '<'/'>' as \u003c/\u003e
+    — so any literal text in SYSTEM_PROMPT ending in dots immediately
+    before a tag (e.g. an ellipsis-style "<tag>...</tag>" example) can
+    produce a literal "..\" sequence that an undocumented AWS-managed WAF
+    in front of the Gateway's inference endpoint blocks with a bare,
+    unlogged 403 — 100% reproducing, with zero Gateway app log or
+    CloudTrail correlation, since the block happens at an edge/ALB layer
+    before the request reaches Gateway application code. If
+    ClassifierStrategy starts failing this way again, check SYSTEM_PROMPT
+    for this pattern before assuming a model/auth regression — see
+    prompts.py's comment above SYSTEM_PROMPT and
+    .kiro/notes/agentcore-gateway-waf-403-root-cause.md for the full
+    investigation.
     """
     if not GATEWAY_INFERENCE_URL:
         raise RuntimeError(
@@ -738,39 +982,78 @@ async def build_model() -> AnthropicModel:
             "OBO exchange this path depends on to have a subject token to "
             "work from."
         )
+    # Fetched once here, not once per model role — see this function's own
+    # docstring on why one token serves all three constructions below.
     gateway_token = await _get_cached_or_exchange_gateway_token(workload_access_token)
 
-    gateway_inference_model_id = (
-        MODEL_ID[len("us.") :] if MODEL_ID.startswith("us.") else MODEL_ID
+    cheap_candidate = RoutingCandidate(
+        _build_gateway_anthropic_model(
+            HAIKU_MODEL_ID, gateway_token, max_tokens=MAX_OUTPUT_TOKENS, enable_adaptive_thinking=False
+        ),
+        name="cheap",
+        description=(
+            "Lower-cost, lower-latency model for purely conversational turns that need no "
+            "tool use or research — greetings, small talk, recalling something already "
+            "stated in this conversation, or simple clarifying-question exchanges."
+        ),
+    )
+    capable_candidate = RoutingCandidate(
+        _build_gateway_anthropic_model(MODEL_ID, gateway_token, max_tokens=MAX_OUTPUT_TOKENS),
+        name="capable",
+        description=(
+            "Higher-capability model for turns likely to need tool calls (weather, places, "
+            "web search, code interpreter) or multi-step reasoning — itinerary generation, "
+            "anything mentioning specific dates/places/weather, or budget arithmetic."
+        ),
+    )
+    classifier_model = _build_gateway_anthropic_model(
+        HAIKU_MODEL_ID, gateway_token, max_tokens=64, enable_adaptive_thinking=False
     )
 
-    return AnthropicModel(
-        client_args={
-            # auth_token sends "Authorization: Bearer <token>" instead of
-            # Anthropic's own "x-api-key" header — required here since the
-            # Gateway's inbound authorizer validates a JWT bearer token,
-            # not an Anthropic API key (confirmed against the Anthropic
-            # Python SDK's own client parameters).
-            "auth_token": gateway_token,
-            "base_url": GATEWAY_INFERENCE_URL,
-        },
-        model_id=gateway_inference_model_id,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        # Enables the "reasoning" stream_agent_turn() event (Claude's
-        # extended-thinking content) for the diagnostic panel — same
-        # adaptive-thinking config previously used on the direct
-        # BedrockModel path, under AnthropicModel's own "params"
-        # passthrough (merged directly into the Messages API request
-        # body) rather than "additional_request_fields". display=
-        # "summarized" is required to get any reasoningText.text at all
-        # (confirmed by testing the raw Bedrock Converse API directly,
-        # bypassing Strands, on 2026-08-24: with just
-        # {"type": "adaptive"}, reasoningText.text came back empty even on
-        # a turn that did produce a reasoningContent block). Claude Sonnet
-        # 5 decides per-request whether to think at all, so this event
-        # will still be inconsistent turn-to-turn — expected, not a bug.
-        params={"thinking": {"type": "adaptive", "display": "summarized"}},
+    return ModelRouter(
+        # First-declared candidate is the router's own default (served
+        # when the strategy declines) — "capable" first, not "cheap", so
+        # a classifier failure/timeout fails toward the safer, more
+        # capable option rather than silently under-serving a request
+        # (mirrors this agent's own "when uncertain, prefer the capable
+        # candidate" instruction in _ROUTING_POLICY_SYSTEM_PROMPT).
+        models=[capable_candidate, cheap_candidate],
+        strategy=ClassifierStrategy(
+            classifier_model,
+            system_prompt=_ROUTING_POLICY_SYSTEM_PROMPT,
+        ),
     )
+
+
+_ROUTING_STATE_KEY_SUBSTRING = "model_routing"
+
+
+def _selected_candidate_name(event: AfterModelCallEvent) -> Optional[str]:
+    """Best-effort read of which RoutingCandidate served this model call.
+
+    Strands' ModelRouter stores its per-invocation selection in
+    event.invocation_state under a key containing "model_routing" (see
+    strands.models.routing.router's own _ROUTING_KEY_PREFIX constant) —
+    there is no public API for reading the selected candidate back, so
+    this reads the same invocation_state dict every hook callback already
+    receives rather than reconstructing the router's private key format
+    exactly (which also depends on id()-based object identity this module
+    has no access to). Confirmed working via direct experimentation
+    against strands-agents==1.54.0 before relying on it — not assumed
+    from reading source alone. Returns None (never raises) if the shape
+    ever changes upstream, so a Strands internals rename degrades this
+    purely-observational feature gracefully rather than breaking a real
+    chat turn.
+    """
+    try:
+        for key, value in event.invocation_state.items():
+            if _ROUTING_STATE_KEY_SUBSTRING in key:
+                candidate = getattr(value, "candidate", None)
+                if candidate is not None:
+                    return candidate.name
+    except Exception:  # noqa: BLE001 - purely observational, must never break a turn
+        pass
+    return None
 
 
 async def build_mcp_client() -> Optional[MCPClient]:
@@ -1007,7 +1290,7 @@ async def invoke(payload: dict, context: Any = None):
     source: inspect.isasyncgen(result) in _handle_invocation) and wraps it as
     a text/event-stream StreamingResponse, converting each yielded dict to a
     "data: <json>\n\n" frame automatically. See stream_agent_turn() for the
-    event shapes yielded: reasoning | text | tool_use | tool_result | done | error.
+    event shapes yielded: reasoning | text | tool_use | tool_result | routing | done | error.
 
     A malformed request (missing prompt) still needs a single event, not a
     plain dict return — BedrockAgentCoreApp's streaming detection is based
@@ -1027,7 +1310,7 @@ async def invoke(payload: dict, context: Any = None):
 
     session_manager = build_session_manager(actor_id, session_id)
     mcp_client = await build_mcp_client()
-    model = await build_model()
+    model = await build_model_router()
     # UTC "today" — there's no per-traveler timezone collected from the
     # conversation (see prompts.py's requirements list), so this is the only
     # unambiguous default. AgentCore Runtime containers run in UTC, so

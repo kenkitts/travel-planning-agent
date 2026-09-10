@@ -160,6 +160,7 @@ class GatewayStack(Stack):
         weather_function: lambda_.IFunction,
         places_function: lambda_.IFunction,
         model_id: str,
+        haiku_model_id: str,
         gateway_oidc_discovery_url: str | None = None,
         gateway_oidc_allowed_audience: list[str] | None = None,
         gateway_oidc_allowed_clients: list[str] | None = None,
@@ -244,7 +245,7 @@ class GatewayStack(Stack):
         # attachment has finished; policy_dependable is the actual
         # construct CDK's own AddToPrincipalPolicyResult recommends for
         # this exact ordering guarantee.
-        inference_grant = self._grant_bedrock_inference_invoke(model_id)
+        inference_grant = self._grant_bedrock_inference_invoke(model_id, haiku_model_id)
         self.inference_target = self._add_inference_target(model_id)
         self.inference_target.node.add_dependency(inference_grant.policy_dependable)        # Gateway's inference targets are reachable at
         # {gatewayUrl}/inference/{path} — gateway_url above is the MCP
@@ -287,7 +288,7 @@ class GatewayStack(Stack):
         # than silently having no effect for unmatched callers (see AWS's
         # own rate-limit best-practices doc on always including a
         # catch-all entry).
-        self._add_inference_rate_limit(model_id)
+        self._add_inference_rate_limit(model_id, haiku_model_id)
 
         self.oauth2_credential_provider = None
         if gateway_oidc_discovery_url and gateway_oidc_client_id and gateway_oidc_client_secret:
@@ -297,7 +298,9 @@ class GatewayStack(Stack):
                 gateway_oidc_client_secret,
             )
 
-    def _add_inference_rate_limit(self, model_id: str) -> agentcore.CfnGatewayRateLimit:
+    def _add_inference_rate_limit(
+        self, model_id: str, haiku_model_id: str
+    ) -> agentcore.CfnGatewayRateLimit:
         """Per-user TPM budget on the bedrock-mantle inference target.
 
         dimensionKeys=["qualifiedModelId", "$.context.jwt.sub"]: scopes the
@@ -318,29 +321,71 @@ class GatewayStack(Stack):
         constraint and still isolates each distinct caller into their own
         budget bucket.
 
-        qualifiedModelId is asserted from AWS's own rate-limit example
-        payloads to be the bare foundation-model ID (e.g.
-        "anthropic.claude-fable-5"), not a `us.`-prefixed cross-region
-        inference-profile ID — the same bare-ID convention already found
-        live for bedrock-mantle's own model resolution (see
-        _add_inference_target()'s docstring and agent.py's
-        GATEWAY_INFERENCE_MODEL_ID). Strips the same "us." prefix here
-        rather than importing agent.py's constant, since this is
-        CDK-side/synth-time logic with no dependency on the agent package.
+        qualifiedModelId must match the Gateway's actual *resolved*
+        bedrock-mantle model ID (visible in the Gateway's own application
+        logs as "resolvedModelId"), not agent.py's bedrock-runtime-style
+        MODEL_ID/HAIKU_MODEL_ID values — see _bedrock_mantle_model_id()
+        below, which mirrors agent.py's explicit mapping exactly rather
+        than re-deriving it (a naive "strip a `us.` prefix" transformation
+        is wrong for Haiku and was a real, live-confirmed bug: an
+        unmatched qualifiedModelId meant every Haiku inference call was
+        rejected outright by rate-limit enforcement with a bare HTML 403,
+        before ever reaching Gateway routing/logging).
 
-        A single entry, not a specific-user + wildcard pair like AWS's
-        tiered-access example — this project has no user tiers (see
+        Two entries — one for `model_id` (Sonnet) and one for
+        `haiku_model_id` — each with the SAME per-user budget
+        (INFERENCE_TOKENS_PER_MINUTE_PER_USER), added for the tiered
+        ModelRouter (see agent.py's build_model()). Not a smaller/larger
+        budget for Haiku: there's no real usage data yet to size a
+        different number confidently, and copying the existing value is a
+        safer starting point than guessing a new one — matches this
+        method's own original "starting value, not a load-tested ceiling"
+        framing, now applied identically to a second model. Each model
+        gets its own independent budget rather than sharing one bucket
+        across both — a burst of cheap Haiku classifier calls should not
+        be able to exhaust the budget an expensive Sonnet-serving turn
+        also needs.
+
+        A single entry per model, not a specific-user + wildcard pair like
+        AWS's tiered-access example — this project has no user tiers (see
         DESIGN.md; this agent has one flat user population), so every
-        caller gets the same, single per-user budget rather than needing a
-        named entry per person.
+        caller gets the same, single per-user budget per model rather than
+        needing a named entry per person.
 
         Depends on the inference target explicitly: this rate limit is
-        conceptually scoped to that target's model, and AWS's rate-limit
+        conceptually scoped to that target's models, and AWS's rate-limit
         API needs the gateway (and, in practice, a stable target/model to
         route against) to already exist — matching this file's existing
         dependency-ordering precedent for the inference target itself.
         """
-        bare_model_id = model_id[len("us.") :] if model_id.startswith("us.") else model_id
+
+        def _bedrock_mantle_model_id(model: str) -> str:
+            """Map a bedrock-runtime-style model ID to its bedrock-mantle alias.
+
+            Mirrors agent.py's _bedrock_model_id_for_gateway() explicit
+            mapping exactly (not re-derived here) — a naive "strip a `us.`
+            prefix" transformation is wrong for Haiku, whose bedrock-mantle
+            alias ("anthropic.claude-haiku-4-5") drops the entire
+            "-20251001-v1:0" suffix, not just a "us." prefix. Confirmed
+            live this rate limit's qualifiedModelId dimension must match
+            the Gateway's actual *resolved* model ID (visible in its own
+            application logs as "resolvedModelId") for the entry to match
+            at all — an unmatched entry meant the Gateway's rate-limit
+            enforcement rejected every Haiku inference call with a bare
+            HTML 403 (no application-log entry, rejected before routing
+            logic), which is what made the model-routing classifier fail
+            on effectively every real turn regardless of message content.
+            """
+            mapping = {
+                "us.anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
+                "anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic.claude-haiku-4-5",
+                "anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic.claude-haiku-4-5",
+            }
+            if model not in mapping:
+                raise ValueError(f"No known bedrock-mantle alias for model ID: {model!r}")
+            return mapping[model]
+
         rate_limit = agentcore.CfnGatewayRateLimit(
             self,
             "InferenceRateLimit",
@@ -348,13 +393,25 @@ class GatewayStack(Stack):
             rate_limit_id="inference-tpm-per-user",
             description=(
                 f"Per-user token budget ({INFERENCE_TOKENS_PER_MINUTE_PER_USER} "
-                "TPM) on the bedrock-mantle inference target."
+                "TPM per model) on the bedrock-mantle inference target."
             ),
             dimension_keys=["qualifiedModelId", "$.context.jwt.sub"],
             entries=[
                 agentcore.CfnGatewayRateLimit.LimitEntryProperty(
                     dimensions={
-                        "qualifiedModelId": bare_model_id,
+                        "qualifiedModelId": _bedrock_mantle_model_id(model_id),
+                        "$.context.jwt.sub": "*",
+                    },
+                    tokens=[
+                        agentcore.CfnGatewayRateLimit.RateConfigProperty(
+                            rate=INFERENCE_TOKENS_PER_MINUTE_PER_USER,
+                            period="minute",
+                        ),
+                    ],
+                ),
+                agentcore.CfnGatewayRateLimit.LimitEntryProperty(
+                    dimensions={
+                        "qualifiedModelId": _bedrock_mantle_model_id(haiku_model_id),
                         "$.context.jwt.sub": "*",
                     },
                     tokens=[
@@ -646,16 +703,25 @@ class GatewayStack(Stack):
             ],
         )
 
-    def _grant_bedrock_inference_invoke(self, model_id: str) -> iam.AddToPrincipalPolicyResult:
+    def _grant_bedrock_inference_invoke(
+        self, model_id: str, haiku_model_id: str
+    ) -> iam.AddToPrincipalPolicyResult:
         """Grant the Gateway's own service role permission to invoke the
-        Bedrock model behind the inference target, scoped to the exact
-        model/inference-profile ARN — not a wildcard across all Bedrock
+        Bedrock models behind the inference target, scoped to the exact
+        model/inference-profile ARNs — not a wildcard across all Bedrock
         models, matching this project's existing narrow-scoping precedent
         (the Lambda targets above are scoped to their exact function
         ARNs, not lambda:InvokeFunction on "*").
 
-        Both InvokeModel and InvokeModelWithResponseStream are granted,
-        plus bedrock-mantle:ListModels and bedrock-mantle:CreateInference
+        Covers both `model_id` (Sonnet, the original single-model grant)
+        and `haiku_model_id` (added for the tiered ModelRouter — see
+        agent.py's build_model()/DESIGN.md's model-routing decision) on
+        one shared statement, since both are plain
+        `bedrock:InvokeModel`/`InvokeModelWithResponseStream` grants
+        differing only by resource ARN — no reason to duplicate the
+        action list across two statements. Both InvokeModel and
+        InvokeModelWithResponseStream are granted for each, plus
+        bedrock-mantle:ListModels and bedrock-mantle:CreateInference
         (scoped to this account/region's default Bedrock Mantle project)
         and bedrock-mantle:CallWithBearerToken — the exact action set
         AWS's own AmazonBedrockMantleInferenceAccess managed policy
@@ -664,17 +730,20 @@ class GatewayStack(Stack):
         this scoped no more broadly than what's actually needed, matching
         this project's existing narrow-scoping precedent (the Lambda
         targets above are scoped to their exact function ARNs, not
-        lambda:InvokeFunction on "*"). `model_id` (e.g.
-        "us.anthropic.claude-sonnet-5") is a cross-region inference
-        profile ID, not a plain foundation-model ID — its ARN uses the
-        `inference-profile` resource type, not `foundation-model`
-        (confirmed against AWS's own IAM policy examples for inference
-        profiles). ListModels/CreateInference need the account's default
-        Bedrock Mantle project ARN
+        lambda:InvokeFunction on "*"). Both `model_id` (e.g.
+        "us.anthropic.claude-sonnet-5") and `haiku_model_id` are
+        cross-region inference profile IDs, not plain foundation-model
+        IDs — their ARNs use the `inference-profile` resource type, not
+        `foundation-model` (confirmed against AWS's own IAM policy
+        examples for inference profiles). ListModels/CreateInference need
+        the account's default Bedrock Mantle project ARN
         (arn:aws:bedrock-mantle:{region}:{account}:project/default,
         confirmed against AWS's own "Projects (OpenAI-compatible)" doc
         example) — CallWithBearerToken has no resource-level scoping
         available (its own managed-policy example uses Resource: "*").
+        This is a single project-level grant regardless of how many
+        models are routed to — CreateInference/ListModels aren't
+        model-scoped, unlike InvokeModel itself.
 
         Returns the last statement's AddToPrincipalPolicyResult so the
         caller can make the inference target's creation explicitly
@@ -691,6 +760,7 @@ class GatewayStack(Stack):
                 ],
                 resources=[
                     f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/{model_id}",
+                    f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/{haiku_model_id}",
                 ],
             )
         )

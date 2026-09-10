@@ -127,6 +127,19 @@ env = cdk.Environment(region="us-east-1")
 # rather than a third place this string could silently drift.
 model_id = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-5")
 
+# Cheap-tier/classifier model ID for the ModelRouter-based tiered
+# inference path (see agent/agent.py's build_model()) — same
+# single-source-of-truth treatment as model_id above, threaded into both
+# GatewayStack (IAM/rate-limit scoping for a second model) and
+# RuntimeStack (the HAIKU_MODEL_ID env var agent.py reads). Default
+# confirmed live via `aws bedrock get-inference-profile` as a real,
+# ACTIVE, SYSTEM_DEFINED cross-region inference profile in this account
+# (same "us."-prefix convention as model_id's own default) — not
+# guessed from documentation alone.
+haiku_model_id = os.environ.get(
+    "HAIKU_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+
 tools_stack = ToolsStack(app, "TravelAgentToolsStack", env=env)
 
 # GatewayStack's JWT authorizer is optional and independent of WebStack —
@@ -162,6 +175,7 @@ gateway_stack = GatewayStack(
     weather_function=tools_stack.weather_function,
     places_function=tools_stack.places_function,
     model_id=model_id,
+    haiku_model_id=haiku_model_id,
     gateway_oidc_discovery_url=gateway_oidc_discovery_url,
     gateway_oidc_allowed_audience=gateway_oidc_allowed_audience,
     gateway_oidc_allowed_clients=gateway_oidc_allowed_clients,
@@ -221,6 +235,7 @@ runtime_stack = RuntimeStack(
     gateway=gateway_stack.gateway,
     memory=memory_stack.memory,
     model_id=model_id,
+    haiku_model_id=haiku_model_id,
     runtime_oidc_discovery_url=runtime_oidc_discovery_url,
     runtime_oidc_allowed_audience=runtime_oidc_allowed_audience,
     runtime_oidc_allowed_clients=runtime_oidc_allowed_clients,

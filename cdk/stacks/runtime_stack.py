@@ -135,6 +135,7 @@ class RuntimeStack(Stack):
         gateway: agentcore.IGateway,
         memory: agentcore.IMemory,
         model_id: str,
+        haiku_model_id: str,
         runtime_oidc_discovery_url: str | None = None,
         runtime_oidc_allowed_audience: list[str] | None = None,
         runtime_oidc_allowed_clients: list[str] | None = None,
@@ -244,6 +245,13 @@ class RuntimeStack(Stack):
                 "MEMORY_ID": memory.memory_id,
                 "AWS_REGION": self.region,
                 "MODEL_ID": model_id,
+                # Cheap-tier/classifier model ID for the ModelRouter-based
+                # tiered inference path (see agent.py's build_model()) —
+                # threaded through the same single-source-of-truth pattern
+                # as MODEL_ID above (cdk/app.py reads HAIKU_MODEL_ID once,
+                # passes it to both GatewayStack's IAM/rate-limit scoping
+                # and here), rather than a second hardcoded copy.
+                "HAIKU_MODEL_ID": haiku_model_id,
                 # Gateway's inference target base URL (see
                 # GatewayStack._add_inference_target()) — required.
                 # agent.py's build_model() is the sole model-call path

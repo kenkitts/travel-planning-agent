@@ -18,6 +18,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 _AGENT_DIR = Path(__file__).resolve().parents[1] / "agent"
@@ -63,6 +64,13 @@ class _FakeAgent:
     def __init__(self, events, messages=None):
         self._events = events
         self.messages = messages or []
+        # stream_agent_turn() registers its routing-observability hook
+        # unconditionally (see agent.py) — this fixture only needs a
+        # working hooks.add_callback() no-op, not a real ModelRouter, for
+        # every test that isn't specifically about routing observability.
+        # RoutingObservabilityTests below builds a real ModelRouter/Agent
+        # pair instead of using this fixture.
+        self.hooks = SimpleNamespace(add_callback=lambda *_a, **_kw: None)
 
     async def stream_async(self, _user_message, **_kwargs):
         for event in self._events:
@@ -715,13 +723,69 @@ class BuildMcpClientTests(unittest.TestCase):
             self.assertEqual(fake_get_token.await_count, 2)
 
 
-class BuildModelTests(unittest.TestCase):
-    """Covers build_model()'s sole model-call path (Gateway-routed
-    AnthropicModel) — see DESIGN.md's "Gateway-routed inference mandatory"
-    decision, superseding the earlier opt-in design with a direct
-    BedrockModel fallback. Mirrors BuildMcpClientTests' setUp/tearDown/
-    patching conventions, since both functions read the same
-    module-level OBO config and token cache.
+class BedrockModelIdForGatewayTests(unittest.TestCase):
+    """Covers _bedrock_model_id_for_gateway()'s explicit per-model mapping
+    directly — see that function's own docstring for why this must be an
+    explicit mapping, not a shared string transformation (Sonnet 5's
+    bedrock-mantle ID happens to equal its bare bedrock-runtime ID; Haiku
+    4.5's is a shorter, distinct alias with the date/version suffix
+    dropped entirely, found live after a real 400/403 in production).
+    """
+
+    def test_maps_sonnet_five_us_prefixed_id(self):
+        self.assertEqual(
+            travel_agent._bedrock_model_id_for_gateway("us.anthropic.claude-sonnet-5"),
+            "anthropic.claude-sonnet-5",
+        )
+
+    def test_maps_sonnet_five_bare_id(self):
+        self.assertEqual(
+            travel_agent._bedrock_model_id_for_gateway("anthropic.claude-sonnet-5"),
+            "anthropic.claude-sonnet-5",
+        )
+
+    def test_maps_haiku_four_five_us_prefixed_id_to_shorter_alias(self):
+        """The real bug: Haiku 4.5's bedrock-mantle ID drops the
+        "-20251001-v1:0" suffix entirely -- it is not a substring of the
+        bedrock-runtime-shaped ID, unlike Sonnet 5's case above."""
+        self.assertEqual(
+            travel_agent._bedrock_model_id_for_gateway(
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            ),
+            "anthropic.claude-haiku-4-5",
+        )
+
+    def test_maps_haiku_four_five_bare_id_to_shorter_alias(self):
+        self.assertEqual(
+            travel_agent._bedrock_model_id_for_gateway(
+                "anthropic.claude-haiku-4-5-20251001-v1:0"
+            ),
+            "anthropic.claude-haiku-4-5",
+        )
+
+    def test_raises_for_unknown_model_id(self):
+        """Fails loudly for an unmapped model ID rather than guessing a
+        transformation — a wrong guess here fails the same way the real
+        Haiku bug did (a live 400/403 from bedrock-mantle), just later
+        and less clearly."""
+        with self.assertRaises(ValueError):
+            travel_agent._bedrock_model_id_for_gateway("anthropic.claude-opus-4-8")
+
+
+class BuildModelRouterTests(unittest.TestCase):
+    """Covers build_model_router()'s construction-time wiring — the tiered
+    ModelRouter/ClassifierStrategy path that replaced the single-model
+    build_model() (see DESIGN.md's model-routing decision). Mirrors
+    BuildMcpClientTests' setUp/tearDown/patching conventions, since both
+    functions read the same module-level OBO config and token cache.
+
+    Per this feature's own design interview (construction-time wiring
+    only, no simulated routing-decision tests): asserts on how the 3
+    AnthropicModel instances (2 serving candidates + 1 classifier) were
+    constructed — correct model IDs, the shared token, classifier config
+    — never on which candidate ClassifierStrategy would actually pick for
+    a given message. That judgment call is validated via live testing
+    only, not unit tests (see PLAN.md's phase write-up for this feature).
     """
 
     def setUp(self):
@@ -744,74 +808,157 @@ class BuildModelTests(unittest.TestCase):
         travel_agent.GATEWAY_INFERENCE_URL = ""
 
         with self.assertRaises(RuntimeError):
-            asyncio_run(travel_agent.build_model())
+            asyncio_run(travel_agent.build_model_router())
 
     def test_raises_when_inference_url_set_but_no_workload_token(self):
         travel_agent.GATEWAY_INFERENCE_URL = "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
         travel_agent.BedrockAgentCoreContext.set_workload_access_token("")
 
         with self.assertRaises(RuntimeError):
-            asyncio_run(travel_agent.build_model())
+            asyncio_run(travel_agent.build_model_router())
 
-    def test_returns_anthropic_model_via_gateway(self):
+    def _build_router_with_fake_token(self, fake_token="fake-gateway-jwt"):
+        """Shared setup: build a real ModelRouter with a mocked OBO exchange."""
         travel_agent.GATEWAY_INFERENCE_URL = (
             "https://example-gateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference"
         )
         travel_agent.GATEWAY_OBO_PROVIDER_NAME = "travel-planning-agent-gateway-obo"
         travel_agent.BedrockAgentCoreContext.set_workload_access_token("fake-workload-token")
 
-        fake_get_token = AsyncMock(return_value="fake-gateway-jwt")
-        with patch.object(travel_agent, "IdentityClient") as fake_identity_client_cls:
-            fake_identity_client_cls.return_value.get_token = fake_get_token
+        fake_get_token = AsyncMock(return_value=fake_token)
+        patcher = patch.object(travel_agent, "IdentityClient")
+        fake_identity_client_cls = patcher.start()
+        self.addCleanup(patcher.stop)
+        fake_identity_client_cls.return_value.get_token = fake_get_token
+        router = asyncio_run(travel_agent.build_model_router())
+        return router, fake_get_token
 
-            model = asyncio_run(travel_agent.build_model())
+    def test_returns_model_router_with_two_serving_candidates(self):
+        router, _ = self._build_router_with_fake_token()
 
-            self.assertIsInstance(model, travel_agent.AnthropicModel)
-            # Gateway-routed calls need the bare foundation-model ID
-            # (e.g. "anthropic.claude-sonnet-5"), not MODEL_ID's own
-            # "us."-prefixed cross-region-inference-profile form — found
-            # live: routing "us.anthropic.claude-sonnet-5" through the
-            # Gateway's bedrock-mantle connector target returned a real
-            # 404 ("Model ... not found on any target"), since that
-            # prefix is a bedrock-runtime/Converse-specific concept the
-            # connector's own model routing doesn't resolve. Stripped
-            # inline in build_model() now (no separate module constant).
-            expected_gateway_model_id = (
-                travel_agent.MODEL_ID[len("us.") :]
-                if travel_agent.MODEL_ID.startswith("us.")
-                else travel_agent.MODEL_ID
-            )
-            self.assertEqual(model.config["model_id"], expected_gateway_model_id)
-            self.assertNotEqual(model.config["model_id"], travel_agent.MODEL_ID)
-            # AnthropicModel stores client_args on its underlying client
-            # rather than exposing them directly — confirm the Bearer
-            # token and base_url actually reached the Anthropic client
-            # instance via its httpx client's configured auth/base_url,
-            # which is the only externally-observable proof they were
-            # passed through correctly.
-            anthropic_client = model.client
-            self.assertEqual(str(anthropic_client.base_url).rstrip("/"), travel_agent.GATEWAY_INFERENCE_URL)
+        self.assertIsInstance(router, travel_agent.ModelRouter)
+        self.assertEqual(len(router.candidates), 2)
+        names = {candidate.name for candidate in router.candidates}
+        self.assertEqual(names, {"capable", "cheap"})
+
+    def test_capable_candidate_is_declared_first_as_router_default(self):
+        """The capable (Sonnet) candidate is router.candidates[0] — the
+        router's own default when a strategy declines — so a classifier
+        failure fails toward the safer, more capable option rather than
+        silently under-serving a request."""
+        router, _ = self._build_router_with_fake_token()
+
+        self.assertEqual(router.candidates[0].name, "capable")
+        self.assertEqual(router.candidates[1].name, "cheap")
+
+    def test_serving_candidates_use_correct_bare_model_ids(self):
+        """Gateway-routed calls need each model's bedrock-mantle-specific
+        ID, not the bedrock-runtime-shaped MODEL_ID/HAIKU_MODEL_ID values —
+        found live (see _bedrock_model_id_for_gateway()'s docstring).
+        Asserts the real, AWS-documented mapped values directly (not just
+        "whatever _bedrock_model_id_for_gateway() itself returns") so a
+        future accidental change to that function's mapping is actually
+        caught, not just confirmed self-consistent."""
+        router, _ = self._build_router_with_fake_token()
+
+        expected_capable_id = travel_agent._bedrock_model_id_for_gateway(travel_agent.MODEL_ID)
+        expected_cheap_id = travel_agent._bedrock_model_id_for_gateway(travel_agent.HAIKU_MODEL_ID)
+        self.assertNotEqual(expected_capable_id, travel_agent.MODEL_ID)
+        self.assertNotEqual(expected_cheap_id, travel_agent.HAIKU_MODEL_ID)
+        # Real values confirmed against AWS's own per-model "Programmatic
+        # Access" documentation table (bedrock-mantle row) — Sonnet 5's
+        # bedrock-mantle ID happens to equal its bare bedrock-runtime ID;
+        # Haiku 4.5's is a shorter, distinct alias with the date/version
+        # suffix dropped entirely, not a substring of its bedrock-runtime ID.
+        self.assertEqual(expected_capable_id, "anthropic.claude-sonnet-5")
+        self.assertEqual(expected_cheap_id, "anthropic.claude-haiku-4-5")
+
+        by_name = {candidate.name: candidate.model for candidate in router.candidates}
+        self.assertEqual(by_name["capable"].config["model_id"], expected_capable_id)
+        self.assertEqual(by_name["cheap"].config["model_id"], expected_cheap_id)
+
+    def test_serving_candidates_share_the_gateway_token_and_url(self):
+        router, fake_get_token = self._build_router_with_fake_token(fake_token="fake-gateway-jwt")
+
+        for candidate in router.candidates:
+            anthropic_client = candidate.model.client
             self.assertEqual(
-                anthropic_client.auth_token,
-                "fake-gateway-jwt",
+                str(anthropic_client.base_url).rstrip("/"), travel_agent.GATEWAY_INFERENCE_URL
             )
-            fake_get_token.assert_awaited_once_with(
-                provider_name="travel-planning-agent-gateway-obo",
-                scopes=[travel_agent.GATEWAY_OBO_SCOPE],
-                audiences=[travel_agent.GATEWAY_OBO_AUDIENCE],
-                agent_identity_token="fake-workload-token",
-                auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
-                custom_parameters={
-                    "subject_token_type": travel_agent.GATEWAY_OBO_SUBJECT_TOKEN_TYPE
-                },
-            )
+            self.assertEqual(anthropic_client.auth_token, "fake-gateway-jwt")
 
-    def test_reuses_cached_obo_token_across_mcp_client_and_model(self):
-        """Question 1 of this feature's design interview: build_model()
-        and build_mcp_client() must share the same OBO token cache entry
-        for the same caller, not perform two independent exchanges.
-        Requires a real request-header sub claim to resolve a cache key
-        at all — mirrors BuildMcpClientTests.test_obo_token_is_cached_per_sub_across_calls()'s
+        # One token authenticates both serving candidates AND the
+        # classifier (3 model roles total) — only one exchange call, not
+        # three, since the token is fetched once in build_model_router()
+        # and reused for every construction (see that function's own
+        # docstring on why this is correct, not just an optimization).
+        fake_get_token.assert_awaited_once()
+
+    def test_classifier_uses_cheap_model_and_small_max_tokens(self):
+        """The classifier reuses HAIKU_MODEL_ID (matching Strands' own
+        docs example of a small/cheap/deterministic classifier model —
+        not a third, separate model) with max_tokens=64, since its only
+        job is a one-field structured-output decision, not real
+        generation."""
+        router, _ = self._build_router_with_fake_token()
+
+        strategy = router._strategy
+        self.assertIsInstance(strategy, travel_agent.ClassifierStrategy)
+        classifier_model = strategy._model
+        expected_classifier_id = travel_agent._bedrock_model_id_for_gateway(
+            travel_agent.HAIKU_MODEL_ID
+        )
+        self.assertEqual(classifier_model.config["model_id"], expected_classifier_id)
+        self.assertEqual(classifier_model.config["max_tokens"], 64)
+
+    def test_haiku_candidates_do_not_enable_adaptive_thinking(self):
+        """The real live bug this feature hit: Claude Haiku 4.5 does not
+        support adaptive/extended thinking at all, and Anthropic's API
+        correctly 400s any request carrying the "thinking" param for it
+        ("adaptive thinking is not supported on this model") -- this
+        broke both the cheap serving candidate (whenever actually
+        selected to serve a turn) and the classifier (every single turn,
+        since it always runs first), confirmed via a temporary diagnostic
+        that called classifier_model.structured_output() directly and
+        logged the real exception body. Neither the cheap serving
+        candidate nor the classifier model must have a "thinking" param;
+        only the capable (Sonnet) candidate, which does support it."""
+        router, _ = self._build_router_with_fake_token()
+
+        by_name = {candidate.name: candidate.model for candidate in router.candidates}
+        cheap_model = by_name["cheap"]
+        capable_model = by_name["capable"]
+        classifier_model = router._strategy._model
+
+        self.assertIsNone(cheap_model.config.get("params"))
+        self.assertIsNone(classifier_model.config.get("params"))
+        self.assertIsNotNone(capable_model.config.get("params"))
+        self.assertIn("thinking", capable_model.config["params"])
+
+    def test_classifier_uses_this_agents_routing_policy_system_prompt(self):
+        router, _ = self._build_router_with_fake_token()
+
+        strategy = router._strategy
+        self.assertEqual(strategy._system_prompt, travel_agent._ROUTING_POLICY_SYSTEM_PROMPT)
+
+    def test_classifier_and_serving_candidates_are_distinct_model_instances(self):
+        """ModelRouter itself rejects duplicate model instances across
+        candidates (see its own construction guards) — this test would
+        have failed at construction time with a ValueError if the cheap
+        serving candidate and the classifier accidentally shared one
+        AnthropicModel object instead of two separate ones."""
+        router, _ = self._build_router_with_fake_token()
+
+        cheap_model = next(c.model for c in router.candidates if c.name == "cheap")
+        classifier_model = router._strategy._model
+        self.assertIsNot(cheap_model, classifier_model)
+
+    def test_reuses_cached_obo_token_across_mcp_client_and_router(self):
+        """This feature's design interview: build_model_router() and
+        build_mcp_client() must share the same OBO token cache entry for
+        the same caller, not perform two independent exchanges. Requires
+        a real request-header sub claim to resolve a cache key at all —
+        mirrors BuildMcpClientTests.test_obo_token_is_cached_per_sub_across_calls()'s
         exact setup for that reason."""
         travel_agent.GATEWAY_URL = "https://example-gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
         travel_agent.GATEWAY_INFERENCE_URL = (
@@ -829,14 +976,130 @@ class BuildModelTests(unittest.TestCase):
             fake_identity_client_cls.return_value.get_token = fake_get_token
 
             asyncio_run(travel_agent.build_mcp_client())
-            asyncio_run(travel_agent.build_model())
+            asyncio_run(travel_agent.build_model_router())
 
             # Only the first call (build_mcp_client()) actually
-            # exchanges — build_model()'s call is a cache hit.
+            # exchanges — build_model_router()'s call (all 3 model roles)
+            # is a cache hit.
             fake_get_token.assert_awaited_once()
 
 
-class BuildSkillsPluginTests(unittest.TestCase):
+class RoutingObservabilityTests(unittest.TestCase):
+    """Covers _selected_candidate_name() and stream_agent_turn()'s
+    "routing" SSE event — the observability half of this feature's
+    design (a CloudWatch log line plus a diagnostic-panel event
+    surfacing which ModelRouter candidate served each turn). Uses a
+    REAL ModelRouter/Agent pair (no fakes), since the behavior under
+    test is reading Strands' own internal per-invocation routing state,
+    which only a real router populates correctly.
+    """
+
+    @staticmethod
+    def _fake_anthropic_model(label):
+        """A minimal stateless Model double — real AnthropicModel
+        construction needs a live client, which isn't needed here since
+        only the router/hook machinery is under test, not any actual
+        Anthropic API shape. Subclasses strands.models.model.Model
+        directly (its real abstract base) rather than AnthropicModel
+        itself."""
+        from strands.models.model import Model as _StrandsModel
+
+        class _FakeModel(_StrandsModel):
+            def __init__(self):
+                self._config = {"model_id": label}
+
+            def update_config(self, **kwargs):
+                self._config.update(kwargs)
+
+            def get_config(self):
+                return self._config
+
+            async def structured_output(self, output_model, prompt, system_prompt=None, **kwargs):
+                yield {"output": output_model(selected_candidate_index=0)}
+
+            async def stream(self, *_args, **_kwargs):
+                yield {"messageStart": {"role": "assistant"}}
+                yield {"messageStop": {"stopReason": "end_turn"}}
+
+        return _FakeModel()
+
+    def test_selected_candidate_name_reads_real_router_state(self):
+        """End-to-end through a real strands.Agent(model=router) turn —
+        confirms the private invocation_state read in
+        _selected_candidate_name() actually reflects ModelRouter's real
+        selection against the installed strands-agents version, not just
+        an assumption about its shape."""
+        from strands import Agent
+        from strands.hooks import AfterModelCallEvent
+
+        cheap = self._fake_anthropic_model("cheap-model")
+        capable = self._fake_anthropic_model("capable-model")
+        router = travel_agent.ModelRouter(
+            models=[
+                travel_agent.RoutingCandidate(capable, name="capable"),
+                travel_agent.RoutingCandidate(cheap, name="cheap"),
+            ],
+        )
+
+        seen_names = []
+
+        async def _capture(event: AfterModelCallEvent) -> None:
+            name = travel_agent._selected_candidate_name(event)
+            if name is not None:
+                seen_names.append(name)
+
+        agent = Agent(model=router, callback_handler=None)
+        agent.hooks.add_callback(AfterModelCallEvent, _capture)
+
+        asyncio_run(agent.invoke_async("hello"))
+
+        # FallbackStrategy (the router's default here, since no
+        # ClassifierStrategy is configured) opens on the first-declared
+        # candidate — "capable" — so this confirms the read reflects a
+        # real selection, not a hardcoded/fallback string.
+        self.assertIn("capable", seen_names)
+
+    def test_selected_candidate_name_returns_none_for_unrelated_event(self):
+        """A plain object with no matching invocation_state key (e.g. a
+        non-routed agent's AfterModelCallEvent) must degrade to None, not
+        raise — this is a purely observational feature."""
+        fake_event = SimpleNamespace(invocation_state={"unrelated-key": object()})
+
+        self.assertIsNone(travel_agent._selected_candidate_name(fake_event))
+
+    def test_stream_agent_turn_emits_routing_event_for_routed_agent(self):
+        """stream_agent_turn() must emit exactly one "routing" event when
+        the agent is actually routed through a real ModelRouter. A
+        non-routed _FakeAgent (no ModelRouter at all) never emits one,
+        per StreamAgentTurnTests' own existing coverage — not because of
+        an isinstance(agent.model, ModelRouter) check (which would never
+        be true even for a genuinely routed agent — see this function's
+        own docstring), but because _selected_candidate_name() finds no
+        matching routing state to report."""
+        from strands import Agent
+
+        cheap = self._fake_anthropic_model("cheap-model")
+        capable = self._fake_anthropic_model("capable-model")
+        router = travel_agent.ModelRouter(
+            models=[
+                travel_agent.RoutingCandidate(capable, name="capable"),
+                travel_agent.RoutingCandidate(cheap, name="cheap"),
+            ],
+        )
+        agent = Agent(model=router, callback_handler=None)
+
+        events = asyncio_run(_collect(travel_agent.stream_agent_turn(agent, "hello")))
+
+        routing_events = [event for event in events if event["type"] == "routing"]
+        self.assertEqual(len(routing_events), 1)
+        self.assertEqual(routing_events[0]["data"]["candidate"], "capable")
+
+
+async def _collect(async_gen):
+    return [event async for event in async_gen]
+
+
+
     """Covers build_skills_plugin() — the AgentSkills plugin wiring for
     agent/skills/. Exercises the real Strands AgentSkills/Agent classes
     (no fakes) since the behavior under test is genuine Strands plugin

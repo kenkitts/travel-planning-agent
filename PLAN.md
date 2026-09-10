@@ -2565,6 +2565,83 @@ direct-`BedrockModel` branch and its associated IAM grant.
   times across the conversation, producing a real, coherent assistant
   response with correct tool use and zero errors/exceptions.
 
+## Phase 28 — AgentCore Gateway WAF 403 root-cause fix for Gateway-routed classifier calls (added 2026-09-09)
+
+Since Phase 27 made Gateway-routed inference mandatory, Strands'
+`ClassifierStrategy` (model routing between cheap/Haiku and
+capable/Sonnet candidates) had been failing 100% of the time in
+production with `PermissionDeniedError` — a bare `403 Forbidden` from an
+AWS-managed ALB (`server: awselb/2.0`), with zero corresponding Gateway
+application log or CloudTrail entries. This phase documents the
+root-cause investigation and the one-line-of-intent fix that resolved
+it. Full investigation detail (every ruled-out theory, the isolated
+`curl` A/B test matrix, and the direct-`bedrock-runtime` reproduction)
+lives in `.kiro/notes/agentcore-gateway-waf-403-root-cause.md` — this
+write-up covers only the high-level arc and the fix itself, per this
+project's established convention of not duplicating full investigation
+notes into PLAN.md/DESIGN.md.
+
+### Investigation summary
+Multiple diagnostic rounds first isolated the failure to the Gateway's
+`bedrock-mantle` inference connector specifically — the identical
+request succeeded when sent directly to `bedrock-runtime`, ruling out
+the model, streaming mode, `structured_output` vs. plain `stream`, and
+JSON well-formedness in turn. With the Gateway/edge layer confirmed as
+the discriminating factor, isolated `curl` A/B testing against the
+Gateway's inference endpoint (varying only a single JSON string field
+per request) pinpointed the exact trigger: an undocumented AWS-managed
+WAF layer in front of the endpoint blocks any JSON string field
+containing `../` or `..\` (backslash) anywhere in its value — not just
+in URL- or path-shaped fields. Tracing that trigger back to this
+codebase found it was always present, unconditionally, in every single
+classifier call: Strands' `ClassifierStrategy` copies the parent agent's
+`system_prompt` verbatim into its classifier context and JSON-escapes
+`<`/`>` as `\u003c`/`\u003e` (expected, correct Strands behavior, not a
+bug in Strands). `agent/prompts.py`'s `SYSTEM_PROMPT` had a literal
+markdown example `` `<user_context>...</user_context>` ``, and escaping
+turned `...</user_context>` into `...\u003c/user_context\u003e` — the
+literal dots immediately followed by the escaped tag's leading
+backslash-u produced `..\u`, an exact match for the WAF trigger, on
+every call. A related AWS re:Post thread
+(https://repost.aws/questions/QUDJVgUFuQRC2sgh6Qx3XB_w/agentcore-inference-gateway-blocks-benign-html-with-403)
+describes the identical `awselb/2.0` bare-403 signature triggered
+instead by benign HTML tokens, suggesting a generic managed WAF ruleset
+(XSS + path-traversal categories) rather than an account-specific issue.
+
+### What was built
+- `agent/prompts.py`: reworded the `SYSTEM_PROMPT` example describing
+  the memory-injection format from a literal
+  `` `<user_context>...</user_context>` `` markdown span to "The system
+  may insert `<user_context>` blocks (each closed by a matching
+  `</user_context>` tag) at the start..." — no ellipsis left adjacent to
+  a tag, so the JSON-escaped form no longer contains `..\`. Also trimmed
+  the overall `SYSTEM_PROMPT` from 4290 to 2804 characters (secondary,
+  harmless improvement made while already editing this text — not
+  required for the fix itself).
+- Deployed via `cdk deploy TravelAgentRuntimeStack`.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 213/213 passing throughout —
+  before, during, and after the fix.
+- `cdk deploy TravelAgentRuntimeStack` reached `UPDATE_COMPLETE`.
+- **Live confirmation in a brand-new conversation session** (required
+  per this project's documented per-session code-pinning behavior —
+  decision #94 — to rule out stale pre-deploy code): sent `"hi"`, which
+  correctly routed to the cheap/Haiku candidate, then a weather
+  question, which correctly routed to the capable/Sonnet candidate —
+  both confirmed via the real success log line (`router.py:259`,
+  `"candidate selected"`), with zero `classifier_error`/
+  `PermissionDeniedError` entries anywhere in the new session's logs.
+
+### Open follow-up
+An AWS Support case remains open to document the underlying AWS
+platform issue (the undocumented WAF layer itself, which blocks benign,
+non-malicious content with no visibility or documented way to
+inspect/tune it from the customer account) — this project's own fix
+works around it but does not resolve it at the source:
+`case-800206160271-muen-2026-2f915626953d8ae2` (display ID
+`178899350400031`), service Bedrock AgentCore, category Gateway.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

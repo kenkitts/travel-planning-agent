@@ -442,7 +442,7 @@ codes, 404 when `--memory-id` is unset). Full suite: 81/81 passing.
 
 ## Phase 8 — JWT Authorization (Okta)
 
-See DESIGN.md §2a (decisions #26–35) for full rationale. Execution order:
+See DESIGN_HISTORY.md §2a (decisions #26–35) for full rationale. Execution order:
 
 - [ ] Register a new, dedicated Okta application for the Travel Agent
       (native/public client, PKCE required, `offline_access` scope) —
@@ -656,7 +656,7 @@ default — it has to be configured explicitly, one-time, per Gateway.
 
 Requested: host the web UI on AWS (ECS Fargate + autoscaling, an ALB with
 OIDC enabled, an existing TLS certificate) instead of everyone running
-`web/server.py` locally. See DESIGN.md §2b (decisions #37-44) for the full
+`web/server.py` locally. See DESIGN_HISTORY.md §2b (decisions #37-44) for the full
 design rationale, gathered via a clarifying-questions pass before any code
 was written.
 
@@ -838,7 +838,7 @@ was written.
 
 Requested: remove the local CLI REPL client entirely — the hosted web UI
 (Phase 10) becomes the only supported way to use the agent. See
-DESIGN.md §2d (decisions #48-49) for the full rationale.
+DESIGN_HISTORY.md §2d (decisions #48-49) for the full rationale.
 
 - [x] Relocated `cli/agent_client.py` → `web/agent_client.py` (pure move,
       docstrings updated to drop CLI references) — `web/server.py`
@@ -935,7 +935,7 @@ DESIGN.md §2d (decisions #48-49) for the full rationale.
 Removes the ALB's `authenticate-oidc` listener action; `web/server.py`
 now runs the entire OAuth 2.0 Authorization Code + PKCE flow against a
 new, dedicated Okta app itself, storing the result in a single,
-KMS-envelope-encrypted session cookie. See DESIGN.md §2e (decisions
+KMS-envelope-encrypted session cookie. See DESIGN_HISTORY.md §2e (decisions
 #50-60) for the full rationale — motivated by a later, not-yet-built
 phase's need for a live, forwardable/exchangeable signed JWT to
 eventually give the AgentCore Gateway real per-user identity for its
@@ -1117,7 +1117,7 @@ tests) after both deploys:
 
 ## Phase 13 — Auth rearchitecture Phase 2: RFC 8693 token exchange replaces IAM/SigV4 for the Runtime (added 2026-08-29)
 
-See DESIGN.md §2f (decisions #63-75) for the full design rationale and
+See DESIGN_HISTORY.md §2f (decisions #63-75) for the full design rationale and
 the two AWS-documentation findings that reshaped this phase mid-design
 (JWT/IAM inbound auth are mutually exclusive per-Runtime, and boto3
 cannot invoke a JWT-authorized Runtime at all).
@@ -1246,7 +1246,7 @@ cannot invoke a JWT-authorized Runtime at all).
 
 ## Phase 14 — Auth rearchitecture Phase 3: Gateway JWT authorizer + RFC 8693 On-Behalf-Of token exchange (added 2026-08-30)
 
-See DESIGN.md §2g (decisions #80-87) for the full design rationale, the
+See DESIGN_HISTORY.md §2g (decisions #80-87) for the full design rationale, the
 AWS Security Blog post this follows almost directly, and the 18
 clarifying-question-and-answer exchange that shaped it before any code
 was written.
@@ -1392,7 +1392,7 @@ was written.
 
 ## Phase 15 — Observability pass: logging, tracing, log retention across all 5 stacks (added 2026-08-31)
 
-See DESIGN.md §2h (decisions #97-104) for the full design rationale,
+See DESIGN_HISTORY.md §2h (decisions #97-104) for the full design rationale,
 including why custom metrics, alarms, and a dashboard were all
 considered and explicitly deferred rather than built this phase, and the
 mid-implementation deviation from the original plan (classic X-Ray SDK
@@ -1498,7 +1498,7 @@ mid-implementation deviation from the original plan (classic X-Ray SDK
 
 ## Phase 16 — Gateway-routed inference for centralized governance (added 2026-09-01)
 
-See DESIGN.md §2i (decisions #106-114) for the full design rationale.
+See DESIGN_HISTORY.md §2i (decisions #106-114) for the full design rationale.
 The originally-implemented approach (a hand-rolled `provider`-type
 inference target against `bedrock-runtime`) was abandoned after two
 successive live-deploy failures and replaced with the built-in
@@ -1599,7 +1599,7 @@ and removed both times before this phase's final state.
 
 ## Phase 17 — Gateway token rate limiting + graceful throttle handling (added 2026-09-02)
 
-See DESIGN.md §2i (decisions #115-118) for the full design rationale.
+See DESIGN_HISTORY.md §2i (decisions #115-118) for the full design rationale.
 The fast-follow decision #112 explicitly deferred from Phase 16 — landed
 now that Phase 16's base routing path is genuinely verified working
 end-to-end, per that same decision's own stated trigger condition.
@@ -1877,7 +1877,7 @@ already-documented failure class behind it.
 
 ## Phase 21 — AWS DevOps Agent integration for on-demand monitoring (added 2026-09-04)
 
-See DESIGN.md §2j (decisions #123-133) for the full design rationale and
+See DESIGN_HISTORY.md §2j (decisions #123-133) for the full design rationale and
 the 11-question clarifying-questions pass that shaped it before any code
 was written.
 
@@ -1980,7 +1980,7 @@ was written.
 
 ## Phase 22 — CloudWatch Alarms + Dashboard fast-follow (added 2026-09-05)
 
-See DESIGN.md §2k (decisions #134-142) for the full design rationale and
+See DESIGN_HISTORY.md §2k (decisions #134-142) for the full design rationale and
 the 8-question clarifying-questions pass that shaped it before any code
 was written. Triggered by a user-requested observability audit that
 re-confirmed decisions #102/#103's original deferral condition ("once the
@@ -2106,7 +2106,7 @@ checked against `ecs describe-services`' event history for the same
 window: `runningCount` stayed at 1 throughout, and the service's routine
 ~6-hour "reached a steady state" cycle (Fargate's own periodic task/
 platform refresh, not a code deployment) was the likely source of the
-metric gap, not an actual outage. See DESIGN.md §2l decision #146.
+metric gap, not an actual outage. See DESIGN_HISTORY.md §2l decision #146.
 
 Fixed by changing `treat_missing_data` from `BREACHING` to
 `NOT_BREACHING`, matching every sibling alarm in this stack. Verified
@@ -2116,7 +2116,7 @@ synthesized template) and the full test suite (199/199, unaffected).
 ### Post-deploy fix: Gateway/Runtime dashboard widgets and alarms had no real data (2026-09-12)
 
 User reported both AgentCore dashboard widgets showing zero datapoints.
-Root cause, findings, and fix fully documented in DESIGN.md §2k decision
+Root cause, findings, and fix fully documented in DESIGN_HISTORY.md §2k decision
 #172 — summary here:
 
 - `cloudwatch:ListMetrics` confirmed AgentCore never publishes a Gateway
@@ -2155,7 +2155,7 @@ Root cause, findings, and fix fully documented in DESIGN.md §2k decision
 
 ## Phase 23 — Logout capability (added 2026-09-05)
 
-See DESIGN.md §2l (decisions #143-144) for the full tier comparison and
+See DESIGN_HISTORY.md §2l (decisions #143-144) for the full tier comparison and
 rationale. Researched Okta's actual logout mechanics (RP-initiated
 logout's `/v1/logout`, and token revocation's `/v1/revoke`) before
 choosing a tier, rather than assuming cookie-clearing alone was
@@ -2228,7 +2228,7 @@ Fixed by adding `NoCacheStaticFiles` (a `StaticFiles` subclass forcing
 and setting the same header explicitly on `/`/`/favicon.ico`. `no-cache`
 (not `no-store`) keeps `ETag` revalidation working — an unchanged file
 after a redeploy still gets a fast `304`. Two regression tests
-(`StaticAssetCachingTests`) lock this in. See DESIGN.md §2l's "Live
+(`StaticAssetCachingTests`) lock this in. See DESIGN_HISTORY.md §2l's "Live
 deployment findings" subsection (decision #145) for the full writeup —
 this is the first bug in this project that only a real user's real
 browser could have caught, not any server-side/live-AWS-state check.
@@ -2418,7 +2418,7 @@ path again.
 
 ## Phase 26 — Identity display + unauthenticated landing page (added 2026-09-06)
 
-See DESIGN.md §2m (decisions #147-157) for the full design rationale.
+See DESIGN_HISTORY.md §2m (decisions #147-157) for the full design rationale.
 Two independent features, both auth-adjacent, gathered via two separate
 `grill-me` clarifying-question passes before implementation.
 
@@ -2487,7 +2487,7 @@ Two independent features, both auth-adjacent, gathered via two separate
 
 ## Phase 27 — Gateway-routed inference made mandatory; direct-Bedrock path removed (added 2026-09-07)
 
-See DESIGN.md §2n (decisions #158-163) for the full rationale. Unlike
+See DESIGN_HISTORY.md §2n (decisions #158-163) for the full rationale. Unlike
 every other "make X mandatory" phase in this project's history, this one
 required **zero auth or infrastructure cutover** — both the Gateway and
 the Runtime were already confirmed live and JWT-only before any code was
@@ -2684,7 +2684,7 @@ works around it but does not resolve it at the source:
 
 ## Phase 29 — Educational prompt caching for ModelRouter serving candidates (added 2026-09-11)
 
-See DESIGN.md §2p (decisions #166-171) for the full design rationale and
+See DESIGN_HISTORY.md §2p (decisions #166-171) for the full design rationale and
 the clarifying-questions pass that shaped it before any code was
 written. Exploratory/learning-oriented, not driven by a bug report or
 cost/latency problem — exercising Anthropic-native prompt caching

@@ -6,7 +6,7 @@ investigation of the travel planning agent's infrastructure via the
 DevOps Agent web app or CLI. Deliberately does NOT wire any CloudWatch
 Alarm to auto-trigger investigations — usage is on-demand only for now,
 revisited once the on-demand flow has been used enough to trust it (see
-DESIGN.md §2j).
+DESIGN_HISTORY.md §2j).
 
 Two IAM roles, matching AWS's own documented CloudFormation reference
 pattern exactly (see "Getting started with AWS DevOps Agent using AWS

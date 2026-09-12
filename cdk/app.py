@@ -56,7 +56,7 @@ Stack wiring:
                   accepted by the Runtime at all.
   DevOpsStack  -> provisions an AWS DevOps Agent Space for on-demand
                   monitoring/investigation of this account's resources
-                  (DESIGN.md §2j). Deliberately independent — no CDK
+                  (DESIGN_HISTORY.md §2j). Deliberately independent — no CDK
                   dependency on, or resource references from, any of the
                   other 4 stacks; its own read access is account-wide by
                   design (see devops_stack.py's module docstring).
@@ -305,7 +305,7 @@ if web_certificate_arn:
     web_stack.add_dependency(runtime_stack)
     web_stack.add_dependency(memory_stack)
 
-# Independent of every other stack (DESIGN.md §2j) — no cross-stack
+# Independent of every other stack (DESIGN_HISTORY.md §2j) — no cross-stack
 # dependency, no imported resource ARNs. Unconditional (unlike WebStack)
 # since it has no external prerequisite comparable to an ACM certificate
 # or an Okta app registration; it only needs this AWS account itself.

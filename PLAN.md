@@ -2642,6 +2642,136 @@ works around it but does not resolve it at the source:
 `case-800206160271-muen-2026-2f915626953d8ae2` (display ID
 `178899350400031`), service Bedrock AgentCore, category Gateway.
 
+## Phase 29 — Educational prompt caching for ModelRouter serving candidates (added 2026-09-11)
+
+See DESIGN.md §2p (decisions #166-171) for the full design rationale and
+the clarifying-questions pass that shaped it before any code was
+written. Exploratory/learning-oriented, not driven by a bug report or
+cost/latency problem — exercising Anthropic-native prompt caching
+directly on the two ModelRouter serving candidates (§2i's model-routing
+feature), verified live rather than only asserted to work.
+
+### What was built
+- `agent/prompts.py`: `build_system_prompt(today_iso)` (the original
+  date-prefix-on-`SYSTEM_PROMPT` function) removed entirely, replaced by
+  `build_current_date_context(today_iso)` — a plain renderer with no
+  `SYSTEM_PROMPT` concatenation, used only by the new context injector
+  below.
+- `agent/agent.py`:
+  - New `build_date_context_injector()`, using Strands'
+    `ContextInjector` (`trigger="userTurn"`) to fold today's date onto
+    the trailing edge of each fresh user turn — never into the system
+    prompt, never into durable history. Added to both `Agent(...)`
+    construction sites' `plugins=` list alongside the existing
+    `build_skills_plugin()`. `invoke()` now passes `SYSTEM_PROMPT`
+    directly (no date-prefix wrapping) to both `Agent(...)` calls.
+  - New `PROMPT_CACHE_TTL` module constant (env var, defaults to unset →
+    `CacheConfig.ttl=None`, i.e. Anthropic's 5-minute API default),
+    following the same env-var-override convention as
+    `MAX_OUTPUT_TOKENS`/`AGENT_MAX_TURNS`.
+  - `_build_gateway_anthropic_model()` gained an `enable_prompt_caching`
+    kwarg (default `False`). When `True`, adds
+    `cache_config=CacheConfig(strategy="anthropic", system_prompt_ttl=True,
+    ttl=PROMPT_CACHE_TTL)` (a cache point after the system prompt) and
+    `cache_tools=CacheToolsConfig(ttl=PROMPT_CACHE_TTL)` (a second cache
+    point after the tool-definitions block).
+  - `build_model_router()` passes `enable_prompt_caching=True` for
+    `cheap_candidate` and `capable_candidate` only — `classifier_model`
+    is left untouched (caching the classifier's own internally-built
+    request is a separate, unverified question, deliberately out of
+    scope for this pass).
+  - New `_turn_cache_usage(result)` helper, reading
+    `result.metrics.accumulated_usage["cacheReadInputTokens"/
+    "cacheWriteInputTokens"]` — confirmed by directly reading
+    `strands.hooks.AfterModelCallEvent`'s source that it carries no
+    usage data at all (`stop_response` is only `{message, stop_reason}`),
+    so this had to come from the final `AgentResult.metrics`, not a
+    hook, correcting an initial assumption.
+  - `stream_agent_turn()` yields one new `{"type": "cache_usage", "data":
+    {"cache_read_input_tokens": ..., "cache_write_input_tokens": ...}}`
+    event immediately before the existing `"done"` event, only when
+    either field is present — silently omitted otherwise, matching the
+    existing `"routing"` event's intentional-silence convention.
+- `web/static/app.js`: no changes needed — confirmed by reading the
+  diagnostic panel's existing event-dispatch logic that any event type
+  not explicitly handled (`text`/`done`/`error`/`reasoning`) already
+  falls through to generic `appendDiagnosticEntry()` rendering, which
+  handles a dict payload correctly.
+- `tests/test_agent.py`: 9 new tests — `BuildModelRouterTests` gained 3
+  (both serving candidates carry `cache_config`/`cache_tools` with
+  `strategy="anthropic"`; the classifier carries neither;
+  `PROMPT_CACHE_TTL` flows through to both configs' `ttl` field, tested
+  by temporarily overriding the module constant). `StreamAgentTurnTests`
+  gained 2 (`cache_usage` event yielded before `done` when
+  `accumulated_usage` is present; silently omitted when absent). New
+  `BuildCurrentDateContextTests` (2: renders the given date;
+  `SYSTEM_PROMPT` no longer contains `"Today's date is"`). New
+  `BuildDateContextInjectorTests` (2, driving the real
+  `strands.injection._message_injection._create_injection_middleware()`
+  with a real `strands._middleware.stages.InvokeModelContext` — not
+  mocks — confirming actual date injection and that the injected text
+  never persists into the original messages list).
+
+### Why this, not alternatives
+- **System prompt + tools, not system-prompt-only** (DESIGN.md decision
+  #166/#167) — a local token-count measurement, done before writing any
+  code, found `SYSTEM_PROMPT` alone (~709 estimated tokens) would not
+  have cleared Claude Haiku 4.5's documented 4,096-token minimum cache
+  threshold on its own; the combined system-prompt-plus-tools scope
+  (~11,009 estimated tokens) clears both Sonnet's (1,024) and Haiku's
+  thresholds with substantial margin.
+- **`ContextInjector`, not a reordered date-prefix string** (decision
+  #169) — the user's original ask was a `current_time` tool; research
+  found `strands_tools.current_time` is deprecated (becomes an error log
+  in a future release) with `ContextInjector` as its own documented
+  migration path, and that mechanism structurally keeps injected text
+  downstream of any system-prompt cache point by design (folded onto the
+  trailing edge of the latest user message, never into durable history)
+  — a better fix than either the tool or a manual reorder, surfaced and
+  substituted with the user's explicit confirmation.
+- **TTL left at 5-minute default, 1-hour comparison skipped** (decision
+  #168) — user's explicit direction once the 5-minute deploy was already
+  verified live and working.
+- **Diagnostic-panel event, not a one-off script** (decision #170) —
+  user's explicit choice, for ongoing observability rather than a single
+  proof-then-discard verification.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 222/222 passing (213 baseline +
+  9 new).
+- `cdk synth` (all 7 stacks): clean — this phase touches zero CDK/infra
+  code, only `agent/agent.py`/`agent/prompts.py`/tests.
+- Deployed via `cdk deploy TravelAgentRuntimeStack`
+  (`UPDATE_COMPLETE`, 33.42s), confirmed via `describe-stacks`.
+- **Live, end-to-end confirmation via real X-Ray traces**, in a
+  genuinely new conversation session (per decision #94's per-session
+  code-pinning): one trace shows `gen_ai.request.model=
+  "anthropic.claude-haiku-4-5"` with `cache_write_input_tokens=880`/
+  `cache_read_input_tokens=6238`; a second shows
+  `"anthropic.claude-sonnet-5"` with `cache_write_input_tokens=9672` (a
+  genuine miss/rewrite) immediately followed, within the same turn, by
+  `cache_read_input_tokens=9672` — the model reading back the exact
+  prefix the prior model-call cycle had just written, confirming
+  `cache_control` genuinely survives being proxied through the Gateway's
+  `bedrock-mantle` connector unmodified (the one load-bearing unknown
+  flagged before implementation — resolved: it works). A third trace —
+  the session's slowest turn at 17.628s, investigated after the user
+  raised a throttling concern — showed `HasFault=false`/`HasError=false`/
+  `HasThrottle=false` and `agentcore.gateway.throttle.customer.decision=
+  "allowed"` on every Gateway call, confirming the latency was genuine
+  multi-tool-call LLM processing time (a Sonnet call, a weather-tool
+  execution, then a second Sonnet call), not throttling or a stall. A
+  user-reported large turn-level total (`cache_read_input_tokens=61388`/
+  `cache_write_input_tokens=43006`) was explained, not a bug: `_turn_cache_usage()`'s
+  own documented behavior sums `accumulated_usage` across every
+  model-call cycle in a turn, and that turn had multiple tool calls each
+  contributing their own read/write pairs to the total.
+- CloudWatch's `describe-log-streams`
+  `lastEventTimestamp` field proved stale/unreliable for finding recent
+  activity in this account during this verification; `get-trace-summaries`/
+  `batch-get-traces` (converting the log's raw 32-hex `trace_id` to
+  X-Ray's `1-{first8hex}-{remaining24hex}` format) was the reliable path.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

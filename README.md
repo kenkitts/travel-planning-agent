@@ -375,6 +375,7 @@ The agent reads its configuration from environment variables, set by
 | `GATEWAY_INFERENCE_URL` | `RuntimeStack` | Required — base URL of the Gateway's `bedrock-mantle` inference target. All model calls route through it; there is no direct-Bedrock fallback (see `build_model()`) |
 | `MAX_OUTPUT_TOKENS` | Code-level default in `agent/agent.py` (8192) | Not currently wired as a CDK-set env var — override manually if ever needed |
 | `AGENT_MAX_TURNS` | Code-level default in `agent/agent.py` (30) | Caps agent-loop iterations per turn (`Limits.turns`); not currently wired as a CDK-set env var |
+| `PROMPT_CACHE_TTL` | Code-level default in `agent/agent.py` (unset — Anthropic's own 5-minute API default) | Anthropic-native prompt-caching TTL (`"5m"` or `"1h"`) for the two ModelRouter serving candidates' system-prompt and tool-definition cache points (not the classifier); not currently wired as a CDK-set env var — override manually to compare TTLs |
 
 `MODEL_ID` and the namespace strings in `agent/agent.py` must stay in sync
 with the corresponding constants in `cdk/app.py` and

@@ -87,24 +87,36 @@ itinerary is final.
 """
 
 
-def build_system_prompt(today_iso: str) -> str:
-    """Return SYSTEM_PROMPT with the current date grounded in, for date math.
+def build_current_date_context(today_iso: str) -> str:
+    """Return the per-call date-grounding text for a ContextInjector callback.
 
     The model has no reliable notion of "today" on its own (training data
-    goes stale, and there's no current_time tool — see DESIGN.md for why:
-    strands_tools.current_time is deprecated upstream, with no replacement
-    recommended other than injecting the date as context). Without this,
-    relative requests like "next Friday" or "in two weeks" can't be resolved
-    to real dates, and multi-day itinerary headings (e.g. "Day 1 — <date>")
-    have nothing to anchor to.
+    goes stale, and there's no current_time tool — strands_tools.current_time
+    is deprecated upstream, becoming an error log in a future release, with
+    its own documented migration path being exactly this: inject the current
+    time as context via Strands' ContextInjector plugin rather than call a
+    tool). Without this, relative requests like "next Friday" or "in two
+    weeks" can't be resolved to real dates, and multi-day itinerary headings
+    (e.g. "Day 1 — <date>") have nothing to anchor to.
+
+    Deliberately NOT part of SYSTEM_PROMPT (see agent.py's build_date_context_injector()):
+    ContextInjector folds this text onto the trailing edge of the current
+    call's latest user message — never into the system prompt, and never
+    into durable conversation history — so it can't sit ahead of (or
+    anywhere inside) a cached system-prompt prefix. Anthropic's cache
+    requires an exact prefix match, so a date string glued to the front of
+    the system prompt (this project's original approach, before prompt
+    caching was added) would invalidate that cache once per UTC day at
+    minimum — a real, documented cache-fragmentation failure mode ("Prevent
+    Cache Fragmentation": move timestamps after the cache point).
 
     Args:
         today_iso: Today's date as an ISO 8601 date string (YYYY-MM-DD), in
             the traveler-relevant timezone the caller has chosen.
     """
     return (
-        f"Today's date is {today_iso}. Use this to resolve any relative "
-        "dates the traveler mentions (e.g. \"next Friday\", \"in two "
-        "weeks\") to concrete calendar dates, and to compute day-by-day "
-        "dates for itinerary headings.\n\n" + SYSTEM_PROMPT
+        f"<now>Today's date is {today_iso}. Use this to resolve any "
+        "relative dates the traveler mentions (e.g. \"next Friday\", \"in "
+        "two weeks\") to concrete calendar dates, and to compute day-by-day "
+        "dates for itinerary headings.</now>"
     )

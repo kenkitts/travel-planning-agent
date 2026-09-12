@@ -130,14 +130,16 @@ from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.hooks import AfterModelCallEvent
 from strands.models.anthropic import AnthropicModel
+from strands.models.model import CacheConfig, CacheToolsConfig
 from strands.models.routing import ClassifierStrategy, ModelRouter, RoutingCandidate
 from strands.types.agent import Limits
 from strands.types.exceptions import MaxTokensReachedException, ModelThrottledException
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.vended_plugins.context_injector import ContextInjector
 from strands.vended_plugins.skills import AgentSkills
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
-from prompts import build_system_prompt
+from prompts import SYSTEM_PROMPT, build_current_date_context
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -289,6 +291,23 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
 # ever tripping the token budget, which is the gap this closes.
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "30"))
 
+# TTL for the prompt-cache breakpoints _build_gateway_anthropic_model() adds
+# to the two ModelRouter serving candidates (not the classifier — see that
+# function's own docstring). "5m" (Anthropic's own API default) vs "1h" is
+# a real cost/reuse-window tradeoff, not cosmetic: a 1-hour cache write
+# costs more (2x base input-token rate vs. 1.25x for 5-minute) but survives
+# a longer gap between turns before falling back to a full-price rewrite.
+# Env-var-overridable (not CDK-wired) specifically so this project's own
+# live comparison — deploy with the 5-minute default, observe real
+# cache-read/write behavior via the diagnostic panel, then redeploy with
+# PROMPT_CACHE_TTL=1h and repeat — needs no code change between the two
+# runs, matching this file's existing MAX_OUTPUT_TOKENS/AGENT_MAX_TURNS
+# override convention. An empty string (the default) is treated as "use
+# the API's own 5-minute default" — CacheConfig.ttl=None, not the literal
+# string "5m", since Anthropic's API only requires a TTL value at all when
+# requesting the non-default 1-hour window.
+PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "").strip() or None
+
 # Procedural-knowledge skills (see agent/skills/), loaded via Strands'
 # AgentSkills plugin: lightweight metadata for each skill is injected into
 # the system prompt on every invocation, and the model loads a skill's full
@@ -302,6 +321,44 @@ SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 def build_skills_plugin() -> AgentSkills:
     """Build the AgentSkills plugin, loading every skill under SKILLS_DIR."""
     return AgentSkills(skills=[SKILLS_DIR])
+
+
+def build_date_context_injector() -> ContextInjector:
+    """Build the ContextInjector that folds today's date into fresh user turns.
+
+    Replaces this project's original approach (prepending "Today's date is
+    ..." directly onto SYSTEM_PROMPT, computed once per invoke() call) once
+    prompt caching was added for the two ModelRouter serving candidates (see
+    build_model_router()) — a date glued to the front of the system prompt
+    would invalidate any cache point placed after it once per UTC day at
+    minimum, since Anthropic's cache requires an exact prefix match. See
+    prompts.py's build_current_date_context() docstring for the full
+    rationale, including why this is the officially documented replacement
+    for the deprecated strands_tools.current_time tool, not just a caching
+    workaround.
+
+    trigger="userTurn" (the default, passed explicitly here for clarity) —
+    injects only when the latest message is a fresh user ask, not on
+    intermediate tool-result turns. This matches how this agent actually
+    uses the date (grounding the traveler's own request for relative-date
+    math), not something a mid-tool-loop cycle needs; date math within a
+    tool loop already goes through build_code_interpreter_tool(), not a
+    second read of "today" from context.
+
+    The rendered date is computed fresh on every call (date.today(), not
+    captured once at Agent-construction time) — AgentCore Runtime containers
+    run in UTC, so this is already the correct "today" for any traveler
+    without per-session timezone collection (see prompts.py's requirements
+    list for why that's out of scope). Folded onto the user message, never
+    written to agent.messages/durable history — a conversation resumed on a
+    later day is grounded in that day's real date, not a stale one from
+    whenever the conversation started.
+    """
+    return ContextInjector(
+        lambda context: build_current_date_context(date.today().isoformat()),
+        name="travel-agent:current-date",
+        trigger="userTurn",
+    )
 
 
 def build_code_interpreter_tool():
@@ -480,6 +537,44 @@ def extract_tool_result_text(tool_result: dict) -> str:
     return str(content) if content else ""
 
 
+def _turn_cache_usage(result: Any) -> tuple[Optional[int], Optional[int]]:
+    """Best-effort read of this turn's accumulated prompt-cache token usage.
+
+    Returns (cache_read_input_tokens, cache_write_input_tokens), or (None,
+    None) when no cache usage data is present at all (e.g. prompt caching
+    isn't enabled for this turn's serving candidate, or an older Strands
+    version's AgentResult doesn't carry this field).
+
+    Reads result.metrics.accumulated_usage — a Strands EventLoopMetrics
+    Usage mapping keyed "cacheReadInputTokens"/"cacheWriteInputTokens"
+    (camelCase; confirmed against the installed strands-agents source and
+    Strands' own OpenTelemetry tracer, which reads this exact same field
+    for its "gen_ai.usage.cache_read_input_tokens" span attribute) — NOT
+    strands.hooks.AfterModelCallEvent.stop_response, which was checked
+    directly and confirmed to expose only {message, stop_reason}, no usage
+    data at all.
+
+    accumulated_usage is a TURN-level total (EventLoopMetrics accumulates
+    across every model-call cycle within this one turn — the classifier
+    call plus however many serving-candidate/tool-loop cycles ran), not a
+    per-model-call breakdown. Since this project's classifier is not cache-
+    enabled (see build_model_router()'s scope decision), a nonzero read
+    here reliably indicates the serving candidate's own cache actually hit
+    — but if a future change enables caching on more than one role, this
+    would no longer cleanly attribute cache activity to one specific model
+    call. Deliberately not resolved here (see DESIGN.md's prompt-caching
+    decision): this project's stated verification bar for this feature is
+    "did caching demonstrably activate at all," not "exactly which call."
+    """
+    metrics = getattr(result, "metrics", None)
+    usage = getattr(metrics, "accumulated_usage", None) or {}
+    cache_read = usage.get("cacheReadInputTokens")
+    cache_write = usage.get("cacheWriteInputTokens")
+    if cache_read is None and cache_write is None:
+        return None, None
+    return cache_read, cache_write
+
+
 async def stream_agent_turn(agent: Agent, user_message: str):
     """Run one turn, yielding labeled diagnostic events as they occur.
 
@@ -565,6 +660,17 @@ async def stream_agent_turn(agent: Agent, user_message: str):
     returns None gracefully when there's no routing state to find (a
     non-routed agent), so no "routing" event is ever emitted in that case
     — this is intentionally silent, not an error.
+
+    Emits one "cache_usage" event ({"type": "cache_usage", "data":
+    {"cache_read_input_tokens": int, "cache_write_input_tokens": int}})
+    immediately before the final "done" event, when this turn's
+    AgentResult carries any prompt-cache usage data at all — see
+    _turn_cache_usage()'s own docstring for the exact field this reads and
+    why it's a turn-level total, not a per-model-call breakdown. Silently
+    omitted (no event at all) when neither field is present, the same
+    intentional-silence convention as the "routing" event above — e.g. a
+    turn served entirely by the classifier's own non-cache-enabled request
+    with no serving-candidate call at all would have nothing to report.
     """
     routing_state: dict[str, Optional[str]] = {"candidate": None, "emitted": False}
 
@@ -672,6 +778,15 @@ async def stream_agent_turn(agent: Agent, user_message: str):
                         "data": {"partial_text": partial_text, "note": note},
                     }
                 else:
+                    _cache_read, _cache_write = _turn_cache_usage(result)
+                    if _cache_read is not None or _cache_write is not None:
+                        yield {
+                            "type": "cache_usage",
+                            "data": {
+                                "cache_read_input_tokens": _cache_read or 0,
+                                "cache_write_input_tokens": _cache_write or 0,
+                            },
+                        }
                     yield {"type": "done", "data": extract_response_text(result.message)}
     except MaxTokensReachedException:
         logger.warning("Model hit max_tokens mid-response; ending stream with partial reply")
@@ -832,7 +947,12 @@ def _bedrock_model_id_for_gateway(model_id: str) -> str:
 
 
 def _build_gateway_anthropic_model(
-    model_id: str, gateway_token: str, *, max_tokens: int, enable_adaptive_thinking: bool = True
+    model_id: str,
+    gateway_token: str,
+    *,
+    max_tokens: int,
+    enable_adaptive_thinking: bool = True,
+    enable_prompt_caching: bool = False,
 ) -> AnthropicModel:
     """Build one Gateway-routed AnthropicModel candidate from an already-exchanged token.
 
@@ -865,6 +985,45 @@ def _build_gateway_anthropic_model(
     the diagnostic panel); only the classifier construction passes
     enable_adaptive_thinking=False, since its job is a one-field
     structured-output decision that never needs to think out loud.
+
+    enable_prompt_caching (default False) adds two Anthropic-native
+    ("ephemeral") cache breakpoints, matching this project's educational
+    scope decision to cache the two ModelRouter serving candidates only,
+    not the classifier (see build_model_router()'s own docstring for why
+    caching the classifier's own request is a separate, unverified
+    question left for a future follow-up rather than solved here):
+
+    - cache_config=CacheConfig(strategy="anthropic", system_prompt_ttl=True,
+      ttl=PROMPT_CACHE_TTL) — auto-injects a cache point at the end of the
+      system prompt (SYSTEM_PROMPT is the only system content this project
+      sends, so this is unambiguous). strategy="anthropic" (not "auto") is
+      deliberate: "auto" would additionally probe model support and could
+      silently no-op on an unsupported model, which isn't a concern here
+      since both serving candidates are confirmed-cacheable Claude models —
+      "anthropic" injects unconditionally in Anthropic-compatible format,
+      matching what this function already knows to be true.
+    - cache_tools=CacheToolsConfig(ttl=PROMPT_CACHE_TTL) — a second,
+      independent cache point after the tool-definitions block (the
+      Gateway MCP tools plus the code interpreter tool — see invoke()'s
+      Agent(tools=...) construction). Confirmed via a local token-count
+      measurement (not assumed) that SYSTEM_PROMPT plus this agent's real
+      tool definitions clears both Claude Sonnet 4.5's (1,024) and Claude
+      Haiku 4.5's (4,096) minimum per-cache-point token thresholds with
+      substantial margin — SYSTEM_PROMPT alone (~700 estimated tokens)
+      would NOT have cleared Haiku's threshold on its own, which is why
+      this project's scope decision was "system prompt + tools" together,
+      not system-prompt-only.
+
+    Whether cache_control actually survives being proxied through the
+    Gateway's bedrock-mantle connector unmodified was, at the time this was
+    written, an open, unverified question — AWS's own bedrock-mantle
+    documentation describes the Anthropic Messages API as a first-class
+    supported request format for this connector (not merely an incidental
+    passthrough), but this project's own history with this exact connector
+    (see _bedrock_model_id_for_gateway()'s docstring) already found real,
+    previously-undocumented quirks that only surfaced via live testing —
+    so this was verified live, not assumed: see DESIGN.md's prompt-caching
+    decision for the actual deployed result.
     """
     params = (
         {
@@ -879,8 +1038,8 @@ def _build_gateway_anthropic_model(
         if enable_adaptive_thinking
         else None
     )
-    return AnthropicModel(
-        client_args={
+    model_config: dict[str, Any] = {
+        "client_args": {
             # auth_token sends "Authorization: Bearer <token>" instead of
             # Anthropic's own "x-api-key" header — required here since the
             # Gateway's inbound authorizer validates a JWT bearer token,
@@ -889,14 +1048,20 @@ def _build_gateway_anthropic_model(
             "auth_token": gateway_token,
             "base_url": GATEWAY_INFERENCE_URL,
         },
-        model_id=_bedrock_model_id_for_gateway(model_id),
-        max_tokens=max_tokens,
+        "model_id": _bedrock_model_id_for_gateway(model_id),
+        "max_tokens": max_tokens,
         # Enables the "reasoning" stream_agent_turn() event (Claude's
         # extended-thinking content) for the diagnostic panel — see this
         # function's own docstring for why this is conditional, not
         # always applied.
-        params=params,
-    )
+        "params": params,
+    }
+    if enable_prompt_caching:
+        model_config["cache_config"] = CacheConfig(
+            strategy="anthropic", system_prompt_ttl=True, ttl=PROMPT_CACHE_TTL
+        )
+        model_config["cache_tools"] = CacheToolsConfig(ttl=PROMPT_CACHE_TTL)
+    return AnthropicModel(**model_config)
 
 
 async def build_model_router() -> ModelRouter:
@@ -988,7 +1153,11 @@ async def build_model_router() -> ModelRouter:
 
     cheap_candidate = RoutingCandidate(
         _build_gateway_anthropic_model(
-            HAIKU_MODEL_ID, gateway_token, max_tokens=MAX_OUTPUT_TOKENS, enable_adaptive_thinking=False
+            HAIKU_MODEL_ID,
+            gateway_token,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            enable_adaptive_thinking=False,
+            enable_prompt_caching=True,
         ),
         name="cheap",
         description=(
@@ -998,7 +1167,9 @@ async def build_model_router() -> ModelRouter:
         ),
     )
     capable_candidate = RoutingCandidate(
-        _build_gateway_anthropic_model(MODEL_ID, gateway_token, max_tokens=MAX_OUTPUT_TOKENS),
+        _build_gateway_anthropic_model(
+            MODEL_ID, gateway_token, max_tokens=MAX_OUTPUT_TOKENS, enable_prompt_caching=True
+        ),
         name="capable",
         description=(
             "Higher-capability model for turns likely to need tool calls (weather, places, "
@@ -1006,6 +1177,12 @@ async def build_model_router() -> ModelRouter:
             "anything mentioning specific dates/places/weather, or budget arithmetic."
         ),
     )
+    # enable_prompt_caching intentionally omitted here — caching the
+    # classifier's own request is a separate, unverified question (does
+    # ClassifierStrategy expose any control over the request it builds
+    # internally?) explicitly left out of this project's educational
+    # prompt-caching scope; see build_model_router()'s own module-level
+    # decision record in DESIGN.md.
     classifier_model = _build_gateway_anthropic_model(
         HAIKU_MODEL_ID, gateway_token, max_tokens=64, enable_adaptive_thinking=False
     )
@@ -1311,22 +1488,15 @@ async def invoke(payload: dict, context: Any = None):
     session_manager = build_session_manager(actor_id, session_id)
     mcp_client = await build_mcp_client()
     model = await build_model_router()
-    # UTC "today" — there's no per-traveler timezone collected from the
-    # conversation (see prompts.py's requirements list), so this is the only
-    # unambiguous default. AgentCore Runtime containers run in UTC, so
-    # date.today() is already UTC here. At day granularity this only
-    # misaligns with a traveler's actual local date within a few hours of
-    # UTC midnight, which doesn't meaningfully affect itinerary date math.
-    system_prompt = build_system_prompt(date.today().isoformat())
 
     if mcp_client is None:
         agent = Agent(
             model=model,
             tools=[build_code_interpreter_tool()],
-            system_prompt=system_prompt,
+            system_prompt=SYSTEM_PROMPT,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
-            plugins=[build_skills_plugin()],
+            plugins=[build_skills_plugin(), build_date_context_injector()],
         )
         async for event in stream_agent_turn(agent, user_message):
             yield event
@@ -1339,10 +1509,10 @@ async def invoke(payload: dict, context: Any = None):
         agent = Agent(
             model=model,
             tools=[build_code_interpreter_tool()] + tools,
-            system_prompt=system_prompt,
+            system_prompt=SYSTEM_PROMPT,
             session_manager=session_manager,
             conversation_manager=build_conversation_manager(),
-            plugins=[build_skills_plugin()],
+            plugins=[build_skills_plugin(), build_date_context_injector()],
         )
         async for event in stream_agent_turn(agent, user_message):
             yield event

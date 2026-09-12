@@ -17,6 +17,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -449,6 +450,52 @@ class StreamAgentTurnTests(unittest.TestCase):
         events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a trip"))
 
         self.assertEqual(events[-1], {"type": "done", "data": "Final answer."})
+
+    def test_yields_cache_usage_event_before_done_when_usage_present(self):
+        class _FakeMetrics:
+            accumulated_usage = {
+                "inputTokens": 500,
+                "outputTokens": 50,
+                "totalTokens": 550,
+                "cacheReadInputTokens": 1200,
+                "cacheWriteInputTokens": 0,
+            }
+
+        class _FakeResult:
+            message = {"role": "assistant", "content": [{"text": "Final answer."}]}
+            stop_reason = "end_turn"
+            metrics = _FakeMetrics()
+
+        fake_agent = _FakeAgent([{"result": _FakeResult()}])
+
+        events = _run_async(travel_agent.stream_agent_turn(fake_agent, "Plan a trip"))
+
+        self.assertEqual(
+            events,
+            [
+                {
+                    "type": "cache_usage",
+                    "data": {"cache_read_input_tokens": 1200, "cache_write_input_tokens": 0},
+                },
+                {"type": "done", "data": "Final answer."},
+            ],
+        )
+
+    def test_omits_cache_usage_event_when_no_usage_data_present(self):
+        """The classifier-only-served-with-no-caching case, and any older
+        Strands version whose AgentResult carries no accumulated_usage at
+        all — no "cache_usage" event should appear, matching the "routing"
+        event's own intentional-silence convention."""
+        class _FakeResult:
+            message = {"role": "assistant", "content": [{"text": "Hi there!"}]}
+            stop_reason = "end_turn"
+            # No metrics attribute at all.
+
+        fake_agent = _FakeAgent([{"result": _FakeResult()}])
+
+        events = _run_async(travel_agent.stream_agent_turn(fake_agent, "hi"))
+
+        self.assertEqual(events, [{"type": "done", "data": "Hi there!"}])
 
     def test_passes_turns_limit_to_stream_async(self):
         captured_kwargs = {}
@@ -953,6 +1000,53 @@ class BuildModelRouterTests(unittest.TestCase):
         classifier_model = router._strategy._model
         self.assertIsNot(cheap_model, classifier_model)
 
+    def test_serving_candidates_have_prompt_caching_enabled(self):
+        """Educational prompt-caching scope decision: both serving
+        candidates get cache_config (system-prompt cache point) and
+        cache_tools (tool-definitions cache point) — the classifier does
+        not (see test_classifier_has_no_prompt_caching below)."""
+        router, _ = self._build_router_with_fake_token()
+
+        for candidate in router.candidates:
+            self.assertIn(
+                "cache_config",
+                candidate.model.config,
+                f"{candidate.name} candidate is missing cache_config",
+            )
+            self.assertIsInstance(candidate.model.config["cache_config"], travel_agent.CacheConfig)
+            self.assertEqual(candidate.model.config["cache_config"].strategy, "anthropic")
+            self.assertTrue(candidate.model.config["cache_config"].system_prompt_ttl)
+            self.assertIn("cache_tools", candidate.model.config)
+            self.assertIsInstance(candidate.model.config["cache_tools"], travel_agent.CacheToolsConfig)
+
+    def test_classifier_has_no_prompt_caching(self):
+        """Caching the classifier's own request is a separate, unverified
+        question (does ClassifierStrategy expose any control over the
+        request it builds internally?) explicitly left out of this
+        project's educational prompt-caching scope."""
+        router, _ = self._build_router_with_fake_token()
+
+        classifier_model = router._strategy._model
+        self.assertNotIn("cache_config", classifier_model.config)
+        self.assertNotIn("cache_tools", classifier_model.config)
+
+    def test_cache_ttl_follows_prompt_cache_ttl_module_constant(self):
+        """PROMPT_CACHE_TTL is env-var-overridable (default None -> the
+        API's own 5-minute default) specifically so this project's live
+        5-min-vs-1-hour comparison needs no code change between runs —
+        confirm both candidates' cache config actually reads the current
+        value of that module constant, not a hardcoded literal."""
+        original_ttl = travel_agent.PROMPT_CACHE_TTL
+        try:
+            travel_agent.PROMPT_CACHE_TTL = "1h"
+            router, _ = self._build_router_with_fake_token()
+
+            for candidate in router.candidates:
+                self.assertEqual(candidate.model.config["cache_config"].ttl, "1h")
+                self.assertEqual(candidate.model.config["cache_tools"].ttl, "1h")
+        finally:
+            travel_agent.PROMPT_CACHE_TTL = original_ttl
+
     def test_reuses_cached_obo_token_across_mcp_client_and_router(self):
         """This feature's design interview: build_model_router() and
         build_mcp_client() must share the same OBO token cache entry for
@@ -1149,6 +1243,82 @@ async def _collect(async_gen):
         result = asyncio_run(plugin.skills(skill_name="trip-pacing", tool_context=tool_context))
 
         self.assertIn("Cap outdoor activity count per day", result)
+
+
+class BuildCurrentDateContextTests(unittest.TestCase):
+    """Covers prompts.build_current_date_context() — the text
+    build_date_context_injector() folds into fresh user turns, replacing
+    this project's original date-prefix-on-SYSTEM_PROMPT approach once
+    prompt caching was added (see DESIGN.md's prompt-caching decision)."""
+
+    def test_renders_the_given_date(self):
+        text = travel_agent.build_current_date_context("2026-09-11")
+
+        self.assertIn("2026-09-11", text)
+        self.assertIn("<now>", text)
+
+    def test_system_prompt_no_longer_contains_a_date_placeholder(self):
+        """Regression guard for the actual bug this change fixes: SYSTEM_PROMPT
+        itself must never again gain a literal date/today's-date string —
+        that would sit ahead of the cache_config system-prompt cache point
+        and silently defeat caching once per day. This is deliberately a
+        loose substring check (not asserting exact SYSTEM_PROMPT content),
+        since the whole point is catching an accidental future
+        reintroduction of this pattern by name, not pinning the prompt's
+        wording."""
+        self.assertNotIn("Today's date is", travel_agent.SYSTEM_PROMPT)
+
+
+class BuildDateContextInjectorTests(unittest.TestCase):
+    """Exercises the real ContextInjector plugin's injection middleware
+    against a real InvokeModelContext, matching BuildSkillsPluginTests' own
+    real-plugin-not-mocked convention — the behavior under test is
+    Strands' own injection middleware, not this project's code, so a fake
+    would test nothing real. Drives strands.injection._message_injection's
+    _create_injection_middleware() directly (the exact function
+    ContextInjector.init_agent() registers) with a real InvokeModelContext,
+    rather than reaching into Agent._middleware_registry's private storage
+    to retrieve the already-registered handler."""
+
+    def _invoke_middleware(self, messages):
+        from strands import Agent
+        from strands._middleware.stages import InvokeModelContext
+        from strands.injection._message_injection import _create_injection_middleware
+
+        injector = travel_agent.build_date_context_injector()
+        agent = Agent(system_prompt="Base prompt.", callback_handler=None)
+        middleware = _create_injection_middleware(injector._render_content, trigger=injector._trigger)
+        context = InvokeModelContext(
+            agent=agent,
+            messages=messages,
+            system_prompt="Base prompt.",
+            tool_specs=[],
+            tool_choice=None,
+            invocation_state={},
+            model=agent.model,
+        )
+        return asyncio_run(middleware(context))
+
+    def test_injects_current_date_into_a_fresh_user_turn(self):
+        original_messages = [{"role": "user", "content": [{"text": "Plan a trip"}]}]
+
+        result_context = self._invoke_middleware(original_messages)
+
+        folded_text = " ".join(
+            block["text"] for block in result_context.messages[-1]["content"] if "text" in block
+        )
+        self.assertIn("Today's date is", folded_text)
+        self.assertIn(date.today().isoformat(), folded_text)
+
+    def test_injected_text_does_not_persist_into_original_messages_list(self):
+        """The whole point of using ContextInjector over the old
+        date-prefix-on-SYSTEM_PROMPT approach: the injected text must never
+        reach durable conversation history, only that one call's input."""
+        original_messages = [{"role": "user", "content": [{"text": "Plan a trip"}]}]
+
+        self._invoke_middleware(original_messages)
+
+        self.assertEqual(original_messages, [{"role": "user", "content": [{"text": "Plan a trip"}]}])
 
 
 class BuildCodeInterpreterToolTests(unittest.TestCase):

@@ -2819,3 +2819,20 @@ feature), verified live rather than only asserted to work.
 - Billing budgets/alarms
 - A CI/CD pipeline for `TravelAgentWebStack` (DESIGN.md decision #44 —
   plain manual `cdk deploy`, matching every other stack)
+
+## Educational Backlog (added 2026-09-12)
+
+See DESIGN.md §6 for the full writeup (what each is, and why it'd be
+worth building here) — this is a candidate list only, not scoped or
+scheduled:
+
+1. Strands Evals (offline agent-evaluation harness)
+2. AgentCore Browser tool (managed remote browser)
+3. Multi-agent orchestration — Graph or Swarm
+4. AgentCore Evaluations (live-trace LLM-as-judge, CloudWatch-surfaced)
+5. Standalone Nova Sonic voice agent exploration (`strands.experimental.bidi`, local CLI)
+6. A2A protocol (`strands.agent.a2a_agent`)
+7. AgentCore Identity beyond OBO (third-party OAuth2 credential mgmt)
+8. AgentCore Gateway Policy Engine / claim-based rate limiting and RBAC
+9. Strands hooks beyond `AfterModelCallEvent`
+10. Bedrock Guardrails integration

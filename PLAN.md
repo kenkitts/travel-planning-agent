@@ -2113,6 +2113,46 @@ Fixed by changing `treat_missing_data` from `BREACHING` to
 via `cdk synth` (confirmed `"TreatMissingData": "notBreaching"` in the
 synthesized template) and the full test suite (199/199, unaffected).
 
+### Post-deploy fix: Gateway/Runtime dashboard widgets and alarms had no real data (2026-09-12)
+
+User reported both AgentCore dashboard widgets showing zero datapoints.
+Root cause, findings, and fix fully documented in DESIGN.md §2k decision
+#172 — summary here:
+
+- `cloudwatch:ListMetrics` confirmed AgentCore never publishes a Gateway
+  or Runtime metric under the bare `{"Resource": arn}` dimension set
+  decision #138's original code used — every real published series
+  also carries `Operation` plus usually `Method`/`Protocol`/
+  `ComputeType`/a per-tool `Name`. This also meant both `SystemErrors`
+  alarms had been sitting in an artificial, evidence-free `OK` the whole
+  time (missing-data masking, not genuine confirmation of zero errors).
+- Fixed the two CloudWatch constructs differently, since they have
+  different capabilities: dashboard widgets now use a
+  `SUM(SEARCH(...))`/`AVG(SEARCH(...))` `MathExpression`
+  (`_agentcore_search_metric()` in `observability_stack.py`); alarms
+  target a confirmed-live, fixed rolled-up dimension set instead
+  (`{Resource, Operation, Protocol="MCP"}` for Gateway,
+  `{Resource, Operation, Name="travel_planning_agent::DEFAULT"}` for
+  Runtime), since a real, live `UPDATE_FAILED` deploy attempt confirmed
+  CloudWatch rejects `SEARCH` expressions on Alarms outright.
+- A second, independent live-only bug was found and fixed while building
+  the `SEARCH` expression itself: the `{Namespace,Dim,Dim}` schema-braces
+  syntax silently returned zero matched series for this specific data;
+  the plain `Namespace="..." MetricName="..." Dim="..."` filter-only form
+  works correctly instead.
+- Redeployed `TravelAgentObservabilityStack` twice (once for the
+  alarm-metric split after the first `UPDATE_FAILED`, once for the
+  `SEARCH`-syntax fix after confirming the schema-braces form returned
+  empty via a live `GetMetricData` test) — both reached `UPDATE_COMPLETE`
+  cleanly, with the first failed attempt rolling back with zero partial
+  state. Verified live end-to-end: both widget expressions and both
+  alarms' fixed dimension sets independently confirmed via direct
+  `GetMetricData`/`GetMetricStatistics` calls to return real, non-empty
+  datapoints (including genuine `0.0`-error datapoints, not missing
+  data) at the exact deployed expressions/dimensions/periods. Full test
+  suite (222/222) unaffected — this is a CDK-infrastructure-only change,
+  no application code touched.
+
 ## Phase 23 — Logout capability (added 2026-09-05)
 
 See DESIGN.md §2l (decisions #143-144) for the full tier comparison and

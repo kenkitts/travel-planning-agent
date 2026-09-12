@@ -62,6 +62,16 @@ from constructs import Construct
 # existing convention for sharing config constants between stack modules.
 ALARM_NOTIFICATION_EMAIL = "kenkitts@amazon.com"
 
+# Matches runtime_stack.py's own RUNTIME_NAME constant value — duplicated
+# rather than imported, for the same reason as ALARM_NOTIFICATION_EMAIL
+# above. This is the static runtime name AgentCore uses to build the
+# `Name` dimension value on Runtime CloudWatch metrics
+# ("{RUNTIME_NAME}::DEFAULT", confirmed live via cloudwatch:ListMetrics —
+# note this is a different naming scheme than the Runtime's *log group*
+# name, which uses the dynamic agent_runtime_id with a hyphen separator,
+# not this static name with a double-colon separator).
+RUNTIME_NAME = "travel_planning_agent"
+
 # AgentCore's own CloudWatch namespace (Runtime and Gateway both publish
 # here) — confirmed via AWS's "AgentCore generated runtime/gateway
 # observability data" docs, not assumed. Both resource types use a
@@ -167,16 +177,57 @@ class ObservabilityStack(Stack):
         self, gateway_arn: str, runtime_arn: str
     ) -> list[cloudwatch.IWidget]:
         """Alarm #8/#9 (Gateway/Runtime SystemErrors) + volume/latency
-        widgets. Built as raw cloudwatch.Metric — AgentCore's CDK L2
-        constructs (Gateway/Runtime) expose no metric_* helper methods,
-        confirmed by inspecting the installed aws_bedrockagentcore module
-        directly before writing this."""
+        widgets.
+
+        Confirmed live (2026-09-12) via `cloudwatch:ListMetrics`/
+        `GetMetricData` that AgentCore never publishes a Gateway or
+        Runtime metric under a bare `{"Resource": arn}` dimension set —
+        every real published series also carries at least `Operation`
+        (a fixed value per resource type: `InvokeGateway` for Gateway,
+        `InvokeAgentRuntime` for Runtime), and usually
+        `Method`/`Protocol`/`ComputeType`/a per-tool `Name` too. A plain
+        cloudwatch.Metric() only matches an *exact* published dimension
+        set, so `{"Resource": arn}` alone queried a metric identity that
+        simply doesn't exist — which is why both the SystemErrors alarms
+        and these widgets previously showed zero datapoints (the alarms
+        sat in an artificial, evidence-free OK via
+        TreatMissingData=notBreaching, not genuine confirmation of no
+        errors).
+
+        Two different fixes for two different CloudWatch constructs,
+        since they have genuinely different capabilities here:
+        - Widgets use a SEARCH-based MathExpression (`_agentcore_search_metric`),
+          which matches any published series with the given dimension
+          keys present regardless of what other keys/values also exist,
+          aggregating them into one series — the standard pattern for
+          "known dimensions, unknown/varying extra dimensions."
+        - Alarms CANNOT use SEARCH at all — confirmed live via a real
+          `UPDATE_FAILED` deploy attempt ("SEARCH is not supported on
+          Metric Alarms") and independently by CDK's own
+          SearchExpressionProps docs ("A search expression cannot be
+          used within an Alarm."). Alarms instead target the one
+          minimal, *fixed* rolled-up dimension set AgentCore also
+          publishes for SystemErrors alongside the granular per-Method/
+          per-Name breakdowns — confirmed live to exist and to actually
+          receive data: `{Resource, Operation, Protocol="MCP"}` for
+          Gateway, `{Resource, Operation, Name=<runtime-endpoint-name>}`
+          for Runtime. Neither carries Method/tool-Name, so both are
+          safe to hardcode without silently missing errors from any
+          particular tool/method — AgentCore itself rolls those up into
+          this one series.
+
+        AgentCore's CDK L2 constructs (Gateway/Runtime) expose no
+        metric_* helper methods, confirmed by inspecting the installed
+        aws_bedrockagentcore module directly before writing this."""
         widgets: list[cloudwatch.IWidget] = []
-        for name, resource_arn in (("Gateway", gateway_arn), ("Runtime", runtime_arn)):
-            system_errors = cloudwatch.Metric(
+        for name, resource_arn, operation, rollup_dims in (
+            ("Gateway", gateway_arn, "InvokeGateway", {"Protocol": "MCP"}),
+            ("Runtime", runtime_arn, "InvokeAgentRuntime", {"Name": f"{RUNTIME_NAME}::DEFAULT"}),
+        ):
+            system_errors_alarm_metric = cloudwatch.Metric(
                 namespace=AGENTCORE_NAMESPACE,
                 metric_name="SystemErrors",
-                dimensions_map={"Resource": resource_arn},
+                dimensions_map={"Resource": resource_arn, "Operation": operation, **rollup_dims},
                 statistic="Sum",
                 period=ERROR_ALARM_PERIOD,
             )
@@ -185,34 +236,71 @@ class ObservabilityStack(Stack):
                 f"{name}SystemErrorsAlarm",
                 alarm_name=f"travel-agent-{name.lower()}-system-errors",
                 alarm_description=f"Any AgentCore {name} server-side (5xx) error in a 5-minute window.",
-                metric=system_errors,
+                metric=system_errors_alarm_metric,
                 threshold=ERROR_ALARM_THRESHOLD,
                 evaluation_periods=ERROR_ALARM_EVALUATION_PERIODS,
                 comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
                 treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
             ).add_alarm_action(self._alarm_action())
 
-            invocations = cloudwatch.Metric(
-                namespace=AGENTCORE_NAMESPACE,
-                metric_name="Invocations",
-                dimensions_map={"Resource": resource_arn},
-                statistic="Sum",
+            system_errors_widget_metric = self._agentcore_search_metric(
+                resource_arn, operation, "SystemErrors", "Sum"
             )
-            latency = cloudwatch.Metric(
-                namespace=AGENTCORE_NAMESPACE,
-                metric_name="Latency",
-                dimensions_map={"Resource": resource_arn},
-                statistic="Average",
-            )
+            invocations = self._agentcore_search_metric(resource_arn, operation, "Invocations", "Sum")
+            latency = self._agentcore_search_metric(resource_arn, operation, "Latency", "Average")
             widgets.append(
                 cloudwatch.GraphWidget(
                     title=f"AgentCore {name} — Invocations, Errors & Latency",
-                    left=[invocations, system_errors],
+                    left=[invocations, system_errors_widget_metric],
                     right=[latency],
                     width=12,
                 )
             )
         return widgets
+
+    def _agentcore_search_metric(
+        self, resource_arn: str, operation: str, metric_name: str, statistic: str
+    ) -> cloudwatch.MathExpression:
+        """One SEARCH-based aggregate metric for a specific AgentCore
+        Resource+Operation+MetricName, summed/averaged across whatever
+        other dimensions (Method, Protocol, Name, ComputeType) the real
+        published series also carry. Dashboard-widget-only — CloudWatch
+        rejects SEARCH expressions on Alarms (see
+        _create_agentcore_alarms_and_widgets's docstring).
+
+        Uses the plain `Namespace="..." MetricName="..." Dim="..."`
+        filter-only SEARCH syntax, not the `{Namespace,Dim,Dim}`
+        schema-braces form. Confirmed live (2026-09-12) via
+        `cloudwatch:GetMetricData` that the schema-braces form silently
+        returns zero matched series for these particular metrics — this
+        Gateway/Runtime data has a *variable* dimension count across its
+        real published series (some carry Method/Name, some don't; see
+        this class's docstring), and the schema-braces form appears to
+        require a fixed, exact dimension-name set to match against,
+        unlike the plain filter-only form, which matches any series
+        containing the given key=value filters regardless of what other
+        dimension keys are also present. Re-verify with a real
+        GetMetricData call before changing this syntax again — this was
+        found by trial, not documented anywhere consulted for this fix.
+
+        Search-expression quoting note: resource_arn/operation are this
+        stack's own CDK-resolved constants (a real ARN, a fixed literal),
+        never end-user input, so no injection concern — the same trust
+        level as every other CDK-constructed metric expression in this
+        method."""
+        aggregator = "AVG" if statistic == "Average" else "SUM"
+        query = (
+            f'Namespace="{AGENTCORE_NAMESPACE}" MetricName="{metric_name}" '
+            f'Resource="{resource_arn}" Operation="{operation}"'
+        )
+        expression = f"{aggregator}(SEARCH('{query}', '{statistic}', {ERROR_ALARM_PERIOD.to_seconds()}))"
+        return cloudwatch.MathExpression(
+            expression=expression,
+            label=f"{metric_name}",
+            period=ERROR_ALARM_PERIOD,
+        )
+
+
 
     def _create_web_alarms_and_widgets(
         self,

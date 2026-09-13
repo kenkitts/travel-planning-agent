@@ -115,6 +115,7 @@ import time
 from datetime import date
 from typing import Any, Optional
 
+import boto3
 from bedrock_agentcore.identity.auth import IdentityClient
 from bedrock_agentcore.memory.integrations.strands.config import (
     AgentCoreMemoryConfig,
@@ -126,9 +127,10 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, BedrockAgentCoreContext
 from mcp.client.streamable_http import streamablehttp_client
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
+from opentelemetry import trace
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
-from strands.hooks import AfterModelCallEvent
+from strands.hooks import AfterModelCallEvent, AfterToolCallEvent, BeforeInvocationEvent, BeforeToolCallEvent
 from strands.models.anthropic import AnthropicModel
 from strands.models.model import CacheConfig, CacheToolsConfig
 from strands.models.routing import ClassifierStrategy, ModelRouter, RoutingCandidate
@@ -161,6 +163,18 @@ GATEWAY_OBO_PROVIDER_NAME = os.environ.get("GATEWAY_OBO_PROVIDER_NAME", "")
 # set by RuntimeStack (the target always exists) — this variable's only
 # job is the opt-in, not detecting whether the target exists.
 GATEWAY_INFERENCE_URL = os.environ.get("GATEWAY_INFERENCE_URL", "")
+
+# Bedrock Guardrails via Strands hooks (see runtime_stack.py's
+# _add_guardrail() and DESIGN.md's "Bedrock Guardrails via Strands hooks"
+# decision; closes Educational Backlog items #9 and #10). Log-only this
+# phase: guardrail_check() below calls bedrock-runtime.apply_guardrail()
+# and logs/annotates every verdict, but the three hooks registered in
+# stream_agent_turn() never act on it — no cancel_tool/cancel_message/
+# cancel field is ever set. Always present (RuntimeStack always
+# provisions the guardrail), unlike GATEWAY_OBO_PROVIDER_NAME's
+# "empty string means not configured" convention.
+GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID", "")
+GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION", "")
 # Must match GATEWAY_OIDC_SCOPE/GATEWAY_OIDC_AUDIENCE in cdk/app.py, which
 # configures these same values on the Gateway's own JWT authorizer
 # (allowedScopes/allowedAudience) — see cdk/stacks/gateway_stack.py.
@@ -537,6 +551,108 @@ def extract_tool_result_text(tool_result: dict) -> str:
     return str(content) if content else ""
 
 
+_bedrock_runtime_client = None
+_bedrock_runtime_client_lock = threading.Lock()
+
+
+def _get_bedrock_runtime_client():
+    """Lazily construct and cache a single bedrock-runtime boto3 client.
+
+    Guardrail checks happen multiple times per turn (once per hook
+    invocation — input, each tool call, each tool result), so this avoids
+    re-constructing a boto3 client on every single check. Thread-safe
+    construction (double-checked lock) matches this module's other
+    process-wide lazy-singleton pattern (_GATEWAY_OBO_TOKEN_CACHE_LOCK).
+    """
+    global _bedrock_runtime_client
+    if _bedrock_runtime_client is None:
+        with _bedrock_runtime_client_lock:
+            if _bedrock_runtime_client is None:
+                _bedrock_runtime_client = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+    return _bedrock_runtime_client
+
+
+def guardrail_check(text: str, source: str) -> Optional[dict]:
+    """Call bedrock-runtime.apply_guardrail() and log/annotate the verdict.
+
+    Log-only helper for the three hooks registered in stream_agent_turn()
+    (see DESIGN.md's "Bedrock Guardrails via Strands hooks" decision) —
+    this function itself never blocks or raises on a BLOCKED/intervened
+    verdict; it only logs a warning and returns the raw ApplyGuardrail
+    response dict so the caller can decide whether to act on it (none of
+    the three hooks currently do — see their own docstrings).
+
+    source must be "INPUT" or "OUTPUT", per the ApplyGuardrail API — the
+    caller is responsible for picking the right one (e.g. the user's own
+    message is INPUT; a tool's result text is OUTPUT from the guardrail's
+    perspective, even though it enters the conversation via a tool call
+    rather than the model's own text output — see Question 1's "D" scope
+    decision in the design pass for this phase).
+
+    Sets guardrail.action / guardrail.categories attributes on the
+    current OpenTelemetry span (Strands' own tool/model spans — confirmed
+    by reading strands/tools/executors/_executor.py and
+    strands/telemetry/tracer.py directly, both of which use this exact
+    trace.get_current_span().set_attribute() pattern internally) so a
+    verdict is queryable/aggregable across real traffic via X-Ray/GenAI
+    Observability, not just visible one log line at a time.
+
+    Fails open on ANY error (missing GUARDRAIL_ID/GUARDRAIL_VERSION,
+    ApplyGuardrail throwing, network failure, etc.): logs the failure and
+    returns None, letting the calling hook's turn proceed exactly as if
+    the check had never happened. This is log-only, so there is no
+    enforcement rationale for a stricter fail-closed posture yet (that
+    tradeoff only starts to matter once a future enforce phase exists) —
+    matches this module's other fail-open handling (MaxTokensReachedException,
+    ModelThrottledException) rather than introducing a new stricter style.
+
+    Returns the raw ApplyGuardrail response dict on success, or None on
+    any failure (including "not configured").
+    """
+    if not text or not text.strip():
+        return None
+    if not GUARDRAIL_ID or not GUARDRAIL_VERSION:
+        return None
+    try:
+        client = _get_bedrock_runtime_client()
+        response = client.apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VERSION,
+            source=source,
+            content=[{"text": {"text": text}}],
+        )
+    except Exception:
+        logger.exception("Guardrail check failed (fail-open, turn proceeds unaffected)")
+        return None
+
+    action = response.get("action", "NONE")
+    triggered_types = sorted(
+        {
+            f.get("type")
+            for assessment in response.get("assessments", [])
+            for f in assessment.get("contentPolicy", {}).get("filters", [])
+            if f.get("action") == "BLOCKED"
+        }
+    )
+
+    span = trace.get_current_span()
+    span.set_attribute("guardrail.action", action)
+    if triggered_types:
+        span.set_attribute("guardrail.categories", ",".join(triggered_types))
+
+    if action != "NONE":
+        logger.warning(
+            "Guardrail intervened (log-only, not enforced): source=%s action=%s categories=%s",
+            source,
+            action,
+            triggered_types or "unknown",
+        )
+    else:
+        logger.info("Guardrail check clean: source=%s", source)
+
+    return response
+
+
 def _turn_cache_usage(result: Any) -> tuple[Optional[int], Optional[int]]:
     """Best-effort read of this turn's accumulated prompt-cache token usage.
 
@@ -671,6 +787,29 @@ async def stream_agent_turn(agent: Agent, user_message: str):
     intentional-silence convention as the "routing" event above — e.g. a
     turn served entirely by the classifier's own non-cache-enabled request
     with no serving-candidate call at all would have nothing to report.
+
+    Registers three additional hooks for log-only Bedrock Guardrails
+    checks (see DESIGN.md's "Bedrock Guardrails via Strands hooks"
+    decision and guardrail_check()'s own docstring for the full
+    rationale) — none of these emit an SSE event or change the turn's
+    behavior in any way; they only call guardrail_check() (log +
+    OpenTelemetry span annotation, fail-open):
+      - BeforeInvocationEvent: checks this turn's user_message,
+        source="INPUT", once per turn.
+      - BeforeToolCallEvent: checks every string-valued argument in the
+        tool call's parsed input, source="INPUT" — catches the model
+        laundering injected/adversarial text into a tool argument (e.g. a
+        "location" string that is itself a prompt-injection payload).
+      - AfterToolCallEvent: checks the tool's result text (via the
+        existing extract_tool_result_text() helper), source="OUTPUT" —
+        from the guardrail's perspective this is model-facing content the
+        agent didn't author, the same category as a real model response,
+        even though it entered via a tool call rather than the model's
+        own generated text (this project's model output itself is
+        deliberately NOT checked — see DESIGN.md: Strands' internal
+        model-call stage streams text deltas to the SSE client before
+        AfterModelCallEvent ever fires, so a hook at that point is
+        already too late to prevent exposure).
     """
     routing_state: dict[str, Optional[str]] = {"candidate": None, "emitted": False}
 
@@ -680,7 +819,28 @@ async def stream_agent_turn(agent: Agent, user_message: str):
             if name is not None:
                 routing_state["candidate"] = name
 
+    async def _on_before_invocation(event: BeforeInvocationEvent) -> None:
+        guardrail_check(user_message, source="INPUT")
+
+    async def _on_before_tool_call(event: BeforeToolCallEvent) -> None:
+        tool_input = event.tool_use.get("input")
+        if not isinstance(tool_input, dict):
+            return
+        for value in tool_input.values():
+            if isinstance(value, str):
+                guardrail_check(value, source="INPUT")
+
+    async def _on_after_tool_call(event: AfterToolCallEvent) -> None:
+        result = event.result
+        if not result:
+            return
+        text = extract_tool_result_text(result)
+        guardrail_check(text, source="OUTPUT")
+
     agent.hooks.add_callback(AfterModelCallEvent, _on_after_model_call)
+    agent.hooks.add_callback(BeforeInvocationEvent, _on_before_invocation)
+    agent.hooks.add_callback(BeforeToolCallEvent, _on_before_tool_call)
+    agent.hooks.add_callback(AfterToolCallEvent, _on_after_tool_call)
 
     seen_tool_use_ids: set[str] = set()
     try:

@@ -62,8 +62,8 @@ deferred) · ❌ considered/built, then explicitly rejected or reverted
 ## Security / governance
 - ✅ Gateway JWT authorizer (per-user identity propagation)
 - ⬜ Gateway Policy Engine / claim-based RBAC and per-role rate limiting
-- ⬜ Bedrock Guardrails / content moderation
-- ⬜ Strands hooks beyond `AfterModelCallEvent` (before/after tool-call hooks, audit logging)
+- ✅ Bedrock Guardrails / content moderation (log-only via Strands hooks + a real `AWS::Bedrock::Guardrail`; enforcement is a tracked follow-up)
+- ✅ Strands hooks beyond `AfterModelCallEvent` (`BeforeInvocationEvent`/`BeforeToolCallEvent`/`AfterToolCallEvent`, delivering the guardrail checks above)
 - ✅ WAF on the internet-facing ALB
 - ✅ TLS 1.2/1.3-only ALB policy
 - ✅ Gateway service-role trust-policy hardening (confused-deputy fix)

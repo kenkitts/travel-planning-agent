@@ -2812,6 +2812,163 @@ feature), verified live rather than only asserted to work.
   `batch-get-traces` (converting the log's raw 32-hex `trace_id` to
   X-Ray's `1-{first8hex}-{remaining24hex}` format) was the reliable path.
 
+## Phase 30 — Bedrock Guardrails via Strands hooks (added 2026-09-13)
+
+See DESIGN_HISTORY.md §2q (decisions #172-181) for the full design rationale and
+the 10-question clarifying-questions pass that shaped it before any code
+was written. Closes Educational Backlog items #9 ("Strands hooks beyond
+`AfterModelCallEvent`") and #10 ("Bedrock Guardrails integration") in one
+pass. Kept as a fully separate phase from the same day's (still
+uncommitted, as of this phase) AgentCore Gateway Policy Engine
+"guardrails-in-policies" work — a genuinely different mechanism (Cedar/
+Dogwood policy evaluation at the Gateway layer) targeting a different
+backlog item (#8), per this project's own one-phase-per-coherent-unit-of-
+work convention.
+
+### What was built
+- `cdk/stacks/runtime_stack.py`: new `_add_guardrail()` method,
+  provisioning a real `AWS::Bedrock::Guardrail` (L1 `CfnGuardrail` — no
+  L2 construct exists in `aws-cdk-lib==2.269.0`, confirmed by inspecting
+  `aws_cdk.aws_bedrock` directly) with `ContentFilter`
+  (VIOLENCE/HATE/SEXUAL/INSULTS/MISCONDUCT, MEDIUM input+output) and
+  `PROMPT_ATTACK` (MEDIUM input only — Bedrock's real `CreateGuardrail`
+  schema has no `output_strength`/`output_action`/`output_enabled` field
+  for this filter type at all, confirmed against AWS's own docs and ~15
+  real internal CDK repos), plus a published `CfnGuardrailVersion`
+  (`ApplyGuardrail` needs a real version, not `DRAFT`). `GUARDRAIL_ID`/
+  `GUARDRAIL_VERSION` wired as new environment variables, following the
+  existing `MEMORY_ID`/`GATEWAY_URL` pattern. New `AllowApplyGuardrail`
+  IAM statement (`bedrock:ApplyGuardrail`, scoped to exactly this
+  guardrail's ARN) — a deliberate, documented exception to Phase 27's
+  "no direct Bedrock access" posture, since `ApplyGuardrail` is a
+  content-safety check, not a model-inference call.
+- `agent/agent.py`: new `guardrail_check(text, source)` helper — calls
+  `bedrock-runtime.apply_guardrail()`, logs the verdict
+  (`logger.warning()` on intervention, `logger.info()` when clean), and
+  sets `guardrail.action`/`guardrail.categories` attributes on Strands'
+  own active OpenTelemetry span via `trace.get_current_span()` (the same
+  pattern Strands itself uses internally, confirmed by reading
+  `strands/tools/executors/_executor.py` and
+  `strands/telemetry/tracer.py` directly). Fails open on any error
+  (missing config, `ApplyGuardrail` exception, network failure) — logs
+  and returns `None`, letting the turn proceed unaffected, matching this
+  module's existing `MaxTokensReachedException`/`ModelThrottledException`
+  fail-open style. Three new hooks registered in `stream_agent_turn()`
+  alongside the existing `AfterModelCallEvent` routing-observability
+  hook: `BeforeInvocationEvent` (checks `user_message`, `source=INPUT`),
+  `BeforeToolCallEvent` (checks every string-valued tool argument,
+  `source=INPUT`), `AfterToolCallEvent` (checks the tool's result text
+  via the existing `extract_tool_result_text()` helper, `source=OUTPUT`).
+  None of the three ever set `cancel`/`cancel_tool`/`cancel_message` —
+  log-only this phase.
+- `tests/test_agent.py`: 13 new tests — `GuardrailCheckTests` (7,
+  mocking `travel_agent.boto3`, covering clean/blocked/fail-open/
+  span-annotation paths) and `GuardrailHooksTests` (6, using a real
+  `strands.hooks.registry.HookRegistry` via a new
+  `_FakeAgentWithRealHooks` fixture — distinct from the existing
+  no-op-`hooks`-stub `_FakeAgent` — so the three new hooks are genuinely
+  fired and their `guardrail_check()` calls asserted on, including
+  explicit assertions that `cancel_tool`/`cancel_message` are never set).
+
+### Why this, not alternatives
+- **No output-text blocking** (decision #172) — confirmed from Strands'
+  own event-loop source that the model-call stage streams every text
+  delta to the caller before `AfterModelCallEvent` fires, so a hook there
+  is structurally too late to prevent exposure over this project's live
+  SSE transport (decision #20); reversing that shipped UX choice for
+  every turn wasn't judged worth it for a first pass. Left explicit and
+  tracked, not silently dropped.
+- **Direct `ApplyGuardrail` from hooks, not native `guardrailConfig`/
+  LLM-as-judge/a blocklist** (decision #173) — internal code search
+  confirmed this is the dominant real pattern for exactly this "check
+  content mid-agent-loop" use case; LLM-as-judge adds a second model call
+  per check with no real content-filter categories, a blocklist misses
+  novel injection phrasing entirely.
+- **ContentFilter + PROMPT_ATTACK only, no PII/denied-topics/grounding**
+  (decision #174) — mirrors the same day's separate Gateway Policy Engine
+  session's own scope decision and stated reason ("this agent doesn't
+  collect PII by design"); each deferred category is a distinct future
+  scope decision, not silently folded in here.
+- **Log-only, MEDIUM strength** (decisions #176/#177) — matches the
+  Gateway Policy Engine session's own established LOG_ONLY-first pattern:
+  this is a real hosted, multi-user app now, and enforcing sight-unseen
+  risks blocking a legitimate request with no data yet on false-positive
+  rate.
+- **Narrow `bedrock:ApplyGuardrail` IAM exception, not Gateway-routed**
+  (decision #179) — `ApplyGuardrail` is a safety check, not inference;
+  routing it through the Gateway instead was rejected as unverified and
+  risky, mirroring the kind of unverified-capability research cycle that
+  cost real time in the Gateway Policy Engine session's own field-path
+  discovery work.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: **235/235** passing (222 baseline
+  + 13 new).
+- `cdk synth TravelAgentRuntimeStack` (and full `cdk synth`, all 7
+  stacks): clean. Direct template inspection confirmed the exact designed
+  `ContentFilterConfigProperty` list, the `AllowApplyGuardrail` statement
+  scoped to `AgentGuardrail.GuardrailArn`, and both new environment
+  variables resolving via `Fn::GetAtt`.
+- Deployed via `cdk deploy TravelAgentRuntimeStack` (`UPDATE_COMPLETE`,
+  54.7s, no rollback). **Live-verified via direct AWS API calls, not just
+  the deploy log**: `bedrock:list-guardrails`/`get-guardrail` show
+  `travel_planning_agent_guardrail` `READY` with the exact designed
+  config; `cloudformation:describe-stack-resources` confirms a real
+  published version (`ulc2s74la4c9|1`, not `DRAFT`); `iam:get-role-policy`
+  confirms `AllowApplyGuardrail` scoped to the real guardrail ARN;
+  `get-agent-runtime` confirms `GUARDRAIL_ID`/`GUARDRAIL_VERSION` live in
+  the Runtime's environment, status `READY`.
+- **Live, end-to-end confirmation via real chat traffic**, in a fresh
+  post-deploy web UI session (no stale-code risk): a benign turn produced
+  two clean `guardrail_check` log lines (`agent.py:651`, `source=INPUT`
+  and `source=OUTPUT`). An adversarial message — a weather query whose
+  "location" was itself an injection payload asking the agent to reveal
+  its system prompt — produced a real intervention:
+  `"Guardrail intervened (log-only, not enforced): source=INPUT
+  action=GUARDRAIL_INTERVENED categories=['PROMPT_ATTACK']"`
+  (`agent.py:644`), fired on the `BeforeInvocationEvent` hook (the raw
+  chat message itself, not a laundered tool argument) — the model's own
+  reasoning log independently confirmed the same recognition ("That
+  location name is actually a prompt injection attempt trying to get me
+  to reveal my system prompt... I won't comply"). A follow-up message
+  tripped `INSULTS` the same way. The matching X-Ray trace
+  (`1-6aa6eb77-7044a61074c3e6347ab54f4d`) confirmed a real
+  `"Bedrock Runtime.ApplyGuardrail"` subsegment (`rpc.method=
+  ApplyGuardrail`, `http.status_code=200`) and the `"invoke_agent Strands
+  Agents"` span carrying `metadata.guardrail.action="GUARDRAIL_INTERVENED"`
+  and `metadata.guardrail.categories="PROMPT_ATTACK"` — confirming the
+  custom span annotations land correctly on Strands' own active span, as
+  designed. Zero user-visible behavior change in either case (the model
+  responded normally — a clarifying question, then an apology — nothing
+  was blocked), confirming this phase is genuinely log-only.
+- **Closes the unresolved adversarial-test verification gap** left open
+  by the prior (separate) Gateway Policy Engine session: that session's
+  own attempt to get injection-shaped text into a tool call's free-text
+  argument was refused by the model, and this phase's own first attempt
+  at the identical trick (via `BeforeToolCallEvent`) was refused the same
+  way — confirming that refusal is a robust, repeatable model property
+  across two entirely different sessions and mechanisms, not a fluke.
+  This phase closed the underlying verification goal a different,
+  arguably more fundamental way instead: `BeforeInvocationEvent` caught
+  the identical injection attempt directly on the raw chat message,
+  before the model ever touched it, proving `ApplyGuardrail`/
+  `PROMPT_ATTACK` genuinely fires on real adversarial content in this
+  deployment.
+
+### Deferred, tracked (not built this phase)
+- Output-text blocking (decision #172) — no mechanism exists to
+  intercept the model's own streamed text before a client has already
+  received it; a future phase would need to either accept a retry-after-
+  the-fact flash, buffer-then-check (forfeiting live streaming), or
+  client-side retraction.
+- Enforcement (flipping any hook to actually `cancel`/`cancel_tool`/
+  `cancel_message`) — an explicit, separate follow-up phase once real
+  traffic data justifies picking thresholds, matching the same
+  LOG_ONLY-then-enforce two-phase structure already agreed for the
+  Gateway Policy Engine work.
+- SensitiveInformation/PII, denied topics, contextual grounding
+  categories — each a distinct future scope decision (decision #174).
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend
@@ -2834,5 +2991,5 @@ scheduled:
 6. A2A protocol (`strands.agent.a2a_agent`)
 7. AgentCore Identity beyond OBO (third-party OAuth2 credential mgmt)
 8. AgentCore Gateway Policy Engine / claim-based rate limiting and RBAC
-9. Strands hooks beyond `AfterModelCallEvent`
-10. Bedrock Guardrails integration
+9. ~~Strands hooks beyond `AfterModelCallEvent`~~ — done, see Phase 30
+10. ~~Bedrock Guardrails integration~~ — done, see Phase 30

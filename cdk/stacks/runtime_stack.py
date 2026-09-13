@@ -103,10 +103,42 @@ tracing_enabled=True on the Runtime construct is a separate, fourth
 requirement — it provisions the traces-delivery pipeline that ships
 already-emitted spans to CloudWatch, but does not itself cause any spans
 to be emitted.
+
+Bedrock Guardrails via Strands hooks (see DESIGN.md, "Bedrock Guardrails
+via Strands hooks"; closes Educational Backlog items #9 and #10):
+_add_guardrail() provisions a real AWS::Bedrock::Guardrail (L1
+CfnGuardrail — no L2 construct exists in this installed aws-cdk-lib
+version, confirmed by inspecting aws_cdk.aws_bedrock directly) with
+ContentFilter (VIOLENCE/HATE/SEXUAL/INSULTS/MISCONDUCT, input+output,
+MEDIUM strength) and PROMPT_ATTACK (input only — Bedrock's own
+CreateGuardrail schema has no output_strength/output_action/
+output_enabled field for this filter type at all, confirmed against
+AWS's own guardrails-prompt-attack doc; every real CDK usage found via
+internal code search independently confirms this) policies, plus a
+published CfnGuardrailVersion (ApplyGuardrail requires a real version
+identifier, not "DRAFT", to be called reliably). GUARDRAIL_ID/
+GUARDRAIL_VERSION are passed to the agent process as environment
+variables, following the existing MEMORY_ID/GATEWAY_URL pattern.
+
+This is log-only for this phase: agent.py's hooks call
+bedrock-runtime.apply_guardrail() and log/annotate every verdict, but
+never act on it (no cancel_tool/cancel_message/cancel field is ever
+set) — matching this project's own established LOG_ONLY-first pattern
+from the (separate, unrelated) AgentCore Gateway Policy Engine work.
+Enforcing is an explicit, tracked follow-up phase, not built here.
+
+The new bedrock:ApplyGuardrail IAM grant below is a deliberate, narrow
+exception to this file's "no direct Bedrock access" posture (see the
+Gateway-routed-inference paragraph above) — ApplyGuardrail is a
+standalone content-safety check, not a model-inference call, so the
+"all inference through the Gateway" rationale that removed
+bedrock:InvokeModel* from this role doesn't apply to it. Scoped to
+exactly this guardrail's ARN, nothing else.
 """
 from pathlib import Path
 
 from aws_cdk import BundlingOptions, Stack
+from aws_cdk import aws_bedrock as bedrock
 from aws_cdk import aws_bedrockagentcore as agentcore
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
@@ -145,6 +177,8 @@ class RuntimeStack(Stack):
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        self._add_guardrail()
 
         agent_runtime_artifact = agentcore.AgentRuntimeArtifact.from_code_asset(
             path=str(AGENT_DIR),
@@ -283,6 +317,11 @@ class RuntimeStack(Stack):
                     if gateway_oauth2_credential_provider is not None
                     else ""
                 ),
+                # Bedrock Guardrails via Strands hooks (see module
+                # docstring and _add_guardrail()) — agent.py's hooks call
+                # bedrock-runtime.apply_guardrail() with these identifiers.
+                "GUARDRAIL_ID": self.guardrail.attr_guardrail_id,
+                "GUARDRAIL_VERSION": self.guardrail_version.attr_version,
             },
             # Creates the traces-delivery pipeline (delivery source ->
             # destination -> delivery) that routes this Runtime's X-Ray
@@ -346,6 +385,21 @@ class RuntimeStack(Stack):
                     f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:code-interpreter/*",
                     f"arn:aws:bedrock-agentcore:{self.region}:aws:code-interpreter/*",
                 ],
+            )
+        )
+
+        # Grant the Runtime's execution role permission to call
+        # bedrock-runtime.ApplyGuardrail against this stack's own
+        # guardrail (see module docstring's "Bedrock Guardrails via
+        # Strands hooks" section and _add_guardrail()) — a deliberate,
+        # narrow exception to this file's "no direct Bedrock access"
+        # posture, scoped to exactly this one guardrail's ARN.
+        self.runtime.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="AllowApplyGuardrail",
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock:ApplyGuardrail"],
+                resources=[self.guardrail.attr_guardrail_arn],
             )
         )
 
@@ -437,4 +491,83 @@ class RuntimeStack(Stack):
             allowed_clients=allowed_clients,
             allowed_audience=allowed_audience,
             allowed_scopes=allowed_scopes,
+        )
+
+    def _add_guardrail(self) -> None:
+        """Provision the log-only Bedrock Guardrail agent.py's hooks call.
+
+        See module docstring's "Bedrock Guardrails via Strands hooks"
+        section for the full rationale. Sets self.guardrail and
+        self.guardrail_version; called from __init__ before the Runtime
+        itself, since GUARDRAIL_ID/GUARDRAIL_VERSION are wired into the
+        Runtime's environment_variables.
+
+        Uses the L1 CfnGuardrail (no L2 Guardrail construct exists in this
+        installed aws-cdk-lib version — confirmed by inspecting
+        aws_cdk.aws_bedrock directly, not assumed).
+
+        Content filter strengths: MEDIUM across VIOLENCE/HATE/SEXUAL/
+        INSULTS/MISCONDUCT (input AND output) and PROMPT_ATTACK (input
+        only). PROMPT_ATTACK has no output_strength/output_action/
+        output_enabled field in Bedrock's own CreateGuardrail schema at
+        all — confirmed against AWS's guardrails-prompt-attack userguide
+        page, whose documented request shape for a PROMPT_ATTACK filter
+        entry has no output_* fields, and independently corroborated by
+        every real internal CDK example found via code search (all of
+        which either omit output_strength for this type or explicitly
+        note "Required to be NONE by the API for this filter type" when
+        they do set it) — this is a real API constraint, not a design
+        choice made here.
+
+        input_action/output_action are both left at their default (NONE —
+        "take no action but return detection information") rather than
+        BLOCK, since this phase is log-only: agent.py's hooks read the
+        ApplyGuardrail response's own `action`/`assessments` fields to
+        decide what to log, and never rely on the guardrail itself having
+        blocked anything.
+
+        A CfnGuardrailVersion is published alongside the guardrail —
+        ApplyGuardrail needs a real, stable version identifier; the
+        guardrail's own mutable DRAFT version is not intended for this
+        (confirmed via multiple real CDK examples that always publish a
+        version for exactly this reason).
+        """
+        self.guardrail = bedrock.CfnGuardrail(
+            self,
+            "AgentGuardrail",
+            name="travel_planning_agent_guardrail",
+            description=(
+                "Log-only content-safety guardrail for the travel "
+                "planning agent (ContentFilter + PROMPT_ATTACK). Called "
+                "from Strands hooks in agent.py; never blocks in this "
+                "phase — see DESIGN.md."
+            ),
+            blocked_input_messaging="This request was flagged by a content safety check.",
+            blocked_outputs_messaging="This response was flagged by a content safety check.",
+            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                filters_config=[
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type=content_type,
+                        input_strength="MEDIUM",
+                        output_strength="MEDIUM",
+                    )
+                    for content_type in ("VIOLENCE", "HATE", "SEXUAL", "INSULTS", "MISCONDUCT")
+                ]
+                + [
+                    # PROMPT_ATTACK: input only, see docstring above —
+                    # output_strength is intentionally omitted (Bedrock's
+                    # schema has no such field for this filter type).
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type="PROMPT_ATTACK",
+                        input_strength="MEDIUM",
+                        output_strength="NONE",
+                    )
+                ],
+            ),
+        )
+        self.guardrail_version = bedrock.CfnGuardrailVersion(
+            self,
+            "AgentGuardrailVersion",
+            guardrail_identifier=self.guardrail.attr_guardrail_id,
+            description="Initial published version — log-only content-safety checks.",
         )

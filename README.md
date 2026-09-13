@@ -376,6 +376,7 @@ The agent reads its configuration from environment variables, set by
 | `MAX_OUTPUT_TOKENS` | Code-level default in `agent/agent.py` (8192) | Not currently wired as a CDK-set env var — override manually if ever needed |
 | `AGENT_MAX_TURNS` | Code-level default in `agent/agent.py` (30) | Caps agent-loop iterations per turn (`Limits.turns`); not currently wired as a CDK-set env var |
 | `PROMPT_CACHE_TTL` | Code-level default in `agent/agent.py` (unset — Anthropic's own 5-minute API default) | Anthropic-native prompt-caching TTL (`"5m"` or `"1h"`) for the two ModelRouter serving candidates' system-prompt and tool-definition cache points (not the classifier); not currently wired as a CDK-set env var — override manually to compare TTLs |
+| `GUARDRAIL_ID` / `GUARDRAIL_VERSION` | `RuntimeStack` | Identifies the Bedrock Guardrail `guardrail_check()` calls (see "Content-safety guardrails" below); always set (the guardrail is always provisioned) |
 
 `MODEL_ID` and the namespace strings in `agent/agent.py` must stay in sync
 with the corresponding constants in `cdk/app.py` and
@@ -471,6 +472,27 @@ fractions of a cent per call. A $100/month AWS Budget (with 80%
 forecasted and 100% actual alerts) is provisioned as a guardrail, but
 there is no hard spend cap — nothing blocks usage once the budget is
 exceeded.
+
+### Content-safety guardrails
+
+A real `AWS::Bedrock::Guardrail` (`ContentFilter` covering VIOLENCE/HATE/
+SEXUAL/INSULTS/MISCONDUCT at MEDIUM strength on both input and output,
+plus `PROMPT_ATTACK` at MEDIUM strength on input — Bedrock's own API has
+no output-side option for that filter type) is called directly from
+three Strands hooks in `agent/agent.py` (`BeforeInvocationEvent` on the
+user's message, `BeforeToolCallEvent` on each tool call's string
+arguments, `AfterToolCallEvent` on each tool's result text) via
+`bedrock-runtime.ApplyGuardrail`. This is **log-only**: every check's
+verdict is logged (`logger.info`/`logger.warning` in the Runtime's
+CloudWatch log group) and annotated onto the current OpenTelemetry span
+(`guardrail.action`/`guardrail.categories`, visible in X-Ray/GenAI
+Observability), but nothing is ever blocked or redacted — see `DESIGN.md`
+§2q for the full rationale and the tracked follow-up (enforcement) this
+intentionally defers. The model's own free-text output is not checked —
+Strands streams text deltas to the client before a hook can see the full
+response, so there is no point at which a hook could intercept it without
+either buffering (forfeiting live streaming) or a client-side retraction
+mechanism, neither of which is built here.
 
 ## Known limitations
 

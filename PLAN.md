@@ -2993,3 +2993,12 @@ scheduled:
 8. AgentCore Gateway Policy Engine / claim-based rate limiting and RBAC
 9. ~~Strands hooks beyond `AfterModelCallEvent`~~ — done, see Phase 30
 10. ~~Bedrock Guardrails integration~~ — done, see Phase 30
+11. AgentCore Runtime V2 (`platformVersion`) — confirmed blocked, not just
+    untried: CDK/CloudFormation don't yet support setting it (verified
+    against the installed `CfnRuntime` construct's real signature — no
+    `platform_version` param exists); would need a custom resource to
+    adopt via CDK. See DESIGN.md §6 item #11 for the full rationale and
+    open questions (env-var size budget under V2's tighter cap, the
+    minutes-long create/update + 120s health-check window, and the
+    "Optimize for V2" migration guide not yet readable at ideation
+    time).

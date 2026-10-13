@@ -2969,6 +2969,47 @@ work convention.
 - SensitiveInformation/PII, denied topics, contextual grounding
   categories — each a distinct future scope decision (decision #174).
 
+## Phase 31 — ALB connection logs added alongside existing access logs (added 2026-10-13)
+
+See DESIGN_HISTORY.md §2r (decisions #182-183) for the full rationale.
+Fast-follow to the existing ALB access-logs delivery (§2h/§2k): adds a
+second, independent delivery pipeline for ALB *connection logs*
+(client IP/port, TLS protocol/cipher, handshake latency, connection
+result) — a distinct ALB log type from access logs (request-level
+method/path/status/latency), not a flag on the same pipeline.
+
+### What was built
+- `cdk/stacks/web_stack.py`: a new `AlbConnectionLogGroup` (`ONE_MONTH`
+  retention, matching every other log group in this project) plus a
+  second `CfnDeliverySource`/`CfnDeliveryDestination`/`CfnDelivery`
+  triple (`LogType: ALB_CONNECTION_LOGS`, same `resource_arn` — the
+  ALB itself — as the existing access-logs source) — mirrors the
+  existing `AlbAccessLogsDeliverySource`/`...Destination`/`...Delivery`
+  code exactly, just a different `log_type` and its own log group.
+
+### Verified
+- `python -m pytest tests/ web/tests/`: 235/235 passing, unchanged —
+  pure CDK/infrastructure addition, no application code touched.
+- `cdk synth TravelAgentWebStack`: clean. Direct template inspection
+  confirmed `AlbConnectionLogGroup` (`RetentionInDays: 30`),
+  `AlbConnectionLogsDeliverySource` (`LogType: ALB_CONNECTION_LOGS`,
+  pointed at the same `WebAlb` resource), `AlbConnectionLogsDelivery
+  Destination` (`CWL`, pointed at the new log group), and
+  `AlbConnectionLogsDelivery` (correctly cross-referencing the new
+  source/destination) — all present and correctly shaped.
+- Deployed via `cdk deploy TravelAgentWebStack --require-approval
+  never`: `UPDATE_COMPLETE` in 28.19s, zero rollback. Only the 4 new
+  log-delivery resources changed (`CREATE_COMPLETE` on each) — the ALB,
+  listener, target group, and ECS service were untouched, confirming
+  this was genuinely additive with no impact to live traffic.
+- **Live-verified** via `aws logs describe-delivery-sources`/
+  `describe-deliveries`: `travel-agent-web-alb-connection-logs-source`
+  (`logType: ALB_CONNECTION_LOGS`, `resourceArns` pointing at the real
+  live ALB ARN) delivering to
+  `travel-agent-web-alb-connection-logs-destination`, alongside the
+  pre-existing, unaffected `travel-agent-web-alb-access-logs-source`
+  delivery.
+
 ## Explicit Non-Goals (tracked, not built now)
 - Booking/payment tool integrations
 - Structured JSON output / frontend

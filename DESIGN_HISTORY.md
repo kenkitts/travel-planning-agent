@@ -657,6 +657,46 @@ one-phase-per-coherent-unit-of-work convention. Scoped via a 10-question
 | 180 | Resource placement: the `CfnGuardrail`/`CfnGuardrailVersion` resources live in `runtime_stack.py` (via a new `_add_guardrail()` method), not a new dedicated stack | Constructed in `RuntimeStack.__init__()` before `self.runtime`, since `GUARDRAIL_ID`/`GUARDRAIL_VERSION` must be known before the Runtime's `environment_variables` dict is built. No L2 `Guardrail` construct exists in the installed `aws-cdk-lib==2.269.0` (confirmed by inspecting `aws_cdk.aws_bedrock` directly — only `CfnGuardrail`/`CfnGuardrailProps`/`CfnGuardrailVersion`/`CfnGuardrailVersionProps`/`CfnEnforcedGuardrailConfiguration*`), so this uses the L1 constructs directly. | The Guardrail has no independent existence or reuse case outside this one Runtime (unlike `TravelAgentObservabilityStack`, which watches multiple stacks' resources, or `TravelAgentDevOpsStack`, which is account-wide) — it belongs with the thing that consumes it, matching how `memory_stack.py`'s Memory ID and `gateway_stack.py`'s Gateway URL are each owned by/consumed from their most directly-related stack today. |
 | 181 | Verification bar: full live-traffic verification, including a real adversarial test closing an unresolved gap from the (separate) Gateway Policy Engine session | Deployed via `cdk deploy TravelAgentRuntimeStack` (`UPDATE_COMPLETE`, 54.7s). Live-confirmed via direct AWS API calls (not just the deploy log): `bedrock:list-guardrails`/`get-guardrail` show `travel_planning_agent_guardrail` `READY` with the exact designed `ContentFilter` config; `cloudformation:describe-stack-resources` confirms a real published version (`ulc2s74la4c9\|1`, not `DRAFT`); `iam:get-role-policy` confirms the `AllowApplyGuardrail` statement scoped to the real guardrail ARN; `get-agent-runtime` confirms `GUARDRAIL_ID`/`GUARDRAIL_VERSION` live in the Runtime's environment. Real chat traffic through the web UI, in a fresh post-deploy session: a benign turn produced two clean `guardrail_check` log lines (`source=INPUT`, `source=OUTPUT`); an adversarial message (a weather query whose "location" was itself an injection payload asking the agent to reveal its system prompt) produced a real `GUARDRAIL_INTERVENED`/`PROMPT_ATTACK` log line and a matching X-Ray `Bedrock Runtime.ApplyGuardrail` subsegment plus `guardrail.action`/`guardrail.categories` span annotations — with zero user-visible behavior change (the model responded normally in both cases; nothing was blocked, matching decision #177). | The prior (separate) Gateway Policy Engine session left one explicit, tracked verification gap open: getting adversarial-shaped text into a tool call's free-text argument without depending on the model's voluntary cooperation — the model correctly refused twice, across two entirely different sessions and mechanisms (that session's Gateway-tool-argument attempt, and this phase's own first attempt at the same trick). This phase closed the underlying question a different, arguably more fundamental way: `BeforeInvocationEvent` caught the same injection attempt directly on the raw chat message, before the model ever touched it — proving `ApplyGuardrail`/`PROMPT_ATTACK` genuinely fires on real adversarial content in this deployment, and confirming the model's refusal to launder injection into a tool argument is a robust, repeatable property of this system, not a fluke. |
 
+## 2r. ALB connection logs added alongside existing access logs (added 2026-10-13)
+
+Fast-follow to the observability pass (§2h decision #100 / §2k's own ALB
+access-logs delivery): the ALB already delivers *access logs*
+(request-level: method, path, status, latency) to CloudWatch Logs via a
+`CfnDeliverySource`/`CfnDeliveryDestination`/`CfnDelivery` triple with
+`LogType: ALB_ACCESS_LOGS`. Requested: add *connection logs* too —
+connection-level data (client IP/port, listener port, TLS protocol/
+cipher, TLS handshake latency, connection result, client certificate
+details) that access logs don't capture, useful for TLS-handshake/
+mTLS-style troubleshooting independent of what a request's HTTP layer
+looked like.
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 182 | Mechanism: a second, independent `CfnDeliverySource`/`CfnDeliveryDestination`/`CfnDelivery` triple with `LogType: ALB_CONNECTION_LOGS`, its own dedicated `logs.LogGroup` — not reusing the existing access-logs log group or delivery source | Confirmed via AWS's own ALB connection-logs documentation and an internal code-search precedent (`AWSWaypointRoutesServiceCDK`'s `configureAlbLogging`, which wires all three ALB log types — `ALB_ACCESS_LOGS`, `ALB_CONNECTION_LOGS`, `ALB_HEALTH_CHECK_LOGS` — as independent delivery triples against the same ALB ARN) that connection logs are a genuinely distinct ALB log type from access logs, not a mode/flag on the same delivery pipeline — each log type needs its own `CfnDeliverySource` (same `resource_arn` — the ALB itself — different `log_type`) and its own destination/log group, exactly mirroring how `gateway_stack.py` already provisions two independent delivery triples (`APPLICATION_LOGS` and `TRACES`) against the same Gateway ARN. | Keeps connection-level and request-level log streams independently queryable/retainable, matching this project's existing one-log-group-per-log-type convention rather than conflating two different schemas into one stream. |
+| 183 | Retention: `ONE_MONTH`, matching every other log group in this project (Lambda, Gateway, Runtime, ADOT, WebContainer, the existing ALB access-log group) | No new retention policy introduced — `logs.RetentionDays.ONE_MONTH` on the new `AlbConnectionLogGroup`. | Consistency; no stated reason exists in this project for connection logs specifically to retain longer or shorter than every other log type already in place. |
+
+### Verified
+`python -m pytest tests/ web/tests/`: 235/235 passing, unchanged — this
+is a pure CDK/infrastructure addition with no application code touched.
+`cdk synth TravelAgentWebStack`: clean; direct template inspection
+confirmed `AlbConnectionLogGroup` (`AWS::Logs::LogGroup`,
+`RetentionInDays: 30`), `AlbConnectionLogsDeliverySource`
+(`LogType: ALB_CONNECTION_LOGS`, `ResourceArn` pointing at the same
+`WebAlb` resource the existing access-logs source already references),
+`AlbConnectionLogsDeliveryDestination` (`DeliveryDestinationType: CWL`,
+pointed at the new log group), and `AlbConnectionLogsDelivery`
+(correctly cross-referencing the new source/destination by name/ARN) —
+all present and correctly shaped, independent of the pre-existing
+access-logs triple. Deployed via `cdk deploy TravelAgentWebStack
+--require-approval never`: `UPDATE_COMPLETE` in 28.19s, zero rollback,
+only the 4 new log-delivery resources created (`CREATE_COMPLETE` on
+each) — the ALB, listener, target group, and ECS service were
+untouched. Live-confirmed via `aws logs describe-delivery-sources`/
+`describe-deliveries`: `travel-agent-web-alb-connection-logs-source`
+(`ALB_CONNECTION_LOGS`, pointed at the real live ALB ARN) delivering to
+`travel-agent-web-alb-connection-logs-destination`, alongside the
+pre-existing, unaffected access-logs delivery.
+
 
    pace (relaxed/packed), interests, travelers/constraints. Uses short-term
    memory to avoid re-asking within a session; checks long-term memory for

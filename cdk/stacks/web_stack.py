@@ -336,6 +336,42 @@ class WebStack(Stack):
         alb_logs_delivery.node.add_dependency(alb_logs_source)
         alb_logs_delivery.node.add_dependency(alb_logs_destination)
 
+        # ALB connection logs -> CloudWatch Logs: a distinct ALB log type
+        # from access logs above (connection-level data — client IP/port,
+        # TLS protocol/cipher, handshake latency, connection result —
+        # rather than request-level data). Same
+        # DeliverySource/DeliveryDestination/Delivery triple, same `CWL`
+        # destination type, just `LogType: ALB_CONNECTION_LOGS` and its
+        # own log group — mirrors the access-logs delivery above exactly,
+        # no new pattern introduced.
+        alb_connection_log_group = logs.LogGroup(
+            self,
+            "AlbConnectionLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+        alb_connection_logs_source = logs.CfnDeliverySource(
+            self,
+            "AlbConnectionLogsDeliverySource",
+            name="travel-agent-web-alb-connection-logs-source",
+            log_type="ALB_CONNECTION_LOGS",
+            resource_arn=self.load_balancer.load_balancer_arn,
+        )
+        alb_connection_logs_destination = logs.CfnDeliveryDestination(
+            self,
+            "AlbConnectionLogsDeliveryDestination",
+            name="travel-agent-web-alb-connection-logs-destination",
+            delivery_destination_type="CWL",
+            destination_resource_arn=alb_connection_log_group.log_group_arn,
+        )
+        alb_connection_logs_delivery = logs.CfnDelivery(
+            self,
+            "AlbConnectionLogsDelivery",
+            delivery_source_name=alb_connection_logs_source.name,
+            delivery_destination_arn=alb_connection_logs_destination.attr_arn,
+        )
+        alb_connection_logs_delivery.node.add_dependency(alb_connection_logs_source)
+        alb_connection_logs_delivery.node.add_dependency(alb_connection_logs_destination)
+
         # The OIDC redirect_uri points at web_hostname (a caller-supplied
         # friendly domain the caller has separately pointed at this ALB —
         # DNS is explicitly out of scope for this stack, decision #40),

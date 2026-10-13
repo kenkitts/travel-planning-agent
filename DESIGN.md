@@ -69,6 +69,7 @@ Quick index of what's in `DESIGN_HISTORY.md`:
 - §2o — AgentCore Gateway WAF 403 root-cause fix (decisions #164-165)
 - §2p — Educational prompt caching for ModelRouter (decisions #166-171)
 - §2q — Bedrock Guardrails via Strands hooks (decisions #172-181)
+- §2r — ALB connection logs added alongside existing access logs (decision #182-183)
 
 ## 5. Out of Scope (v1) — Explicit Fast-Follows
 
